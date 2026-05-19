@@ -1,0 +1,23 @@
+# Foundry build artifacts
+cache/
+out/
+broadcast/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Coverage
+lcov.info
+coverage/
