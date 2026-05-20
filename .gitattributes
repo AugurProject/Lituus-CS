@@ -1,0 +1,19 @@
+# Force LF line endings for all text files, regardless of platform.
+# Prevents Windows CRLF mess when collaborating with Linux/Mac contributors.
+* text=auto eol=lf
+
+# Solidity & related
+*.sol     text eol=lf
+*.toml    text eol=lf
+*.md      text eol=lf
+*.txt     text eol=lf
+*.json    text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.sh      text eol=lf
+
+# Binary files - never touch
+*.png     binary
+*.jpg     binary
+*.pdf     binary
+*.zip     binary
