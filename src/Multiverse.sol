@@ -10,35 +10,33 @@ import { LituusRep } from "./LituusRep.sol";
 import { IReputationToken } from "./interfaces/IReputationToken.sol";
 
 contract Multiverse {
-
     using SafeERC20 for IERC20;
 
-    uint public constant MAX_OUTCOMES = 255;		//number of outcomes for a query
-    uint public constant MAX_FORK_OUTCOMES = 2;		//number of outcomes for a forking query
-	uint public constant UNRESOLVED	= MAX_OUTCOMES;	//the starting value for outcome is UNRESOLVED. Outcome 0 is the first, outcome (MAX_OUTCOMES-1) is the last.
-	uint public constant NO_REPORT = MAX_OUTCOMES;	//the starting value for lastReport is NO_REPORT. 
+    uint256 public constant MAX_OUTCOMES = 255; //number of outcomes for a query
+    uint256 public constant MAX_FORK_OUTCOMES = 2; //number of outcomes for a forking query
+    uint256 public constant UNRESOLVED = MAX_OUTCOMES; //the starting value for outcome is UNRESOLVED. Outcome 0 is the
+    // first, outcome (MAX_OUTCOMES-1) is the last.
+    uint256 public constant NO_REPORT = MAX_OUTCOMES; //the starting value for lastReport is NO_REPORT.
 
     enum ForkState {
-        NotForking,         // 0 - default; universe is operating normally
-        AwaitingChildren,   // 1 - system frozen, waiting for forkUniverse() to be called
-        InitialMigration,   // 2 - forking in progress; REP holders migrate to child universes
+        NotForking, // 0 - default; universe is operating normally
+        AwaitingChildren, // 1 - system frozen, waiting for forkUniverse() to be called
+        InitialMigration, // 2 - forking in progress; REP holders migrate to child universes
         SupplyRestoration1, // 3 - SR attempt 1
         SupplyRestoration2, // 4 - SR attempt 2
         SupplyRestoration3, // 5 - SR attempt 3
-        PostFork,           // 6 - fork finalized
-        Forming             // 7 - child universe still being formed
+        PostFork, // 6 - fork finalized
+        Forming // 7 - child universe still being formed
     }
 
-    struct Stake
-	{
-		address owner;
-		uint48 claim;
-		uint48 time;	
-		uint256 amount;
-	}
+    struct Stake {
+        address owner;
+        uint48 claim;
+        uint48 time;
+        uint256 amount;
+    }
 
-    struct Query
-    {
+    struct Query {
         uint48 createTime;
         uint16 numberOfOutcomes;
         uint64 originUniverse;
@@ -47,15 +45,13 @@ contract Multiverse {
         bytes32[] resolvedUniverses;
     }
 
-    struct Outcome
-    {
+    struct Outcome {
         uint16 outcome;
         uint256 totalStake;
         Stake[] stake;
     }
 
-    struct Universe
-    {
+    struct Universe {
         ILituusRep repToken;
         ForkState forkState;
         uint64 parent;
@@ -86,7 +82,8 @@ contract Multiverse {
         // deploy a Lituus REP token that wraps the Zoltar REP token
         // token symbol will use universe.history as a suffix. Genesis universe will have symbol "REP0"
         // TODO: Discuss the format of the suffix if the forks are for binary queries.
-        ILituusRep repToken = new LituusRep(address(this), address(initialZoltarRepToken), "Lituus Reputation Token", "REP0");
+        ILituusRep repToken =
+            new LituusRep(address(this), address(initialZoltarRepToken), "Lituus Reputation Token", "REP0");
 
         Universe memory genesisUniverse;
         genesisUniverse.favoriteChild = 0;

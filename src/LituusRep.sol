@@ -10,14 +10,14 @@ import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
 import { ILituusRep } from "./interfaces/ILituusRep.sol";
 
 contract LituusRep is ERC20, ERC20Burnable, Ownable, ILituusRep {
-
     using SafeERC20 for IERC20;
 
     IERC20 public immutable UNDERLYING_TOKEN;
 
     constructor(address owner, address underlyingToken, string memory name, string memory symbol)
         ERC20(name, symbol)
-        Ownable(owner) {
+        Ownable(owner)
+    {
         UNDERLYING_TOKEN = IERC20(underlyingToken);
     }
 
