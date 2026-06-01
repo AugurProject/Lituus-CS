@@ -13,6 +13,22 @@ contract Multiverse {
 
     using SafeERC20 for IERC20;
 
+    uint public constant MAX_OUTCOMES = 255;		//number of outcomes for a query
+    uint public constant MAX_FORK_OUTCOMES = 2;		//number of outcomes for a forking query
+	uint public constant UNRESOLVED	= MAX_OUTCOMES;	//the starting value for outcome is UNRESOLVED. Outcome 0 is the first, outcome (MAX_OUTCOMES-1) is the last.
+	uint public constant NO_REPORT = MAX_OUTCOMES;	//the starting value for lastReport is NO_REPORT. 
+
+    enum ForkState {
+        NotForking,         // 0 - default; universe is operating normally
+        AwaitingChildren,   // 1 - system frozen, waiting for forkUniverse() to be called
+        InitialMigration,   // 2 - forking in progress; REP holders migrate to child universes
+        SupplyRestoration1, // 3 - SR attempt 1
+        SupplyRestoration2, // 4 - SR attempt 2
+        SupplyRestoration3, // 5 - SR attempt 3
+        PostFork,           // 6 - fork finalized
+        Forming             // 7 - child universe still being formed
+    }
+
     struct Stake
 	{
 		address owner;
@@ -41,7 +57,7 @@ contract Multiverse {
     struct Universe
     {
         ILituusRep repToken;
-        uint8 forkState;
+        ForkState forkState;
         uint64 parent;
         uint64 favoriteChild;
         uint64 heir;
@@ -69,13 +85,14 @@ contract Multiverse {
         IReputationToken initialZoltarRepToken = ZOLTAR.getRepToken(_initialZoltarUniverseId);
         // deploy a Lituus REP token that wraps the Zoltar REP token
         // token symbol will use universe.history as a suffix. Genesis universe will have symbol "REP0"
+        // TODO: Discuss the format of the suffix if the forks are for binary queries.
         ILituusRep repToken = new LituusRep(address(this), address(initialZoltarRepToken), "Lituus Reputation Token", "REP0");
 
         Universe memory genesisUniverse;
         genesisUniverse.favoriteChild = 0;
         genesisUniverse.parent = 0;
         genesisUniverse.repToken = repToken;
-        genesisUniverse.forkState = 0;
+        genesisUniverse.forkState = ForkState.NotForking;
         genesisUniverse.heir = 0;
         genesisUniverse.history = new bytes32[](0);
         genesisUniverse.forkQuery = 0;
