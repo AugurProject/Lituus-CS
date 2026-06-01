@@ -1,11 +1,12 @@
 name: foundry-ci
 
 on:
-  push:
+  pull_request:
+    branches: [ main ]
 
 jobs:
   foundry-ci:
-    name: Forge fmt & test
+    name: Forge Format Check and Test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -21,7 +22,7 @@ jobs:
       - name: Run Forge Build
         run: forge build
 
-      - name: Forge format check
+      - name: Forge Format Check
         run: forge fmt --check
         
       - name: Run Forge Test
