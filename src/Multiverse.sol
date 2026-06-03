@@ -45,11 +45,11 @@ contract Multiverse {
         uint248 originUniverse;
         uint256 fee;
         string question;
-        bytes32[] resolvedUniverses;
+        uint248[] resolvedUniverses;
     }
 
     struct Outcome {
-        uint16 outcome;
+        uint8 outcome;
         uint256 totalStake;
         Stake[] stake;
     }
