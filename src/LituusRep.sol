@@ -24,6 +24,12 @@ contract LituusRep is ERC20, Ownable, ILituusRep {
         _mint(to, amount);
     }
 
+    // Single burn can only be called by owner and used only to burn query fees, so msg.sender works.
+    // TODO-CHECK IF WE NEED THIS.
+    function burn(uint256 amount) public onlyOwner {
+        _burn(msg.sender, amount);
+    }
+
     function wrap(address sender, uint256 amount) public onlyOwner {
         UNDERLYING_TOKEN.safeTransferFrom(sender, address(this), amount);
         _mint(sender, amount);
