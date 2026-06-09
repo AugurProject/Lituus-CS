@@ -61,8 +61,8 @@ contract Multiverse {
     }
 
     struct QueryResolution {
-        // flag which if true the query is resolved in the universe, otherwise it's not.
-        bool isResolved;
+        // if this is 0, then UNRESOLVED, otherwise it is RESOLVED.
+        uint8 winnerOutcome;
         // The stakes for this query.
         Stake[] stakes;
     }
@@ -203,8 +203,7 @@ contract Multiverse {
 
 /* ================================================ OUTCOME FUNCTIONS =============================================== */
     function getOutcome(uint248 universeId, uint256 queryId) external view returns (uint8) {
-        Stake[] storage stakes = queryResolutions[universeId][queryId].stakes;
-        return stakes[stakes.length - 1].reportedOutcome;
+        return queryResolutions[universeId][queryId].winnerOutcome;
     }
 
 /* ============================================== ESCALATION FUNCTIONS ============================================== */
