@@ -16,4 +16,8 @@ interface IZoltar {
     function getChildUniverseId(uint248 universeId, uint256 outcomeIndex) external pure returns (uint248);
 
     function getRepToken(uint248 universeId) external view returns (IReputationToken);
+
+    function getUniverseTheoreticalSupply(uint248 universeId) external view returns (uint256);
+
+    function getForkThreshold(uint248 universeId) external view returns (uint256);
 }
