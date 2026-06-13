@@ -36,7 +36,7 @@ contract Multiverse is ReentrancyGuard {
 
     /* ================================================== ENUMS ================================================== */
     enum ForkState {
-        Active, // 0 - default; universe is operating normally, not forking
+        NotForking, // 0 - default; universe is operating normally, not forking
         AwaitingChildren, // 1 - system frozen, waiting for forkUniverse() to be called
         Migration, // 2 - forking in progress; REP holders migrate to child universes
         SupplyRestoration1, // 3 - SR attempt 1
@@ -155,7 +155,7 @@ contract Multiverse is ReentrancyGuard {
         genesisUniverse.favoriteChild = 0;
         genesisUniverse.parent = 0;
         genesisUniverse.repToken = repToken;
-        genesisUniverse.forkState = ForkState.Active;
+        genesisUniverse.forkState = ForkState.NotForking;
         genesisUniverse.forkTime = uint48(block.timestamp);
         genesisUniverse.heir = 0;
         genesisUniverse.history = 0;
@@ -243,7 +243,7 @@ contract Multiverse is ReentrancyGuard {
         }
 
         uint256 requiredStakeAmount = getNextStakeAmount(activeUniverseId, queryId);
-        uint256 forkThreshold = ZOLTAR.getForkThreshold(activeUniverseId);
+        uint256 forkThreshold = ZOLTAR.getForkThreshold(activeUniverseId); // TODO: actual Lituus threshold will differ
         if (requiredStakeAmount >= forkThreshold) {
             // TODO: fork logic in a separate call
             // If the universe cannot fork then revert
@@ -335,18 +335,18 @@ contract Multiverse is ReentrancyGuard {
             uint48 reportingTimestamp
         ) = _extractWinnerOutcomeAndTotals(universeId, queryId);
 
-        uint256 reporterFee = queries[queryId].fee;
+        uint256 queryFee = queries[queryId].fee;
         // Per-universe queryCreateTime: createQuery sets it for the origin universe and report()
         // lazily sets it to universe.forkTime for heir universes on first report.
         uint48 queryCreateTime = queryResolutions[universeId][queryId].queryCreateTime;
 
         uint256 totalLoserStakes = totalStaked - winnerOutcomeStaked;
-        uint256 reporterPay = reporterFee * uint256(reportingTimestamp - queryCreateTime) / THREE_DAYS;
+        uint256 reporterPay = queryFee * uint256(reportingTimestamp - queryCreateTime) / THREE_DAYS;
         // Here because the report for the winner query can come after escalation starts, sometimes it might extend over
-        // 3 days, so we should make it equal to reporterFee in that case
-        if (reporterPay > reporterFee) reporterPay = reporterFee;
+        // 3 days, so we should make it equal to queryFee in that case
+        if (reporterPay > queryFee) reporterPay = queryFee;
 
-        uint256 profit = totalLoserStakes / BURN_DIVIDER + (reporterFee - reporterPay);
+        uint256 profit = totalLoserStakes / BURN_DIVIDER + (queryFee - reporterPay);
 
         ILituusRep repToken = universes[universeId].repToken;
         // TODO-Check if makes sense to also calculate reporterStake and losing side.
@@ -354,7 +354,7 @@ contract Multiverse is ReentrancyGuard {
         // TODO-CHECK IF LITUUS HERE OR UNWRAP AND BURN REP.
         //        repToken.burn(profit);
 
-        _applyRevenuesAndProfits(universeId, reporterFee, profit);
+        _applyRevenuesAndProfits(universeId, queryFee, profit);
 
         return winnerOutcome;
     }
@@ -523,7 +523,7 @@ contract Multiverse is ReentrancyGuard {
         // Sanity check: if the universe is not active or forming,
         // then the reporting should have been forwarded to the heir.
         ForkState forkState = universe.forkState;
-        if ((forkState != ForkState.Active) && (forkState != ForkState.Forming)) {
+        if ((forkState != ForkState.NotForking) && (forkState != ForkState.Forming)) {
             revert InvalidUniverseState();
         }
         repToken = universe.repToken;
