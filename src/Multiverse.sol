@@ -3,6 +3,7 @@ pragma solidity ^0.8.35;
 
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 import { IZoltar } from "./interfaces/IZoltar.sol";
 import { ILituusRep } from "./interfaces/ILituusRep.sol";
@@ -10,19 +11,21 @@ import { LituusRep } from "./LituusRep.sol";
 import { IReputationToken } from "./interfaces/IReputationToken.sol";
 import { IQueryFeeController } from "./interfaces/IQueryFeeController.sol";
 
-contract Multiverse {
+// TODO: check zoltar forks
+
+contract Multiverse is ReentrancyGuard {
     using SafeERC20 for IERC20;
     using SafeERC20 for ILituusRep;
 
-/* ============================================== CONSTANTS/IMMUTABLES ============================================== */
+    /* ========================================== CONSTANTS/IMMUTABLES =========================================== */
     uint8 public constant MAX_OUTCOMES = 253; //number of outcomes for a query
     uint8 public constant MAX_FORK_OUTCOMES = 2; //number of outcomes for a forking query
-    uint8 public constant UNRESOLVED = 255; // Not reported in time.
+    uint8 public constant UNRESOLVED = 0; // the query is not resolved yet
     uint8 public constant INVALID = 254; // an invalid outcome value used for reporting an invalid fork outcome during
-    // fork resolution. It is outside the valid outcome range [0, MAX_OUTCOMES-1]
-    uint8 public constant NO_REPORT = 0; // the starting value for outcome is NO_REPORT.
+    // fork resolution. It is outside the valid outcome range [1, MAX_OUTCOMES]
 
     uint256 public constant THREE_DAYS = 3 days;
+    uint256 public constant ONE_DAY = 1 days;
     // This is the divider for the burn depending on losingStakes on a query.
     // If burn ratio is 20% (1/5), then BURN_DIVIDER is 5.
     uint256 public constant BURN_DIVIDER = 5;
@@ -31,11 +34,11 @@ contract Multiverse {
     IZoltar public immutable ZOLTAR;
     IQueryFeeController public immutable QUERY_FEE_CONTROLLER;
 
-/* ====================================================== ENUMS ===================================================== */
+    /* ================================================== ENUMS ================================================== */
     enum ForkState {
-        NotForking, // 0 - default; universe is operating normally
+        NotForking, // 0 - default; universe is operating normally, not forking
         AwaitingChildren, // 1 - system frozen, waiting for forkUniverse() to be called
-        InitialMigration, // 2 - forking in progress; REP holders migrate to child universes
+        Migration, // 2 - forking in progress; REP holders migrate to child universes
         SupplyRestoration1, // 3 - SR attempt 1
         SupplyRestoration2, // 4 - SR attempt 2
         SupplyRestoration3, // 5 - SR attempt 3
@@ -43,7 +46,7 @@ contract Multiverse {
         Forming // 7 - child universe still being formed
     }
 
-/* ===================================================== STRUCTS ==================================================== */
+    /* ================================================= STRUCTS ================================================= */
     struct Stake {
         address reporter;
         uint48 time;
@@ -52,7 +55,6 @@ contract Multiverse {
     }
 
     struct Query {
-        uint48 createTime;
         uint8 numberOfOutcomes;
         uint248 originUniverse;
         uint256 fee;
@@ -61,8 +63,12 @@ contract Multiverse {
     }
 
     struct QueryResolution {
+        // The time the query first became reportable in this universe.
+        // Set on createQuery in the origin universe and lazily on the first report() in heir universes
+        // (to that universe's forkTime).
+        uint48 queryCreateTime;
         // if this is 0, then UNRESOLVED, otherwise it is RESOLVED.
-        uint8 winnerOutcome;
+        uint8 outcome;
         // The stakes for this query.
         Stake[] stakes;
     }
@@ -70,9 +76,12 @@ contract Multiverse {
     struct Universe {
         ILituusRep repToken;
         ForkState forkState;
+        // TODO: populate the forkTime
+        uint48 forkTime;
         uint248 parent;
         uint248 favoriteChild;
         uint248 heir;
+        // TODO: populate the history
         bytes32 history;
         uint256 forkQuery;
         uint256 supplyBeforeFork;
@@ -90,7 +99,7 @@ contract Multiverse {
         uint256 totalProfit;
     }
 
-/* ==================================================== VARIABLES =================================================== */
+    /* ================================================ VARIABLES ================================================ */
     mapping(uint248 universeId => Universe) public universes;
     mapping(uint248 universeId => UniverseRevenues) public universeRevenues;
     mapping(uint256 queryId => Query) public queries;
@@ -98,23 +107,44 @@ contract Multiverse {
 
     uint256 public queryCount;
 
-/* ===================================================== EVENTS ===================================================== */
-    event QueryCreated(uint256 indexed queryId, uint248 indexed universeId, string question, uint8 numberOfOutcomes);
+    /* ================================================= EVENTS ================================================== */
+    event QueryCreated(
+        address indexed creator,
+        uint256 indexed queryId,
+        uint248 indexed universeId,
+        string question,
+        uint8 numberOfOutcomes
+    );
+    event QueryReported(
+        address indexed reporter,
+        uint248 indexed universeId,
+        uint256 indexed queryId,
+        uint8 outcome,
+        uint256 stakeAmount
+    );
+    event QueryResolved(address indexed resolver, uint248 indexed universeId, uint256 indexed queryId, uint8 outcome);
 
-/* ===================================================== ERRORS ===================================================== */
+    /* ================================================= ERRORS ================================================== */
     error ZeroAddress();
     error InvalidUniverse();
-    error UniverseForking();
     error InvalidNumberOfOutcomes();
+    error InvalidQuery();
+    error InvalidOutcome();
+    error OutcomeSameAsPrevious();
+    error QueryAlreadyResolved();
+    error QueryNotReadyToResolve();
+    error QueryExpired();
+    error AppealPeriodOver();
+    error InvalidUniverseState();
 
-/* =================================================== CONSTRUCTOR ================================================== */
+    /* =============================================== CONSTRUCTOR =============================================== */
     constructor(IZoltar _zoltar, uint248 _initialZoltarUniverseId, IQueryFeeController _queryFeeController) {
         ZOLTAR = _zoltar;
         if (address(ZOLTAR) == address(0)) revert ZeroAddress();
         QUERY_FEE_CONTROLLER = _queryFeeController;
         if (address(QUERY_FEE_CONTROLLER) == address(0)) revert ZeroAddress();
 
-        // get the rep token address from the initial universe in Zoltar
+        // get the REP token address from the initial universe in Zoltar
         IReputationToken initialZoltarRepToken = ZOLTAR.getRepToken(_initialZoltarUniverseId);
         // deploy a Lituus REP token that wraps the Zoltar REP token
         // token symbol will use universe.history as a suffix. Genesis universe will have symbol "REP0"
@@ -127,18 +157,21 @@ contract Multiverse {
         genesisUniverse.parent = 0;
         genesisUniverse.repToken = repToken;
         genesisUniverse.forkState = ForkState.NotForking;
+        genesisUniverse.forkTime = uint48(block.timestamp);
         genesisUniverse.heir = 0;
         genesisUniverse.history = 0;
         genesisUniverse.forkQuery = 0;
-        genesisUniverse.supplyBeforeFork = repToken.totalSupply(); // TODO: what should it be?
+        // TODO: fill in the correct supply
+        genesisUniverse.supplyBeforeFork = ZOLTAR.getUniverseTheoreticalSupply(_initialZoltarUniverseId);
         genesisUniverse.queryTokenizer = address(0);
 
         GENESIS_TIMESTAMP = block.timestamp;
     }
 
-/* ================================================= WRAP FUNCTIONS ================================================= */
+    /* ============================================= WRAP FUNCTIONS ============================================== */
     function wrap(uint248 universeId, uint256 amount) external {
         // TODO: check universe status
+        // TODO: maybe check if some fork is upcoming (some escalation game is close to fork threshold)
         universes[universeId].repToken.wrap(msg.sender, amount);
     }
 
@@ -147,31 +180,11 @@ contract Multiverse {
         universes[universeId].repToken.unwrap(msg.sender, amount);
     }
 
-    // Main functions
+    /* ============================================= QUERY FUNCTIONS ============================================= */
+    function createQuery(uint248 universeId, string calldata question, uint8 numberOfOutcomes) external nonReentrant {
+        (uint248 activeUniverseId, Universe storage universe, ILituusRep repToken) =
+            _getActiveUniverseAndRepToken(universeId);
 
-/* ================================================= QUERY FUNCTIONS ================================================ */
-    function createQuery(uint248 universeId, string calldata question, uint8 numberOfOutcomes) external {
-        Universe storage universe = universes[universeId];
-        ILituusRep repToken = universe.repToken;
-        if (address(repToken) == address(0)) revert InvalidUniverse();
-        // Forward the transaction to the heir
-        uint248 heirId = universe.heir;
-        if (heirId != universeId) {
-            universe = universes[heirId];
-            repToken = universe.repToken;
-            if (address(repToken) == address(0)) revert InvalidUniverse();
-        }
-        // TODO: double check the allowed states
-        // Query creation is allowed during a fork in child universes
-        // but not in the parent universe that is forking.
-        ForkState forkState = universe.forkState;
-        if (
-            forkState == ForkState.InitialMigration || forkState == ForkState.SupplyRestoration1
-                || forkState == ForkState.SupplyRestoration2 || forkState == ForkState.SupplyRestoration3
-                || forkState == ForkState.PostFork
-        ) {
-            revert UniverseForking();
-        }
         // Validate the question and number of outcomes
         if (numberOfOutcomes <= 2) revert InvalidNumberOfOutcomes();
         if (numberOfOutcomes > MAX_OUTCOMES) revert InvalidNumberOfOutcomes();
@@ -179,34 +192,121 @@ contract Multiverse {
         // TODO: Here we need to actually check if question contains the same numberOfOutcomes needed.
 
         // Get the fee amount from the query fee controller
-        uint256 fee = QUERY_FEE_CONTROLLER.getQueryFee(universeId);
+        uint256 fee = QUERY_FEE_CONTROLLER.getQueryFee(activeUniverseId);
         // Transfer the query fee amount of REP token
         // TODO: permit? permit2?
         repToken.safeTransferFrom(msg.sender, address(this), fee);
         // Create a global query record
 
         Query storage query = queries[queryCount];
-        query.createTime = uint48(block.timestamp);
         query.numberOfOutcomes = numberOfOutcomes;
-        query.originUniverse = universeId;
+        query.originUniverse = activeUniverseId;
         query.fee = fee;
         query.question = question;
 
-        // A universe-specific outcome record will start with NO_REPORT
-        // The record will be populated when the first report comes in
+        // A universe-specific resolution record starts with outcome == UNRESOLVED.
+        // Set the queryCreateTime so the reporting window can be enforced in this universe.
+        QueryResolution storage resolution = queryResolutions[activeUniverseId][queryCount];
+        resolution.queryCreateTime = uint48(block.timestamp);
 
         // Emit an event
-        emit QueryCreated(queryCount, universeId, question, numberOfOutcomes);
+        emit QueryCreated(msg.sender, queryCount, activeUniverseId, question, numberOfOutcomes);
 
         queryCount++;
     }
 
-/* ================================================ OUTCOME FUNCTIONS =============================================== */
-    function getOutcome(uint248 universeId, uint256 queryId) external view returns (uint8) {
-        return queryResolutions[universeId][queryId].winnerOutcome;
+    function report(uint248 universeId, uint256 queryId, uint8 outcome) external nonReentrant {
+        // Check all conditions (universe exists, query exists, outcome is valid, report is within time, etc.)
+        (uint248 activeUniverseId, Universe storage universe, ILituusRep repToken) =
+            _getActiveUniverseAndRepToken(universeId);
+
+        Query storage query = queries[queryId];
+        if (query.numberOfOutcomes == 0) revert InvalidQuery();
+
+        QueryResolution storage resolution = queryResolutions[activeUniverseId][queryId];
+        if (resolution.outcome != UNRESOLVED) revert QueryAlreadyResolved();
+
+        // Outcome should be between 1 and numberOfOutcomes unless the query should be reported as INVALID
+        if (outcome == UNRESOLVED) revert InvalidOutcome();
+        if ((outcome > query.numberOfOutcomes) && (outcome != INVALID)) revert InvalidOutcome();
+
+        uint48 queryCreateTime = _getAndUpdateQueryCreateTime(activeUniverseId, queryId);
+
+        // Check that the reporting window for the query is not over yet
+        if (resolution.stakes.length == 0 && queryCreateTime + THREE_DAYS < block.timestamp) revert QueryExpired();
+
+        uint256 numberOfStakes = resolution.stakes.length;
+        // Check that the last outcome is not the same as the current outcome, and the appeal period hasn't expired.
+        if (numberOfStakes > 0) {
+            Stake storage lastStake = resolution.stakes[numberOfStakes - 1];
+            if (lastStake.reportedOutcome == outcome) revert OutcomeSameAsPrevious();
+            if (lastStake.time + ONE_DAY < block.timestamp) revert AppealPeriodOver();
+        }
+
+        uint256 requiredStakeAmount = _requiredStakeAmount(activeUniverseId, queryId);
+
+        // Transfer the stake
+        repToken.safeTransferFrom(msg.sender, address(this), requiredStakeAmount);
+
+        uint256 forkThreshold = ZOLTAR.getForkThreshold(activeUniverseId); // TODO: actual Lituus threshold will differ
+        if (requiredStakeAmount >= forkThreshold) {
+            // TODO: fork logic in a separate call
+            // If the universe cannot fork then revert
+        }
+
+        // Update the resolution record for the universe
+        Stake[] storage stakes = resolution.stakes;
+        uint256 index = stakes.length;
+        stakes.push();
+
+        Stake storage newStake = stakes[index];
+        newStake.reporter = msg.sender;
+        newStake.time = uint48(block.timestamp);
+        newStake.reportedOutcome = outcome;
+        newStake.amount = requiredStakeAmount;
+
+        // Emit an event
+        emit QueryReported(msg.sender, activeUniverseId, queryId, outcome, requiredStakeAmount);
     }
 
-/* ============================================== ESCALATION FUNCTIONS ============================================== */
+    function resolve(uint248 universeId, uint256 queryId) external nonReentrant {
+        (uint248 activeUniverseId, Universe storage universe, ILituusRep repToken) =
+            _getActiveUniverseAndRepToken(universeId);
+
+        Query storage query = queries[queryId];
+        if (query.numberOfOutcomes == 0) revert InvalidQuery();
+
+        QueryResolution storage resolution = queryResolutions[activeUniverseId][queryId];
+        if (resolution.outcome != UNRESOLVED) revert QueryAlreadyResolved();
+
+        uint48 queryCreateTime = _getAndUpdateQueryCreateTime(activeUniverseId, queryId);
+
+        if (resolution.stakes.length == 0 && queryCreateTime + THREE_DAYS < block.timestamp) {
+            // If the report period has passed and the query was not reported on then resolve the query as INVALID
+            resolution.outcome = INVALID;
+            emit QueryResolved(msg.sender, activeUniverseId, queryId, INVALID);
+            // TODO: Payout to the resolver, another clock auction
+        } else if (resolution.stakes.length > 0) {
+            if (resolution.stakes[resolution.stakes.length - 1].time + ONE_DAY < block.timestamp) {
+                // If there are stakes and the appeal period has passed then resolve the query with the last outcome
+                // TODO: Unless the query is 1 step from fork threshold, then we should wait for the fork to finish
+                uint8 outcome = _calculateOutcomeAndEscalationPayoffs(activeUniverseId, queryId);
+                resolution.outcome = outcome;
+                emit QueryResolved(msg.sender, activeUniverseId, queryId, outcome);
+                // TODO: Payouts
+            } else {
+                // Appeal period is not over yet, cannot resolve
+                revert QueryNotReadyToResolve();
+            }
+        } else {
+            // Otherwise, the query cannot be resolved yet
+            revert QueryNotReadyToResolve();
+        }
+
+        // TODO: check Zoltar forking state
+    }
+
+    /* ========================================== ESCALATION FUNCTIONS =========================================== */
     /**
      * @notice Resolves the escalation game for a reported query: pays the query fee reward to the
      *         first correct reporter, computes the protocol profit, records the universe's revenue
@@ -215,7 +315,7 @@ contract Multiverse {
      *      the query has no stakes; callers MUST guarantee the query is reported before calling.
      *
      *      `reporterPay` accrues linearly over the reporting window as
-     *      `fee * (reportingTimestamp - createTime) / THREE_DAYS`, capped at the full `fee`: the
+     *      `fee * (reportingTimestamp - queryCreateTime) / THREE_DAYS`, capped at the full `fee`: the
      *      winning report can land after escalation has begun and thus past the 3-day window, so
      *      the cap prevents paying out more than the fee.
      *
@@ -230,7 +330,7 @@ contract Multiverse {
      * @param queryId The id of the query being resolved.
      * @return winnerOutcome The winning outcome of the resolved query.
      */
-    function _calculateAndSetEscalationPayoffs(uint248 universeId, uint256 queryId) internal returns (uint8) {
+    function _calculateOutcomeAndEscalationPayoffs(uint248 universeId, uint256 queryId) internal returns (uint8) {
         (
             uint256 totalStaked,
             uint256 winnerOutcomeStaked,
@@ -239,15 +339,18 @@ contract Multiverse {
             uint48 reportingTimestamp
         ) = _extractWinnerOutcomeAndTotals(universeId, queryId);
 
-        uint256 reporterFee = queries[queryId].fee;
+        uint256 queryFee = queries[queryId].fee;
+        // Per-universe queryCreateTime: createQuery sets it for the origin universe and report()
+        // lazily sets it to universe.forkTime for heir universes on first report.
+        uint48 queryCreateTime = queryResolutions[universeId][queryId].queryCreateTime;
 
         uint256 totalLoserStakes = totalStaked - winnerOutcomeStaked;
-        uint256 reporterPay = reporterFee * uint256(reportingTimestamp - queries[queryId].createTime) / THREE_DAYS;
+        uint256 reporterPay = queryFee * uint256(reportingTimestamp - queryCreateTime) / THREE_DAYS;
         // Here because the report for the winner query can come after escalation starts, sometimes it might extend over
-        // 3 days, so we should make it equal to reporterFee in that case
-        if (reporterPay > reporterFee) reporterPay = reporterFee;
+        // 3 days, so we should make it equal to queryFee in that case
+        if (reporterPay > queryFee) reporterPay = queryFee;
 
-        uint256 profit = totalLoserStakes / BURN_DIVIDER + (reporterFee - reporterPay);
+        uint256 profit = totalLoserStakes / BURN_DIVIDER + (queryFee - reporterPay);
 
         ILituusRep repToken = universes[universeId].repToken;
         // TODO-Check if makes sense to also calculate reporterStake and losing side.
@@ -255,11 +358,12 @@ contract Multiverse {
         // TODO-CHECK IF LITUUS HERE OR UNWRAP AND BURN REP.
         //        repToken.burn(profit);
 
-        _applyRevenuesAndProfits(universeId, reporterFee, profit);
+        _applyRevenuesAndProfits(universeId, queryFee, profit);
 
         return winnerOutcome;
     }
-/* ========================================== RESOLUTION INTERNAL FUNCTIONS ========================================= */
+
+    /* ====================================== RESOLUTION INTERNAL FUNCTIONS ====================================== */
     /**
      * @notice Records a resolved query's revenue and profit into the universe's current 3-day
      *         bucket and its running totals.
@@ -309,15 +413,15 @@ contract Multiverse {
      * @return reportingTimestamp The timestamp when the stake acquiring the query fee reward occurred.
      */
     function _extractWinnerOutcomeAndTotals(uint248 universeId, uint256 queryId)
-    internal
-    view
-    returns (
-        uint256 totalStaked,
-        uint256 winnerOutcomeStaked,
-        uint8 winnerOutcome,
-        address reporter,
-        uint48 reportingTimestamp
-    )
+        internal
+        view
+        returns (
+            uint256 totalStaked,
+            uint256 winnerOutcomeStaked,
+            uint8 winnerOutcome,
+            address reporter,
+            uint48 reportingTimestamp
+        )
     {
         Stake[] storage stakes = queryResolutions[universeId][queryId].stakes;
         uint256 length = stakes.length;
@@ -357,6 +461,93 @@ contract Multiverse {
                     i += 1;
                 }
             }
+        }
+    }
+
+    /* ========================================= PUBLIC VIEW FUNCTIONS =========================================== */
+    function getOutcome(uint248 universeId, uint256 queryId) external view returns (uint8) {
+        // TODO: outcome lookup in ancestor universes if unresolved in the current universe
+        return queryResolutions[universeId][queryId].outcome;
+    }
+
+    function _requiredStakeAmount(uint248 universeId, uint256 queryId) public view returns (uint256) {
+        QueryResolution storage resolution = queryResolutions[universeId][queryId];
+        uint256 numberOfStakes = resolution.stakes.length;
+        if (numberOfStakes == 0) {
+            return QUERY_FEE_CONTROLLER.getQueryFee(universeId);
+        } else {
+            uint256 lastStakeAmount = resolution.stakes[numberOfStakes - 1].amount;
+            uint256 requiredStakeAmount = lastStakeAmount * 2;
+            uint256 forkThreshold = ZOLTAR.getForkThreshold(universeId);
+            if (requiredStakeAmount >= forkThreshold / 2) {
+                return forkThreshold;
+            } else {
+                return requiredStakeAmount;
+            }
+        }
+    }
+
+    /* ==================================== TOKEN SUPPLY MANAGEMENT FUNCTIONS ==================================== */
+    /**
+     * @notice Migration, auction, and other token supply management functions.
+     */
+
+    /* ============================================ FORKING FUNCTIONS ============================================ */
+    function forkUniverse(uint248 universeId, uint256 queryId) internal {
+        // TODO
+        // Check if the universe can fork (state of the universe)
+        // Check if ZOLTAR is not forking, revert if it's forking
+        // Handle if the query should fork but the universe cannot fork
+        // Create a ZOLTAR binary fork query
+        // Approve REP for ZOLTAR
+        // Create a fork in ZOLTAR
+        // TODO: Update the universe's fork state to Awaiting children and set the forkQuery
+        // Spawn child universes
+        // Set outcomes in child universes and update their states to Forming
+    }
+
+    /* =========================================== INTERNAL HELPERS ============================================== */
+    function _getActiveUniverseAndRepToken(uint248 universeId)
+        internal
+        view
+        returns (uint248 activeUniverseId, Universe storage universe, ILituusRep repToken)
+    {
+        universe = universes[universeId];
+        if (address(universe.repToken) == address(0)) revert InvalidUniverse();
+        // Forward to the heir if this universe has forked.
+        // If heir is not 0 and not itself, then the universe has forked.
+        uint248 heirId = universe.heir;
+        if (heirId != universeId && heirId != 0) {
+            universe = universes[heirId];
+            if (address(universe.repToken) == address(0)) revert InvalidUniverse();
+            activeUniverseId = heirId;
+        } else {
+            activeUniverseId = universeId;
+        }
+        // Sanity check: if the universe is not active or forming,
+        // then the reporting should have been forwarded to the heir.
+        ForkState forkState = universe.forkState;
+        if ((forkState != ForkState.NotForking) && (forkState != ForkState.Forming)) {
+            revert InvalidUniverseState();
+        }
+        repToken = universe.repToken;
+    }
+
+    function _getAndUpdateQueryCreateTime(uint248 universeId, uint256 queryId)
+        internal
+        returns (uint48 queryCreateTime)
+    {
+        QueryResolution storage resolution = queryResolutions[universeId][queryId];
+        if (resolution.queryCreateTime != 0) {
+            return resolution.queryCreateTime;
+        } else {
+            // If the queryCreateTime is not set, it means the query was not created in this universe but was reported
+            // on in this universe. In this case, we should use the forkTime of the universe as the queryCreateTime,
+            // since the query becomes reportable in this universe after the fork.
+            Universe storage universe = universes[universeId];
+            queryCreateTime = universe.forkTime;
+            resolution.queryCreateTime = uint48(queryCreateTime);
+            return queryCreateTime;
         }
     }
 }
