@@ -130,6 +130,7 @@ contract Multiverse is ReentrancyGuard {
     error InvalidNumberOfOutcomes();
     error InvalidQuery();
     error InvalidOutcome();
+    error OutcomeSameAsPrevious();
     error QueryAlreadyResolved();
     error QueryNotReadyToResolve();
     error QueryExpired();
@@ -232,24 +233,27 @@ contract Multiverse is ReentrancyGuard {
         uint48 queryCreateTime = _getAndUpdateQueryCreateTime(activeUniverseId, queryId);
 
         // Check that the reporting window for the query is not over yet
-        if (queryCreateTime + THREE_DAYS < block.timestamp) revert QueryExpired();
+        if (resolution.stakes.length == 0 && queryCreateTime + THREE_DAYS < block.timestamp) revert QueryExpired();
 
         uint256 numberOfStakes = resolution.stakes.length;
         // Check that the last outcome is not the same as the current outcome, and the appeal period hasn't expired.
         if (numberOfStakes > 0) {
             Stake storage lastStake = resolution.stakes[numberOfStakes - 1];
-            if (lastStake.reportedOutcome == outcome) revert InvalidOutcome();
+            if (lastStake.reportedOutcome == outcome) revert OutcomeSameAsPrevious();
             if (lastStake.time + ONE_DAY < block.timestamp) revert AppealPeriodOver();
         }
 
-        uint256 requiredStakeAmount = getNextStakeAmount(activeUniverseId, queryId);
+        uint256 requiredStakeAmount = _requiredStakeAmount(activeUniverseId, queryId);
+
+        // Transfer the stake
+        repToken.safeTransferFrom(msg.sender, address(this), requiredStakeAmount);
+
         uint256 forkThreshold = ZOLTAR.getForkThreshold(activeUniverseId); // TODO: actual Lituus threshold will differ
         if (requiredStakeAmount >= forkThreshold) {
             // TODO: fork logic in a separate call
             // If the universe cannot fork then revert
         }
-        // Transfer the stake
-        repToken.safeTransferFrom(msg.sender, address(this), requiredStakeAmount);
+
         // Update the resolution record for the universe
         Stake[] storage stakes = resolution.stakes;
         uint256 index = stakes.length;
@@ -466,7 +470,7 @@ contract Multiverse is ReentrancyGuard {
         return queryResolutions[universeId][queryId].outcome;
     }
 
-    function getNextStakeAmount(uint248 universeId, uint256 queryId) public view returns (uint256) {
+    function _requiredStakeAmount(uint248 universeId, uint256 queryId) public view returns (uint256) {
         QueryResolution storage resolution = queryResolutions[universeId][queryId];
         uint256 numberOfStakes = resolution.stakes.length;
         if (numberOfStakes == 0) {
