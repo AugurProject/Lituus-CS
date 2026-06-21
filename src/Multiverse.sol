@@ -10,12 +10,14 @@ import { ILituusRep } from "./interfaces/ILituusRep.sol";
 import { LituusRep } from "./LituusRep.sol";
 import { IReputationToken } from "./interfaces/IReputationToken.sol";
 import { IQueryFeeController } from "./interfaces/IQueryFeeController.sol";
+import { LibStringParsing } from "./lib/LibStringParsing.sol";
 
 // TODO: check zoltar forks
 
 contract Multiverse is ReentrancyGuard {
     using SafeERC20 for IERC20;
     using SafeERC20 for ILituusRep;
+    using LibStringParsing for bytes;
 
     /* ========================================== CONSTANTS/IMMUTABLES =========================================== */
     uint8 public constant MAX_OUTCOMES = 253; //number of outcomes for a query
@@ -37,13 +39,12 @@ contract Multiverse is ReentrancyGuard {
     /* ================================================== ENUMS ================================================== */
     enum ForkState {
         NotForking, // 0 - default; universe is operating normally, not forking
-        AwaitingChildren, // 1 - system frozen, waiting for forkUniverse() to be called
-        Migration, // 2 - forking in progress; REP holders migrate to child universes
-        SupplyRestoration1, // 3 - SR attempt 1
-        SupplyRestoration2, // 4 - SR attempt 2
-        SupplyRestoration3, // 5 - SR attempt 3
-        PostFork, // 6 - fork finalized
-        Forming // 7 - child universe still being formed
+        Migration, // 1 - forking in progress; REP holders migrate to child universes
+        SupplyRestoration1, // 2 - SR attempt 1
+        SupplyRestoration2, // 3 - SR attempt 2
+        SupplyRestoration3, // 4 - SR attempt 3
+        PostFork, // 5 - fork finalized
+        Forming // 6 - child universe still being formed
     }
 
     /* ================================================= STRUCTS ================================================= */
@@ -189,7 +190,13 @@ contract Multiverse is ReentrancyGuard {
         if (numberOfOutcomes <= 2) revert InvalidNumberOfOutcomes();
         if (numberOfOutcomes > MAX_OUTCOMES) revert InvalidNumberOfOutcomes();
 
-        // TODO: Here we need to actually check if question contains the same numberOfOutcomes needed.
+        // 0 is reserved as UNRESOLVED, so the valid outcomes are [1, numberOfOutcomes].
+        // Question format: "Was the price of ETH above $2000 on 2023-01-01?[False,True]"
+        // 1 == False, 2 == True in this case. 254 == INVALID, 0 == UNRESOLVED.
+        // Or: "John Doe's favorite fruit?[Apple,Banana,Carrot]"
+        // First ? is treated as the end of the question.
+        // The rest is treated as the comma-separated list of outcomes in [].
+        _validateQuestionFormatAndAnswerCount(question, numberOfOutcomes);
 
         // Get the fee amount from the query fee controller
         uint256 fee = QUERY_FEE_CONTROLLER.getQueryFee(activeUniverseId);
@@ -243,12 +250,14 @@ contract Multiverse is ReentrancyGuard {
             if (lastStake.time + ONE_DAY < block.timestamp) revert AppealPeriodOver();
         }
 
-        uint256 requiredStakeAmount = _requiredStakeAmount(activeUniverseId, queryId);
+        (uint256 requiredStakeAmount, uint256 forkThreshold) = _requiredStakeAmountAndForkThreshold(activeUniverseId, queryId);
+        // TODO: If the bond before a fork bond is placed so that the next appeal would cause a fork,
+        // and its not possible to fork because the parent has still not resolved their fork,
+        // then the bond placing is reverted and the query is frozen until the parent universe resolves the fork.
 
         // Transfer the stake
         repToken.safeTransferFrom(msg.sender, address(this), requiredStakeAmount);
 
-        uint256 forkThreshold = ZOLTAR.getForkThreshold(activeUniverseId); // TODO: actual Lituus threshold will differ
         if (requiredStakeAmount >= forkThreshold) {
             // TODO: fork logic in a separate call
             // If the universe cannot fork then revert
@@ -470,19 +479,19 @@ contract Multiverse is ReentrancyGuard {
         return queryResolutions[universeId][queryId].outcome;
     }
 
-    function _requiredStakeAmount(uint248 universeId, uint256 queryId) public view returns (uint256) {
+    function _requiredStakeAmountAndForkThreshold(uint248 universeId, uint256 queryId) public view returns (uint256 requiredStakeAmount, uint256 forkThreshold) {
+        forkThreshold = ZOLTAR.getForkThreshold(universeId);
         QueryResolution storage resolution = queryResolutions[universeId][queryId];
         uint256 numberOfStakes = resolution.stakes.length;
         if (numberOfStakes == 0) {
-            return QUERY_FEE_CONTROLLER.getQueryFee(universeId);
+            requiredStakeAmount = QUERY_FEE_CONTROLLER.getQueryFee(universeId);
         } else {
             uint256 lastStakeAmount = resolution.stakes[numberOfStakes - 1].amount;
-            uint256 requiredStakeAmount = lastStakeAmount * 2;
-            uint256 forkThreshold = ZOLTAR.getForkThreshold(universeId);
+            requiredStakeAmount = lastStakeAmount * 2;
             if (requiredStakeAmount >= forkThreshold / 2) {
-                return forkThreshold;
+                requiredStakeAmount = forkThreshold;
             } else {
-                return requiredStakeAmount;
+                requiredStakeAmount = requiredStakeAmount;
             }
         }
     }
@@ -549,5 +558,48 @@ contract Multiverse is ReentrancyGuard {
             resolution.queryCreateTime = uint48(queryCreateTime);
             return queryCreateTime;
         }
+    }
+
+    /**
+     * @notice Validates that `question` matches the format `<text>?[A1,A2,...,AN]` and that
+     *         the parsed answer count equals `numberOfOutcomes`.
+     * @dev Composed from `LibStringParsing` primitives — one full-string `indexOf` to locate
+     *      `?` and one bounded `count` to tally `,` between brackets. Framing checks
+     *      (`[` immediately after `?`, `]` as the final byte) are O(1) byte reads.
+     *
+     *      Strict structural checks:
+     *      - `?` must appear at least once.
+     *      - `[` must be the byte immediately after the first `?`.
+     *      - `]` must be the last byte of the string.
+     *
+     *      Accepted limitations (gas trade-off):
+     *      - Consecutive delimiters (`?[A,,B]`) and leading/trailing delimiters (`?[A,]`,
+     *        `?[,A]`) over-count answers. Detecting empty tokens would require a second
+     *        pass; the count is left to caller-side validation of `numberOfOutcomes`.
+     *      - Whitespace is not trimmed and multi-byte UTF-8 sequences are not interpreted.
+     * @param question         Calldata string holding the question and answer list.
+     * @param numberOfOutcomes Expected number of comma-separated answers in the bracket list.
+     */
+    function _validateQuestionFormatAndAnswerCount(string calldata question, uint8 numberOfOutcomes) internal pure {
+        bytes calldata bytesQuestion = bytes(question);
+        (uint256 questionMarkIndex, bool found) = bytesQuestion.indexOf(bytes1("?"));
+        if (!found) revert InvalidQuery();
+
+        uint256 openIndex = questionMarkIndex + 1;
+        uint256 length = bytesQuestion.length;
+        if (openIndex >= length || bytesQuestion[openIndex] != bytes1("[")) revert InvalidQuery();
+
+        uint256 closeIndex = length - 1;
+        if (bytesQuestion[closeIndex] != bytes1("]")) revert InvalidQuery();
+
+        uint256 answerCount;
+        if (closeIndex - openIndex == 1) {
+            // Empty bracket pair "?[]".
+            answerCount = 0;
+        } else {
+            answerCount = bytesQuestion.count(bytes1(","), openIndex + 1, closeIndex) + 1;
+        }
+
+        if (answerCount != numberOfOutcomes) revert InvalidNumberOfOutcomes();
     }
 }
