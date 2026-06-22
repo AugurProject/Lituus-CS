@@ -502,7 +502,7 @@ contract Multiverse is ReentrancyGuard {
      */
 
     /* ============================================ FORKING FUNCTIONS ============================================ */
-    function forkUniverse(uint248 universeId, uint256 queryId) internal {
+    function _forkUniverse(uint248 universeId, uint256 queryId) internal {
         // TODO
         // Check if the universe can fork (state of the universe)
         // Check if ZOLTAR is not forking, revert if it's forking
@@ -511,6 +511,16 @@ contract Multiverse is ReentrancyGuard {
         // Approve REP for ZOLTAR
         // Create a fork in ZOLTAR
         // TODO: Update the universe's fork state to Awaiting children and set the forkQuery
+        // Spawn child universes
+        // Set outcomes in child universes and update their states to Forming
+    }
+
+    function mirrorZoltarFork(uint248 universeId) public {
+        // TODO
+        // Check if the universe can fork (state of the universe)
+        // Check if ZOLTAR universe is forking, revert if it's not forking
+        // Import a ZOLTAR binary fork query
+        // Deploy REP tokens for the child universes
         // Spawn child universes
         // Set outcomes in child universes and update their states to Forming
     }
