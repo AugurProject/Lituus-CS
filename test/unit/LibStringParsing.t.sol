@@ -27,6 +27,16 @@ contract LibStringParsingHarness {
     {
         return LibStringParsing.count(data, symbol, startInclusive, endExclusive);
     }
+
+    function countAndCheckAdjacency(
+        bytes calldata data,
+        bytes1 symbol,
+        bytes memory separators,
+        uint256 startInclusive,
+        uint256 endExclusive
+    ) external pure returns (uint256, bool) {
+        return LibStringParsing.countAndCheckAdjacency(data, symbol, separators, startInclusive, endExclusive);
+    }
 }
 
 contract LibStringParsingUnitTest is Test {
@@ -131,5 +141,93 @@ contract LibStringParsingUnitTest is Test {
     function test_Count_RevertsWhenEndOutOfBounds() public {
         vm.expectRevert(LibStringParsing.OutOfBounds.selector);
         harness.count(bytes("A,B,C"), bytes1(","), 0, 6);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                     countAndCheckAdjacency
+    //////////////////////////////////////////////////////////////*/
+
+    function test_CountAndCheck_WellFormedListReturnsFullCount() public view {
+        // "[A,B,C]" — 2 commas, no adjacent separators.
+        (uint256 commas, bool hasAdjacent) =
+            harness.countAndCheckAdjacency(bytes("[A,B,C]"), bytes1(","), "[,]", 0, 7);
+        assertEq(commas, 2);
+        assertFalse(hasAdjacent);
+    }
+
+    function test_CountAndCheck_DetectsConsecutiveCommas() public view {
+        // "[A,,B]" — the `,,` pair is at indices 2-3.
+        (, bool hasAdjacent) = harness.countAndCheckAdjacency(bytes("[A,,B]"), bytes1(","), "[,]", 0, 6);
+        assertTrue(hasAdjacent);
+    }
+
+    function test_CountAndCheck_DetectsOpenBracketComma() public view {
+        // "[,A]" — `[` then `,` is an adjacent pair from the set.
+        (, bool hasAdjacent) = harness.countAndCheckAdjacency(bytes("[,A]"), bytes1(","), "[,]", 0, 4);
+        assertTrue(hasAdjacent);
+    }
+
+    function test_CountAndCheck_DetectsCommaCloseBracket() public view {
+        // "[A,]" — `,` then `]` is an adjacent pair from the set.
+        (, bool hasAdjacent) = harness.countAndCheckAdjacency(bytes("[A,]"), bytes1(","), "[,]", 0, 4);
+        assertTrue(hasAdjacent);
+    }
+
+    function test_CountAndCheck_DetectsEmptyBrackets() public view {
+        // "[]" — `[` and `]` are adjacent.
+        (, bool hasAdjacent) = harness.countAndCheckAdjacency(bytes("[]"), bytes1(","), "[,]", 0, 2);
+        assertTrue(hasAdjacent);
+    }
+
+    function test_CountAndCheck_SingleAnswerListNoCommas() public view {
+        (uint256 commas, bool hasAdjacent) =
+            harness.countAndCheckAdjacency(bytes("[A]"), bytes1(","), "[,]", 0, 3);
+        assertEq(commas, 0);
+        assertFalse(hasAdjacent);
+    }
+
+    function test_CountAndCheck_PartialCountOnEarlyReturn() public view {
+        // "[A,B,,C,D]" — first valid commas are at 2 and 4 (2 commas), then `,,` at 4-5
+        // (actually indices: '[', 'A', ',', 'B', ',', ',', 'C', ',', 'D', ']'
+        //                     0    1    2    3    4    5    6    7    8    9
+        // So at i=5 (current `,`), prev (i=4) was also `,` → adjacency detected, return.
+        // `occurrences` at that moment counted commas at i=2 and i=4 → partial count = 2.
+        (uint256 commas, bool hasAdjacent) =
+            harness.countAndCheckAdjacency(bytes("[A,B,,C,D]"), bytes1(","), "[,]", 0, 10);
+        assertTrue(hasAdjacent);
+        assertEq(commas, 2);
+    }
+
+    function test_CountAndCheck_BoundedRange() public view {
+        // "X[A,B,C]Y" — count commas only inside brackets, no adjacency expected.
+        (uint256 commas, bool hasAdjacent) =
+            harness.countAndCheckAdjacency(bytes("X[A,B,C]Y"), bytes1(","), "[,]", 1, 8);
+        assertEq(commas, 2);
+        assertFalse(hasAdjacent);
+    }
+
+    function test_CountAndCheck_EmptyRange() public view {
+        (uint256 commas, bool hasAdjacent) =
+            harness.countAndCheckAdjacency(bytes("[A,B]"), bytes1(","), "[,]", 2, 2);
+        assertEq(commas, 0);
+        assertFalse(hasAdjacent);
+    }
+
+    function test_CountAndCheck_AbsentSeparatorsCountsNormally() public view {
+        // No bytes in the set → adjacency can never trigger; count works as plain count.
+        (uint256 commas, bool hasAdjacent) =
+            harness.countAndCheckAdjacency(bytes("A,B,C"), bytes1(","), "", 0, 5);
+        assertEq(commas, 2);
+        assertFalse(hasAdjacent);
+    }
+
+    function test_CountAndCheck_RevertsWhenStartGreaterThanEnd() public {
+        vm.expectRevert(LibStringParsing.InvalidRange.selector);
+        harness.countAndCheckAdjacency(bytes("[A,B]"), bytes1(","), "[,]", 4, 2);
+    }
+
+    function test_CountAndCheck_RevertsWhenEndOutOfBounds() public {
+        vm.expectRevert(LibStringParsing.OutOfBounds.selector);
+        harness.countAndCheckAdjacency(bytes("[A,B]"), bytes1(","), "[,]", 0, 6);
     }
 }

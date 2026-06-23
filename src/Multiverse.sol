@@ -573,20 +573,21 @@ contract Multiverse is ReentrancyGuard {
     /**
      * @notice Validates that `question` matches the format `<text>?[A1,A2,...,AN]` and that
      *         the parsed answer count equals `numberOfOutcomes`.
-     * @dev Composed from `LibStringParsing` primitives — one full-string `indexOf` to locate
-     *      `?` and one bounded `count` to tally `,` between brackets. Framing checks
-     *      (`[` immediately after `?`, `]` as the final byte) are O(1) byte reads.
+     * @dev Composed from `LibStringParsing` primitives:
+     *      - `indexOf("?")` locates the question/answer split.
+     *      - `countAndCheckAdjacency(",", "[,]")` fuses the answer count and the "no empty
+     *        answer" check into one pass over the bracket region. Using the full boundary
+     *        set `"[,]"` makes `[,`, `,,`, `,]` and the empty pair `[]` all manifest as
+     *        two adjacent separator bytes.
      *
      *      Strict structural checks:
      *      - `?` must appear at least once.
      *      - `[` must be the byte immediately after the first `?`.
      *      - `]` must be the last byte of the string.
+     *      - Every answer between separators must be at least one byte long.
      *
-     *      Accepted limitations (gas trade-off):
-     *      - Consecutive delimiters (`?[A,,B]`) and leading/trailing delimiters (`?[A,]`,
-     *        `?[,A]`) over-count answers. Detecting empty tokens would require a second
-     *        pass; the count is left to caller-side validation of `numberOfOutcomes`.
-     *      - Whitespace is not trimmed and multi-byte UTF-8 sequences are not interpreted.
+     *      Accepted limitation: whitespace is not trimmed and multi-byte UTF-8 sequences are
+     *      not interpreted — `"A "` and `"A"` are treated as distinct one-byte+ answers.
      * @param question         Calldata string holding the question and answer list.
      * @param numberOfOutcomes Expected number of comma-separated answers in the bracket list.
      */
@@ -602,14 +603,14 @@ contract Multiverse is ReentrancyGuard {
         uint256 closeIndex = length - 1;
         if (bytesQuestion[closeIndex] != bytes1("]")) revert InvalidQuery();
 
-        uint256 answerCount;
-        if (closeIndex - openIndex == 1) {
-            // Empty bracket pair "?[]".
-            answerCount = 0;
-        } else {
-            answerCount = bytesQuestion.count(bytes1(","), openIndex + 1, closeIndex) + 1;
-        }
+        // Single pass over the bracket region: count commas AND reject any empty answer.
+        // The range covers `[` and `]` themselves so `?[]` shows up as an adjacent pair.
+        (uint256 commas, bool hasAdjacent) =
+            bytesQuestion.countAndCheckAdjacency(bytes1(","), "[,]", openIndex, closeIndex + 1);
+        if (hasAdjacent) revert InvalidQuery();
 
-        if (answerCount != numberOfOutcomes) revert InvalidNumberOfOutcomes();
+        // After the adjacency check, every answer is non-empty:
+        //   answerCount = commas between brackets + 1
+        if (commas + 1 != numberOfOutcomes) revert InvalidNumberOfOutcomes();
     }
 }

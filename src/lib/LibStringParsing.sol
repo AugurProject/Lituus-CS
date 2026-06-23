@@ -81,4 +81,80 @@ library LibStringParsing {
             }
         }
     }
+
+    /**
+     * @notice Single-pass scan that counts occurrences of `symbol` in
+     *         `data[startInclusive..endExclusive)` and reports whether any two adjacent
+     *         bytes in the range are both members of `separators`.
+     *
+     *         Designed for the common pattern of validating a delimiter-separated list
+     *         where the caller needs both the element count and a "no empty elements"
+     *         check. Walks each byte once.
+     *
+     *         On the first detected adjacency the scan returns early with `hasAdjacent`
+     *         set to true and a *partial* `occurrences` count. Callers that revert on
+     *         adjacency (the expected pattern) never observe the partial count.
+     *
+     * @dev    Reverts with `OutOfBounds` when `endExclusive > data.length`, and with
+     *         `InvalidRange` when `startInclusive > endExclusive`.
+     *
+     * @param  data           Byte string to scan.
+     * @param  symbol         Single byte to count.
+     * @param  separators     Set of bytes treated as separators (duplicates harmless).
+     * @param  startInclusive Inclusive start offset of the range.
+     * @param  endExclusive   Exclusive end offset of the range.
+     * @return occurrences    Number of times `symbol` appears in the range — full count
+     *                        when `hasAdjacent` is false; partial otherwise.
+     * @return hasAdjacent    True if any two adjacent bytes in the range are both in
+     *                        `separators`.
+     */
+    function countAndCheckAdjacency(
+        bytes calldata data,
+        bytes1 symbol,
+        bytes memory separators,
+        uint256 startInclusive,
+        uint256 endExclusive
+    ) internal pure returns (uint256 occurrences, bool hasAdjacent) {
+        if (endExclusive > data.length) revert OutOfBounds();
+        if (startInclusive > endExclusive) revert InvalidRange();
+
+        // Build a 256-bit membership bitmap from `separators`:
+        // bit `b` is set iff byte value `b` belongs to the set.
+        // After this, membership of any byte is a single shift + bit-and.
+        uint256 mask = _toBitmask(separators);
+
+        // Walk the range once. `prevInSet` carries the previous byte's membership so
+        // adjacent separators are detected without a second pass. It starts false, so
+        // the very first byte can never trigger adjacency on its own.
+        bool prevInSet = false;
+        for (uint256 i = startInclusive; i < endExclusive;) {
+            bytes1 currentByte = data[i];
+            bool curInSet = ((mask >> uint8(currentByte)) & 1) == 1;
+            if (prevInSet && curInSet) {
+                return (occurrences, true);
+            }
+            if (currentByte == symbol) {
+                unchecked {
+                    occurrences += 1;
+                }
+            }
+            prevInSet = curInSet;
+            unchecked {
+                i += 1;
+            }
+        }
+    }
+
+    /// @dev Folds `separators` into a 256-bit membership bitmap (bit `b` is set iff byte
+    ///      `b` appears in the set). Kept private; callers build the mask implicitly each
+    ///      call.
+    function _toBitmask(bytes memory separators) private pure returns (uint256 mask) {
+        uint256 length = separators.length;
+        for (uint256 i = 0; i < length;) {
+            mask |= uint256(1) << uint8(separators[i]);
+            unchecked {
+                i += 1;
+            }
+        }
+    }
 }
