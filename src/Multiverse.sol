@@ -5,7 +5,7 @@ import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.s
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-import { IZoltar } from "./interfaces/IZoltar.sol";
+import { IZoltar, IZoltarQuestionData } from "./interfaces/IZoltar.sol";
 import { ILituusRep } from "./interfaces/ILituusRep.sol";
 import { LituusRep } from "./LituusRep.sol";
 import { IReputationToken } from "./interfaces/IReputationToken.sol";
@@ -23,6 +23,8 @@ contract Multiverse is ReentrancyGuard {
     uint8 public constant UNRESOLVED = 0; // the query is not resolved yet
     uint8 public constant INVALID = 254; // an invalid outcome value used for reporting an invalid fork outcome during
     // fork resolution. It is outside the valid outcome range [1, MAX_OUTCOMES]
+    // TODO: determine the max query length based on gas costs
+    uint16 public constant MAX_QUERY_LENGTH = 1024; // maximum length of a query string
 
     uint256 public constant THREE_DAYS = 3 days;
     uint256 public constant ONE_DAY = 1 days;
@@ -32,6 +34,8 @@ contract Multiverse is ReentrancyGuard {
 
     uint256 public immutable GENESIS_TIMESTAMP;
     IZoltar public immutable ZOLTAR;
+    // The ZoltarQuestionData contract is immutable in Zoltar so it can be cached here.
+    IZoltarQuestionData public immutable ZOLTAR_QUESTION_DATA;
     IQueryFeeController public immutable QUERY_FEE_CONTROLLER;
 
     /* ================================================== ENUMS ================================================== */
@@ -136,11 +140,14 @@ contract Multiverse is ReentrancyGuard {
     error QueryExpired();
     error AppealPeriodOver();
     error InvalidUniverseState();
+    error ZoltarQueryCreationFailed();
 
     /* =============================================== CONSTRUCTOR =============================================== */
     constructor(IZoltar _zoltar, uint248 _initialZoltarUniverseId, IQueryFeeController _queryFeeController) {
         ZOLTAR = _zoltar;
         if (address(ZOLTAR) == address(0)) revert ZeroAddress();
+        ZOLTAR_QUESTION_DATA = ZOLTAR.zoltarQuestionData();
+        if (address(ZOLTAR_QUESTION_DATA) == address(0)) revert ZeroAddress();
         QUERY_FEE_CONTROLLER = _queryFeeController;
         if (address(QUERY_FEE_CONTROLLER) == address(0)) revert ZeroAddress();
 
@@ -243,15 +250,26 @@ contract Multiverse is ReentrancyGuard {
             if (lastStake.time + ONE_DAY < block.timestamp) revert AppealPeriodOver();
         }
 
-        uint256 requiredStakeAmount = _requiredStakeAmount(activeUniverseId, queryId);
+        (uint256 requiredStakeAmount, uint256 forkThreshold) =
+            _requiredStakeAmountAndForkThreshold(activeUniverseId, queryId);
+        // TODO: If the bond before a fork bond is placed so that the next appeal would cause a fork,
+        // and its not possible to fork because the parent has still not resolved their fork,
+        // then the bond placing is reverted and the query is frozen until the parent universe resolves the fork.
 
         // Transfer the stake
         repToken.safeTransferFrom(msg.sender, address(this), requiredStakeAmount);
 
-        uint256 forkThreshold = ZOLTAR.getForkThreshold(activeUniverseId); // TODO: actual Lituus threshold will differ
         if (requiredStakeAmount >= forkThreshold) {
             // TODO: fork logic in a separate call
-            // If the universe cannot fork then revert
+            // If the universe cannot fork then:
+            // revert or keep the stake and freeze the query (TBD)
+            // Check conditions:
+            // 1. Current state of the universe
+            // 2. Zoltar universe is not forking
+
+            // Fork the universe here and in Zoltar and create child universes
+            // If Zoltar doesn't allow forking (maybe due to rate limiting)
+            // then accept the stake and freeze the query
         }
 
         // Update the resolution record for the universe
@@ -304,6 +322,13 @@ contract Multiverse is ReentrancyGuard {
         }
 
         // TODO: check Zoltar forking state
+        if (universe.forkState == ForkState.NotForking) {
+            // Check if Zoltar universe is forking
+            if (ZOLTAR.universes(activeUniverseId).forkTime != 0) {
+                // If Zoltar is forking, then we should mirror the fork in this universe
+                mirrorZoltarFork(activeUniverseId);
+            }
+        }
     }
 
     /* ========================================== ESCALATION FUNCTIONS =========================================== */
@@ -470,19 +495,19 @@ contract Multiverse is ReentrancyGuard {
         return queryResolutions[universeId][queryId].outcome;
     }
 
-    function _requiredStakeAmount(uint248 universeId, uint256 queryId) public view returns (uint256) {
+    function _requiredStakeAmountAndForkThreshold(uint248 universeId, uint256 queryId) public view returns (uint256 requiredStakeAmount, uint256 forkThreshold) {
+        forkThreshold = ZOLTAR.getForkThreshold(universeId);
         QueryResolution storage resolution = queryResolutions[universeId][queryId];
         uint256 numberOfStakes = resolution.stakes.length;
         if (numberOfStakes == 0) {
-            return QUERY_FEE_CONTROLLER.getQueryFee(universeId);
+            requiredStakeAmount = QUERY_FEE_CONTROLLER.getQueryFee(universeId);
         } else {
             uint256 lastStakeAmount = resolution.stakes[numberOfStakes - 1].amount;
-            uint256 requiredStakeAmount = lastStakeAmount * 2;
-            uint256 forkThreshold = ZOLTAR.getForkThreshold(universeId);
+            requiredStakeAmount = lastStakeAmount * 2;
             if (requiredStakeAmount >= forkThreshold / 2) {
-                return forkThreshold;
+                requiredStakeAmount = forkThreshold;
             } else {
-                return requiredStakeAmount;
+                requiredStakeAmount = requiredStakeAmount;
             }
         }
     }
@@ -493,15 +518,64 @@ contract Multiverse is ReentrancyGuard {
      */
 
     /* ============================================ FORKING FUNCTIONS ============================================ */
-    function forkUniverse(uint248 universeId, uint256 queryId) internal {
+    /// @notice Internal function for forking the universe
+    /// @dev All preconditions should be checked before calling this function.
+    function _forkLituusUniverse(uint248 universeId, uint256 queryId, uint8 outcomeId) internal {
+        Universe storage universe = universes[universeId];
+        // Create a question in ZOLTAR
+        // Form a string for the question.
+        // The question will be:
+        // "Is Green the valid outcome to the question "Color of the sky: Red/Blue/Green"?"
+        // Outcomes are YES and NO.
+        string memory question = _createForkQuestionString(queryId, outcomeId);
+
+        IZoltarQuestionData.QuestionData memory questionData;
+        questionData.title = question;
+        questionData.description = "";
+        questionData.startTime = block.timestamp - 1 days;
+        // in Zoltar: require(block.timestamp >= endTime, 'Question has not ended');
+        questionData.endTime = block.timestamp - 1 days;
+        questionData.numTicks = 0;
+        questionData.displayValueMin = 0;
+        questionData.displayValueMax = 0;
+        questionData.answerUnit = "";
+
+        string[] memory outcomes = new string[](2);
+        outcomes[0] = "NO";
+        outcomes[1] = "YES";
+
+        // Create a ZOLTAR binary fork query
+        uint256 zoltarQueryId = ZOLTAR_QUESTION_DATA.createQuestion(questionData, outcomes);
+        if (zoltarQueryId == 0) revert ZoltarQueryCreationFailed();
+
+        // REP token will get burned by Zoltar without approval
+        // Create a fork in ZOLTAR
+        // TODO: possibly wrap in try-catch to avoid wasting gas if the decision is to keep the fork stake
+        ZOLTAR.forkUniverse(universeId, zoltarQueryId);
+        // Deploy child universes in Zoltar
+        // NO-universe
+        ZOLTAR.deployChild(universeId, 0);
+        // YES-universe
+        ZOLTAR.deployChild(universeId, 1);
+        _spawnChildUniverses(universeId, queryId);
+        // TODO: Update the universe's fork state to Migration and set the forkQuery
+        universe.forkState = ForkState.Migration;
+        universe.forkQuery = queryId;
+    }
+
+    function _spawnChildUniverses(uint248 universeId, uint256 queryId) internal {
+        // TODO
+        // Spawn child universes
+        // Deploy REP tokens for the child universes
+        // Set outcomes in child universes and update their states to Forming
+    }
+
+    function mirrorZoltarFork(uint248 universeId) public {
         // TODO
         // Check if the universe can fork (state of the universe)
-        // Check if ZOLTAR is not forking, revert if it's forking
-        // Handle if the query should fork but the universe cannot fork
-        // Create a ZOLTAR binary fork query
-        // Approve REP for ZOLTAR
-        // Create a fork in ZOLTAR
-        // TODO: Update the universe's fork state to Awaiting children and set the forkQuery
+        // Check if ZOLTAR universe is forking, revert if it's not forking
+        // Import a ZOLTAR binary fork query
+        // Deploy REP tokens for the child universes
         // Spawn child universes
         // Set outcomes in child universes and update their states to Forming
     }
@@ -549,5 +623,11 @@ contract Multiverse is ReentrancyGuard {
             resolution.queryCreateTime = uint48(queryCreateTime);
             return queryCreateTime;
         }
+    }
+
+    function _createForkQuestionString(uint256 queryId, uint8 outcomeId) internal view returns (string memory) {
+        // TODO: Placeholder for now
+        Query storage query = queries[queryId];
+        return query.question;
     }
 }
