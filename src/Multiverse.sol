@@ -90,6 +90,8 @@ contract Multiverse is ReentrancyGuard {
         uint256 forkQuery;
         uint256 supplyBeforeFork;
         address queryTokenizer;
+        uint8 forkOutcome;
+        bool isLituusFork; // If it's not Lituus fork then no payouts are necessary
     }
 
     struct UniverseRevenues {
@@ -141,6 +143,8 @@ contract Multiverse is ReentrancyGuard {
     error AppealPeriodOver();
     error InvalidUniverseState();
     error ZoltarQueryCreationFailed();
+    error ZoltarUniverseIsNotForking();
+    error InvalidZoltarQuestion();
 
     /* =============================================== CONSTRUCTOR =============================================== */
     constructor(IZoltar _zoltar, uint248 _initialZoltarUniverseId, IQueryFeeController _queryFeeController) {
@@ -495,7 +499,11 @@ contract Multiverse is ReentrancyGuard {
         return queryResolutions[universeId][queryId].outcome;
     }
 
-    function _requiredStakeAmountAndForkThreshold(uint248 universeId, uint256 queryId) public view returns (uint256 requiredStakeAmount, uint256 forkThreshold) {
+    function _requiredStakeAmountAndForkThreshold(uint248 universeId, uint256 queryId)
+        public
+        view
+        returns (uint256 requiredStakeAmount, uint256 forkThreshold)
+    {
         forkThreshold = ZOLTAR.getForkThreshold(universeId);
         QueryResolution storage resolution = queryResolutions[universeId][queryId];
         uint256 numberOfStakes = resolution.stakes.length;
@@ -557,27 +565,84 @@ contract Multiverse is ReentrancyGuard {
         ZOLTAR.deployChild(universeId, 0);
         // YES-universe
         ZOLTAR.deployChild(universeId, 1);
-        _spawnChildUniverses(universeId, queryId);
-        // TODO: Update the universe's fork state to Migration and set the forkQuery
+        _spawnChildUniverse(universeId, queryId, outcomeId, 0);
+        _spawnChildUniverse(universeId, queryId, outcomeId, 1);
+        // TODO: Split the REP token supply in the child universes via Zoltar
         universe.forkState = ForkState.Migration;
         universe.forkQuery = queryId;
+        universe.isLituusFork = true;
+        universe.forkOutcome = outcomeId;
     }
 
-    function _spawnChildUniverses(uint248 universeId, uint256 queryId) internal {
-        // TODO
-        // Spawn child universes
-        // Deploy REP tokens for the child universes
-        // Set outcomes in child universes and update their states to Forming
+    function _spawnChildUniverse(uint248 universeId, uint256 queryId, uint8 forkingOutcomeId, uint8 zoltarOutcomeId)
+        internal
+    {
+        uint248 childUniverseId = ZOLTAR.getChildUniverseId(universeId, zoltarOutcomeId);
+        if (childUniverseId == 0) revert InvalidUniverse();
+
+        IReputationToken childUniverseZoltarRepToken = ZOLTAR.getRepToken(childUniverseId);
+        // Deploy a Lituus REP token that wraps the Zoltar REP token
+        // TODO: Discuss the format of the suffix if the forks are for binary queries.
+        ILituusRep childUniverseRepToken =
+            new LituusRep(address(this), address(childUniverseZoltarRepToken), "Lituus Reputation Token", "REP0.0");
+        Universe storage childUniverse = universes[childUniverseId];
+        childUniverse.repToken = childUniverseRepToken;
+        childUniverse.forkState = ForkState.Forming;
+        childUniverse.forkTime = uint48(block.timestamp);
+        childUniverse.parent = universeId;
+        childUniverse.favoriteChild = 0;
+        childUniverse.heir = 0;
+        // TODO: populate the history
+        childUniverse.history = 0;
+        childUniverse.forkQuery = 0;
+        childUniverse.supplyBeforeFork = ZOLTAR.getUniverseTheoreticalSupply(childUniverseId);
+
+        // Set outcomes in forking queries in child universes
+        QueryResolution storage resolution = queryResolutions[childUniverseId][queryId];
+        resolution.queryCreateTime = uint48(block.timestamp);
+        if (zoltarOutcomeId == 1) {
+            // The query is resolved in the Yes-universe
+            resolution.outcome = forkingOutcomeId;
+        }
     }
 
-    function mirrorZoltarFork(uint248 universeId) public {
+    function mirrorZoltarFork(uint248 universeId) public nonReentrant {
         // TODO
         // Check if the universe can fork (state of the universe)
+        Universe storage universe = universes[universeId];
+        if (universe.forkState != ForkState.NotForking) revert InvalidUniverseState();
         // Check if ZOLTAR universe is forking, revert if it's not forking
+        IZoltar.Universe memory zoltarUniverse = ZOLTAR.universes(universeId);
+        if (zoltarUniverse.forkTime == 0) revert ZoltarUniverseIsNotForking();
+
         // Import a ZOLTAR binary fork query
-        // Deploy REP tokens for the child universes
+        uint256 forkQuestionId = zoltarUniverse.forkQuestionId;
+        IZoltarQuestionData.QuestionData memory questionData = ZOLTAR_QUESTION_DATA.questions(forkQuestionId);
+        if (questionData.endTime == 0) revert InvalidZoltarQuestion();
+
+        uint256 queryId = queryCount;
+
+        Query storage query = queries[queryId];
+        // TODO: check if the outcomes should be YES and NO and what should be their indexes
+        query.numberOfOutcomes = 3; // 0 is Unresolved, 1 is NO, 2 is YES
+        query.originUniverse = universeId;
+        query.fee = 0;
+        query.question = questionData.title;
+
+        // Emit an event
+        emit QueryCreated(msg.sender, queryId, universeId, questionData.title, 2);
+
+        queryCount++;
+
         // Spawn child universes
+        // TODO: check if the outcomes should be YES and NO or the same as in Zoltar
+        // TODO: what if the Zoltar query has more than 2 outcomes?
+        _spawnChildUniverse(universeId, queryId, 1, 0); // Forking over outcome 1 in Zoltar
+        _spawnChildUniverse(universeId, queryId, 1, 1);
         // Set outcomes in child universes and update their states to Forming
+        universe.forkState = ForkState.Migration;
+        universe.forkQuery = queryId;
+        universe.forkOutcome = 1;
     }
 
     /* =========================================== INTERNAL HELPERS ============================================== */

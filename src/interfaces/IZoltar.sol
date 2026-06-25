@@ -45,4 +45,6 @@ interface IZoltarQuestionData {
     function createQuestion(QuestionData memory questionData, string[] calldata outcomeOptions)
         external
         returns (uint256);
+
+    function questions(uint256 questionId) external view returns (QuestionData memory);
 }
