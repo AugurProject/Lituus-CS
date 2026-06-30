@@ -15,6 +15,7 @@ cbor_metadata   = false
 gas_reports     = ["*"]
 fs_permissions  = [{ access = "read-write", path = "./broadcast" }]
 ignored_warnings_from = ["lib"] # ignoring warnings from external packages
+allow_internal_expect_revert = true
 
 fuzz      = { runs = 256 }
 invariant = { runs = 256, depth = 15, fail_on_revert = false, call_override = false }
