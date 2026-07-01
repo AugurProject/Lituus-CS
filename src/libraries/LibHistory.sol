@@ -7,9 +7,10 @@ pragma solidity ^0.8.35;
  *         enabling O(1) ancestor checks via prefix matching.
  * @dev    Encoding is MSB-first / left-aligned. The genesis universe has `history == 0` and
  *         `forkDepth == 0`. Each binary fork appends one bit (the branch taken, 0 or 1) to the
- *         path; the bit for fork level `i` (0-based) lives at bit `255 - i`, so the oldest fork is
- *         the most-significant bit (i=0 -> bit 255, i=255 -> bit 0). A path of depth `d` therefore
- *         occupies the top `d` bits and the remaining `256 - d` low bits MUST be zero.
+ *         path; the bit for fork depth `i` (1-based because depth 0 is the genesis) lives at bit
+ *         `256 - i`, so the oldest fork is the most-significant bit (i=1 -> bit 255, i=256 -> bit 0).
+ *         A path of depth `d` therefore occupies the top `d` bits and the remaining `256 - d`
+ *         low bits MUST be zero.
  *
  *         `forkDepth` is required to disambiguate paths: a branch-0 fork sets no bit, so a history
  *         alone cannot distinguish e.g. "0" (depth 1) from genesis (depth 0) — the depth carries
@@ -108,8 +109,8 @@ library LibHistory {
      * @notice Returns whether a history has no bits set below its declared depth, i.e. only the top
      *         `depth` bits are used as the path.
      * @dev This is the well-formedness invariant for a (history, depth) pair. At `depth == 0` it
-     *      requires `history == 0`; at `depth == MAX_FORK_DEPTH` the whole word is path so it is
-     *      always true (the mask shifts to 0).
+     *      requires `history == 0`; at `depth == MAX_FORK_DEPTH` the whole bytes32 value is path
+     *      so it is always true (the mask shifts to 0).
      *      The check that depth does not exceed {MAX_FORK_DEPTH} is left to the caller.
      * @param history The history bitmap to check.
      * @param depth The declared fork depth (number of leading path bits).

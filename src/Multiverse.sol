@@ -82,6 +82,9 @@ contract Multiverse is ReentrancyGuard {
         // The depth of the universe in the fork tree
         // Genesis universe has depth 0, its children have depth 1, etc. Max 256.
         uint16 forkDepth;
+        // Whether this universe lies on the canonical timeline (the genesis -> favoriteChild -> ... chain).
+        // Genesis is canonical; on a fork, only the designated favoriteChild inherits the parent's flag.
+        bool isCanonical;
         uint248 parent;
         uint248 favoriteChild;
         uint248 heir;
@@ -167,9 +170,10 @@ contract Multiverse is ReentrancyGuard {
         genesisUniverse.forkState = ForkState.NotForking;
         genesisUniverse.forkTime = uint48(block.timestamp);
         genesisUniverse.heir = 0;
-        // Genesis is the root of the fork tree: an empty inheritance path.
+        // Genesis is the root of the fork tree: an empty inheritance path, and the root of the canonical timeline.
         genesisUniverse.history = 0;
         genesisUniverse.forkDepth = 0;
+        genesisUniverse.isCanonical = true;
         genesisUniverse.forkQuery = 0;
         // TODO: fill in the correct supply
         genesisUniverse.supplyBeforeFork = ZOLTAR.getUniverseTheoreticalSupply(_initialZoltarUniverseId);
@@ -286,7 +290,7 @@ contract Multiverse is ReentrancyGuard {
     }
 
     function resolve(uint248 universeId, uint256 queryId) external nonReentrant {
-        (uint248 activeUniverseId, Universe storage universe, ILituusRep repToken) =
+        (uint248 activeUniverseId, Universe storage activeUniverse, ILituusRep repToken) =
             _getActiveUniverseAndRepToken(universeId);
 
         Query storage query = queries[queryId];
@@ -304,9 +308,7 @@ contract Multiverse is ReentrancyGuard {
             if (_findAncestorResolution(activeUniverseId, queryId) != UNRESOLVED) revert QueryAlreadyResolved();
             // If the report period has passed and the query was not reported on then resolve the query as INVALID
             resolution.outcome = INVALID;
-            // Record this universe as one where the query is resolved, so heir universes can find it
-            // as an ancestor resolution via getOutcome().
-            query.resolvedUniverses.push(activeUniverseId);
+            _recordResolvedUniverse(queryId, activeUniverseId, activeUniverse.isCanonical);
             emit QueryResolved(msg.sender, activeUniverseId, queryId, INVALID);
             // TODO: Payout to the resolver, another clock auction
         } else if (resolution.stakes.length > 0) {
@@ -315,9 +317,7 @@ contract Multiverse is ReentrancyGuard {
                 // TODO: Unless the query is 1 step from fork threshold, then we should wait for the fork to finish
                 uint8 outcome = _calculateOutcomeAndEscalationPayoffs(activeUniverseId, queryId);
                 resolution.outcome = outcome;
-                // Record this universe as one where the query is resolved, so heir universes can find it
-                // as an ancestor resolution via getOutcome().
-                query.resolvedUniverses.push(activeUniverseId);
+                _recordResolvedUniverse(queryId, activeUniverseId, activeUniverse.isCanonical);
                 emit QueryResolved(msg.sender, activeUniverseId, queryId, outcome);
                 // TODO: Payouts
             } else {
@@ -539,6 +539,22 @@ contract Multiverse is ReentrancyGuard {
             }
         }
         return UNRESOLVED;
+    }
+
+    /**
+     * @notice Records `universeId` as a universe where `queryId` is resolved.
+     * @dev Keeps a canonical universe's entry at index 0 so `_findAncestorResolution` finds the canonical
+     *      resolution first (the common-case read). Safe because the canonical chain is a single linear
+     *      path, so at most one canonical universe ever resolves a given query. Saves gas during lookups.
+     */
+    function _recordResolvedUniverse(uint256 queryId, uint248 universeId, bool isCanonical) internal {
+        uint248[] storage resolvedUniverses = queries[queryId].resolvedUniverses;
+        if (isCanonical && resolvedUniverses.length > 0) {
+            resolvedUniverses.push(resolvedUniverses[0]); // move current head to the tail
+            resolvedUniverses[0] = universeId; // canonical entry takes index 0
+        } else {
+            resolvedUniverses.push(universeId);
+        }
     }
 
     function _requiredStakeAmount(uint248 universeId, uint256 queryId) public view returns (uint256) {
