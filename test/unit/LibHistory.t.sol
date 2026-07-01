@@ -3,7 +3,6 @@ pragma solidity ^0.8.35;
 
 import { Test } from "forge-std/Test.sol";
 import { LibHistory } from "src/libraries/LibHistory.sol";
-import "forge-std/console.sol";
 
 // Test for the LibHistory library (path-of-inheritance bitmap).
 //
@@ -11,7 +10,7 @@ import "forge-std/console.sol";
 //
 
 contract LibHistoryTest is Test {
-    /* ----------------------------------- appendBit ---------------------------------- */
+    /* ----------------------------------- appendHistory ---------------------------------- */
 
     /// genesis (history 0, depth 0) -> child on branch 0 and branch 1 produce distinct (history, depth).
     function test_appendHistory_genesisChildren_distinct() public {
@@ -21,8 +20,6 @@ contract LibHistoryTest is Test {
         assertEq(d1, 1);
         assertEq(h0, 0x0000000000000000000000000000000000000000000000000000000000000000); // 0....
         assertEq(h1, 0x8000000000000000000000000000000000000000000000000000000000000000); // 1....
-        console.logBytes(abi.encodePacked(h0));
-        console.logBytes(abi.encodePacked(h1));
         assertTrue(h0 != h1);
     }
 
@@ -39,7 +36,6 @@ contract LibHistoryTest is Test {
         (history, depth) = LibHistory.appendHistory(history, depth, 1); // 01101
         (history, depth) = LibHistory.appendHistory(history, depth, 0); // 011010
         assertEq(depth, 6);
-        console.logBytes(abi.encodePacked(history));
         assertEq(history, 0x6800000000000000000000000000000000000000000000000000000000000000); // 011010.....
     }
 
@@ -154,15 +150,11 @@ contract LibHistoryTest is Test {
     function test_isAncestor_revertsOnMalformedAncestor() public {
         // depth 0 must mean an all-zero history; a non-zero genesis history is malformed.
         vm.expectRevert(LibHistory.HistoryAndDepthMismatch.selector);
-        LibHistory.isAncestor(
-            0x8000000000000000000000000000000000000000000000000000000000000000, 0, bytes32(0), 5
-        );
+        LibHistory.isAncestor(0x8000000000000000000000000000000000000000000000000000000000000000, 0, bytes32(0), 5);
         // a stray bit below the claimed depth is also malformed.
         bytes32 strayBelowDepth = 0x6100000000000000000000000000000000000000000000000000000000000000; // 0110...1...
         vm.expectRevert(LibHistory.HistoryAndDepthMismatch.selector);
-        LibHistory.isAncestor(
-            strayBelowDepth, 4, 0x6100000000000000000000000000000000000000000000000000000000000000, 8
-        );
+        LibHistory.isAncestor(strayBelowDepth, 4, 0x6100000000000000000000000000000000000000000000000000000000000000, 8);
     }
 
     /// reverts when the descendant history has bits set below its depth (malformed: history/depth mismatch).
@@ -179,24 +171,14 @@ contract LibHistoryTest is Test {
     function test_isEmptyAfterDepth() public {
         // depth 0 requires an entirely empty history.
         assertTrue(LibHistory.isEmptyAfterDepth(bytes32(0), 0));
-        assertFalse(
-            LibHistory.isEmptyAfterDepth(0x8000000000000000000000000000000000000000000000000000000000000000, 0)
-        );
+        assertFalse(LibHistory.isEmptyAfterDepth(0x8000000000000000000000000000000000000000000000000000000000000000, 0));
         // a single top bit is consumed by depth 1, leaving the rest empty.
-        assertTrue(
-            LibHistory.isEmptyAfterDepth(0x8000000000000000000000000000000000000000000000000000000000000000, 1)
-        );
+        assertTrue(LibHistory.isEmptyAfterDepth(0x8000000000000000000000000000000000000000000000000000000000000000, 1));
         // "011010" is clean at depth 6 but a stray low bit is not.
-        assertTrue(
-            LibHistory.isEmptyAfterDepth(0x6800000000000000000000000000000000000000000000000000000000000000, 6)
-        );
-        assertFalse(
-            LibHistory.isEmptyAfterDepth(0x6800000000000000000000000000000000000000000000000000000000000001, 6)
-        );
+        assertTrue(LibHistory.isEmptyAfterDepth(0x6800000000000000000000000000000000000000000000000000000000000000, 6));
+        assertFalse(LibHistory.isEmptyAfterDepth(0x6800000000000000000000000000000000000000000000000000000000000001, 6));
         // at full depth the whole word is path, so any history is "empty after".
-        assertTrue(
-            LibHistory.isEmptyAfterDepth(bytes32(type(uint256).max), 256)
-        );
+        assertTrue(LibHistory.isEmptyAfterDepth(bytes32(type(uint256).max), 256));
     }
 
     /* ------------------------------------- fuzz ------------------------------------- */
@@ -205,9 +187,7 @@ contract LibHistoryTest is Test {
     function testFuzz_appendThenAncestor(bytes32 parentHistory, uint16 parentDepth, bool branch) public {
         parentDepth = uint16(bound(parentDepth, 0, 255));
         parentHistory = _clearHistoryAfterDepth(parentHistory, parentDepth);
-        console.logBytes(abi.encodePacked(parentHistory));
-        (bytes32 childHistory, uint16 childDepth) =
-            LibHistory.appendHistory(parentHistory, parentDepth, branch ? 1 : 0);
+        (bytes32 childHistory, uint16 childDepth) = LibHistory.appendHistory(parentHistory, parentDepth, branch ? 1 : 0);
         assertTrue(LibHistory.isAncestor(parentHistory, parentDepth, childHistory, childDepth));
     }
 

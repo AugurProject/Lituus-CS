@@ -290,8 +290,7 @@ contract Multiverse is ReentrancyGuard {
     }
 
     function resolve(uint248 universeId, uint256 queryId) external nonReentrant {
-        (uint248 activeUniverseId, Universe storage activeUniverse, ILituusRep repToken) =
-            _getActiveUniverseAndRepToken(universeId);
+        (uint248 activeUniverseId, Universe storage activeUniverse,) = _getActiveUniverseAndRepToken(universeId);
 
         Query storage query = queries[queryId];
         if (query.numberOfOutcomes == 0) revert InvalidQuery();
@@ -511,6 +510,10 @@ contract Multiverse is ReentrancyGuard {
         // report()/resolve() record resolutions. Reverts only if the universe does not exist; outcomes
         // remain readable while the universe is forking (no fork-state check, unlike report/resolve).
         (uint248 activeUniverseId,) = _getActiveUniverse(universeId);
+        if (activeUniverseId != universeId) {
+            uint8 heirOutcome = queryResolutions[activeUniverseId][queryId].outcome;
+            if (heirOutcome != UNRESOLVED) return heirOutcome;
+        }
 
         // Otherwise inherit the resolution from an ancestor universe, if any.
         return _findAncestorResolution(activeUniverseId, queryId);
@@ -519,8 +522,7 @@ contract Multiverse is ReentrancyGuard {
     /**
      * @notice Returns the outcome of the first ancestor of `universeId` that has resolved `queryId`.
      * @dev Scans the query's recorded resolution universes and prefix-matches their inheritance path
-     *      against `universeId`'s path. Does NOT consider a resolution in `universeId` itself — callers
-     *      handle the local resolution separately. A query is resolved at most once along any single
+     *      against `universeId`'s path. A query is resolved at most once along any single
      *      lineage, so the first ancestor match is authoritative. Returns UNRESOLVED if no ancestor
      *      has resolved the query.
      */
