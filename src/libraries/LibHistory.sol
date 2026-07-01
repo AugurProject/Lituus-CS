@@ -51,12 +51,15 @@ library LibHistory {
         pure
         returns (bytes32 newHistory, uint16 newForkDepth)
     {
+        // Provided fork depth should be strictly less than MAX_FORK_DEPTH, because the new depth will be forkDepth + 1.
         if ((forkDepth >= MAX_FORK_DEPTH)) {
             revert ForkDepthOverflow();
         }
+        // Check that the history is well-formed: all bits below the top `forkDepth` bits must be zero.
         if (!isEmptyAfterDepth(history, forkDepth)) {
             revert HistoryAndDepthMismatch();
         }
+        // Only two branches are valid for the binary fork: 0 or 1.
         if (forkOutcomeIndex > 1) {
             revert InvalidForkOutcomeIndex();
         }
@@ -100,8 +103,17 @@ library LibHistory {
         }
         // Compare the top `ancestorForkDepth` bits. At depth 0 the mask is 0 (shift by 256),
         // so genesis (history 0) matches every descendant.
+        // The shift is the number of low bits to clear, so the mask is all 1s in the top `ancestorForkDepth` bits and
+        // 0s below.
         uint256 shift = MAX_FORK_DEPTH - ancestorForkDepth;
+        // The mask is 1s in the top `ancestorForkDepth` bits and 0s below (to get the prefix for comparison).
         uint256 mask = uint256(type(uint256).max) << shift;
+        // ANDing the mask with the descendant history clears all bits below that depth.
+        // Compare the masked descendant history to the ancestor history:
+        // if they are equal, the ancestor's path is a prefix of the descendant's path.
+        // Example: ancestor depth 3, history 010... (top 3 bits), descendant depth 5, history 01010... (top 5 bits).
+        // shift = 256 - 3 = 253, mask = 111000...0 (top 3 bits are set to 1, the rest are set to 0)
+        // descendantHistory & mask = 01010... & 11100.... = 01000..., this prefix equals ancestorHistory.
         return ancestorHistory == (descendantHistory & bytes32(mask));
     }
 
@@ -117,7 +129,15 @@ library LibHistory {
      * @return True if all bits below the top `depth` bits are zero.
      */
     function isEmptyAfterDepth(bytes32 history, uint16 depth) internal pure returns (bool) {
+        // The mask is 0s in the top `depth` bits and 1s below (to check that all lower bits are zero).
+        // Example: depth 3, mask = 000111...1 (top 3 bits are set to 0, the rest are set to 1)
         uint256 mask = uint256(type(uint256).max) >> depth;
+        // ANDing the mask with the history clears all bits above that depth.
+        // If the result is 0, then all bits below that depth are zero, so the history is well-formed.
+        // Example (positive): history = 01000..., depth is 3, mask = 000111...1, history & mask = 00000..., which is
+        // zero, so the history is well-formed.
+        // Example (negative): history = 01010..., depth is 3, mask = 000111...1,
+        // history & mask = 00010..., which is not zero, so the history is malformed.
         return (history & bytes32(mask)) == 0;
     }
 }
