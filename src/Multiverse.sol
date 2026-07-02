@@ -18,10 +18,15 @@ contract Multiverse is ReentrancyGuard {
     using SafeERC20 for ILituusRep;
 
     /* ========================================== CONSTANTS/IMMUTABLES =========================================== */
-    uint8 public constant MAX_OUTCOMES = 253; //number of outcomes for a query
+    // Query outcomes:
+    // 0 - UNRESOLVED
+    // 2..254 - valid outcomes (2 is [YES,NO], for example)
+    // 255 - INVALID
+    uint8 public constant MAX_OUTCOMES = 254; //number of outcomes for a query (not including UNRESOLVED and INVALID)
+    uint8 public constant MIN_OUTCOMES = 2; //minimum number of valid outcomes for a query
     uint8 public constant MAX_FORK_OUTCOMES = 2; //number of outcomes for a forking query
     uint8 public constant UNRESOLVED = 0; // the query is not resolved yet
-    uint8 public constant INVALID = 254; // an invalid outcome value used for reporting an invalid fork outcome during
+    uint8 public constant INVALID = 255; // an invalid outcome value used for reporting an invalid fork outcome during
     // fork resolution. It is outside the valid outcome range [1, MAX_OUTCOMES]
 
     uint256 public constant THREE_DAYS = 3 days;
@@ -182,11 +187,11 @@ contract Multiverse is ReentrancyGuard {
 
     /* ============================================= QUERY FUNCTIONS ============================================= */
     function createQuery(uint248 universeId, string calldata question, uint8 numberOfOutcomes) external nonReentrant {
-        (uint248 activeUniverseId, Universe storage universe, ILituusRep repToken) =
-            _getActiveUniverseAndRepToken(universeId);
+        (uint248 activeUniverseId,,ILituusRep repToken) = _getActiveUniverseAndRepToken(universeId);
 
         // Validate the question and number of outcomes
-        if (numberOfOutcomes <= 2) revert InvalidNumberOfOutcomes();
+        // Only meaningful outcomes should be included. UNRESOLVED and INVALID are accounted for separately
+        if (numberOfOutcomes < MIN_OUTCOMES) revert InvalidNumberOfOutcomes();
         if (numberOfOutcomes > MAX_OUTCOMES) revert InvalidNumberOfOutcomes();
 
         // TODO: Here we need to actually check if question contains the same numberOfOutcomes needed.
@@ -217,8 +222,7 @@ contract Multiverse is ReentrancyGuard {
 
     function report(uint248 universeId, uint256 queryId, uint8 outcome) external nonReentrant {
         // Check all conditions (universe exists, query exists, outcome is valid, report is within time, etc.)
-        (uint248 activeUniverseId, Universe storage universe, ILituusRep repToken) =
-            _getActiveUniverseAndRepToken(universeId);
+        (uint248 activeUniverseId,,ILituusRep repToken) = _getActiveUniverseAndRepToken(universeId);
 
         Query storage query = queries[queryId];
         if (query.numberOfOutcomes == 0) revert InvalidQuery();
@@ -270,7 +274,7 @@ contract Multiverse is ReentrancyGuard {
     }
 
     function resolve(uint248 universeId, uint256 queryId) external nonReentrant {
-        (uint248 activeUniverseId, Universe storage universe, ILituusRep repToken) =
+        (uint248 activeUniverseId,,) =
             _getActiveUniverseAndRepToken(universeId);
 
         Query storage query = queries[queryId];
