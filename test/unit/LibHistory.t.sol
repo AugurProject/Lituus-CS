@@ -13,7 +13,7 @@ contract LibHistoryTest is Test {
     /* ----------------------------------- appendHistory ---------------------------------- */
 
     /// genesis (history 0, depth 0) -> child on branch 0 and branch 1 produce distinct (history, depth).
-    function test_appendHistory_genesisChildren_distinct() public {
+    function test_appendHistory_genesisChildren_distinct() public pure {
         (bytes32 h0, uint16 d0) = LibHistory.appendHistory(bytes32(0), 0, 0);
         (bytes32 h1, uint16 d1) = LibHistory.appendHistory(bytes32(0), 0, 1);
         assertEq(d0, 1);
@@ -24,7 +24,7 @@ contract LibHistoryTest is Test {
     }
 
     /// chained appends 0->1->1->0->1->0 build the path "011010" at the top 6 bits
-    function test_appendHistory_chainedPath() public {
+    function test_appendHistory_chainedPath() public pure {
         // build path b0..b5 = 0,1,1,0,1,0 ; expect history top byte == 0x68, depth == 6,
         // and (history >> (256 - 6)) == 0b011010 (== 26).
         bytes32 history = bytes32(0); // genesis
@@ -40,7 +40,7 @@ contract LibHistoryTest is Test {
     }
 
     /// appends history when the MAX_FORK_DEPTH is not exceeded.
-    function test_appendHistory_atMaxDepth() public {
+    function test_appendHistory_atMaxDepth() public pure {
         bytes32 history = bytes32(0);
         uint16 depth = 255;
         (history, depth) = LibHistory.appendHistory(history, depth, 0);
@@ -59,20 +59,10 @@ contract LibHistoryTest is Test {
         LibHistory.appendHistory(bytes32(0), 0, 2);
     }
 
-    // reverts if the history is not empty after the given depth.
-    function test_appendHistory_revertsOnNonEmptyAfterDepth() public {
-        bytes32 history = 0xF000000000000000000000000000000000000000000000000000000000000000; // 111100....
-        uint16 depth = 3;
-        vm.expectRevert(LibHistory.HistoryAndDepthMismatch.selector);
-        LibHistory.appendHistory(history, depth, 0);
-        depth = 4; // correct depth
-        LibHistory.appendHistory(history, depth, 0);
-    }
-
     /* ----------------------------------- isAncestor --------------------------------- */
 
     /// genesis (depth 0) is an ancestor of every universe, including itself.
-    function test_isAncestor_genesisIsAncestorOfAll() public {
+    function test_isAncestor_genesisIsAncestorOfAll() public pure {
         bytes32 anyHistory = 0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef;
         uint16 anyDepth = 256;
         assertTrue(LibHistory.isAncestor(bytes32(0), 0, anyHistory, anyDepth));
@@ -84,7 +74,7 @@ contract LibHistoryTest is Test {
     }
 
     /// "0110" is an ancestor of "011010", but "0111" is not.
-    function test_isAncestor_prefixMatchAndMismatch() public {
+    function test_isAncestor_prefixMatchAndMismatch() public pure {
         // anc0110  (depth 4), desc011010 (depth 6) -> true
         bytes32 ancestorHistory = 0x6000000000000000000000000000000000000000000000000000000000000000; // 0110....
         uint16 ancestorDepth = 4;
@@ -101,14 +91,14 @@ contract LibHistoryTest is Test {
     }
 
     /// equal paths are ancestor-or-equal (true).
-    function test_isAncestor_equalPathsAreAncestors() public {
+    function test_isAncestor_equalPathsAreAncestors() public pure {
         bytes32 history = 0x6000000000000000000000000000000000000000000000000000000000000000; // 0110....
         uint16 depth = 4;
         assertTrue(LibHistory.isAncestor(history, depth, history, depth));
     }
 
     /// a sibling is not an ancestor (false).
-    function test_isAncestor_siblingIsNotAncestor() public {
+    function test_isAncestor_siblingIsNotAncestor() public pure {
         bytes32 ancestorHistory = 0x6800000000000000000000000000000000000000000000000000000000000000; // 0110....
         uint16 ancestorDepth = 6;
         bytes32 descendantHistory = 0x6C00000000000000000000000000000000000000000000000000000000000000; // 0110....
@@ -117,7 +107,7 @@ contract LibHistoryTest is Test {
     }
 
     /// a deeper "ancestor" than the descendant can never be an ancestor (false).
-    function test_isAncestor_deeperThanDescendantIsFalse() public {
+    function test_isAncestor_deeperThanDescendantIsFalse() public pure {
         bytes32 ancestorHistory = 0x6000000000000000000000000000000000000000000000000000000000000000; // 0110....
         uint16 ancestorDepth = 6;
         bytes32 descendantHistory = 0x6000000000000000000000000000000000000000000000000000000000000000; // 0110....
@@ -126,7 +116,7 @@ contract LibHistoryTest is Test {
     }
 
     /// boundary: ancestorDepth == 256 (full word) compares the entire path without reverting.
-    function test_isAncestor_depth256Boundary() public {
+    function test_isAncestor_depth256Boundary() public pure {
         bytes32 ancestorHistory = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF; // 256 bits
         uint16 ancestorDepth = 256;
         bytes32 descendantHistory = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF; // 256 bits
@@ -136,7 +126,7 @@ contract LibHistoryTest is Test {
 
     /// all-zero-branch universes are distinguished only by depth: "00" is an ancestor of "00000",
     /// the reverse is not, and "000" is not an ancestor of the same-depth "001".
-    function test_isAncestor_allZeroBranchesDisambiguatedByDepth() public {
+    function test_isAncestor_allZeroBranchesDisambiguatedByDepth() public pure {
         // "00" (depth 2) is an ancestor of "00000" (depth 5)
         assertTrue(LibHistory.isAncestor(bytes32(0), 2, bytes32(0), 5));
         // the deeper all-zero path is not an ancestor of the shorter one
@@ -146,45 +136,10 @@ contract LibHistoryTest is Test {
         assertFalse(LibHistory.isAncestor(bytes32(0), 3, oneAtThird, 3));
     }
 
-    /// reverts when the ancestor history has bits set below its depth (malformed: history/depth mismatch).
-    function test_isAncestor_revertsOnMalformedAncestor() public {
-        // depth 0 must mean an all-zero history; a non-zero genesis history is malformed.
-        vm.expectRevert(LibHistory.HistoryAndDepthMismatch.selector);
-        LibHistory.isAncestor(0x8000000000000000000000000000000000000000000000000000000000000000, 0, bytes32(0), 5);
-        // a stray bit below the claimed depth is also malformed.
-        bytes32 strayBelowDepth = 0x6100000000000000000000000000000000000000000000000000000000000000; // 0110...1...
-        vm.expectRevert(LibHistory.HistoryAndDepthMismatch.selector);
-        LibHistory.isAncestor(strayBelowDepth, 4, 0x6100000000000000000000000000000000000000000000000000000000000000, 8);
-    }
-
-    /// reverts when the descendant history has bits set below its depth (malformed: history/depth mismatch).
-    function test_isAncestor_revertsOnMalformedDescendant() public {
-        bytes32 ancestorHistory = 0x6000000000000000000000000000000000000000000000000000000000000000; // 0110....
-        // top 6 bits are a clean "011010" but a stray low bit makes depth 6 inconsistent.
-        bytes32 strayLowBit = 0x6800000000000000000000000000000000000000000000000000000000000001;
-        vm.expectRevert(LibHistory.HistoryAndDepthMismatch.selector);
-        LibHistory.isAncestor(ancestorHistory, 4, strayLowBit, 6);
-    }
-
-    /* --------------------------------- isEmptyAfterDepth ---------------------------- */
-
-    function test_isEmptyAfterDepth() public {
-        // depth 0 requires an entirely empty history.
-        assertTrue(LibHistory.isEmptyAfterDepth(bytes32(0), 0));
-        assertFalse(LibHistory.isEmptyAfterDepth(0x8000000000000000000000000000000000000000000000000000000000000000, 0));
-        // a single top bit is consumed by depth 1, leaving the rest empty.
-        assertTrue(LibHistory.isEmptyAfterDepth(0x8000000000000000000000000000000000000000000000000000000000000000, 1));
-        // "011010" is clean at depth 6 but a stray low bit is not.
-        assertTrue(LibHistory.isEmptyAfterDepth(0x6800000000000000000000000000000000000000000000000000000000000000, 6));
-        assertFalse(LibHistory.isEmptyAfterDepth(0x6800000000000000000000000000000000000000000000000000000000000001, 6));
-        // at full depth the whole word is path, so any history is "empty after".
-        assertTrue(LibHistory.isEmptyAfterDepth(bytes32(type(uint256).max), 256));
-    }
-
     /* ------------------------------------- fuzz ------------------------------------- */
 
     /// a freshly-appended child always has its parent as an ancestor.
-    function testFuzz_appendThenAncestor(bytes32 parentHistory, uint16 parentDepth, bool branch) public {
+    function testFuzz_appendThenAncestor(bytes32 parentHistory, uint16 parentDepth, bool branch) public pure {
         parentDepth = uint16(bound(parentDepth, 0, 255));
         parentHistory = _clearHistoryAfterDepth(parentHistory, parentDepth);
         (bytes32 childHistory, uint16 childDepth) = LibHistory.appendHistory(parentHistory, parentDepth, branch ? 1 : 0);

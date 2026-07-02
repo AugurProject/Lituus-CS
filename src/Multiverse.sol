@@ -196,8 +196,7 @@ contract Multiverse is ReentrancyGuard {
 
     /* ============================================= QUERY FUNCTIONS ============================================= */
     function createQuery(uint248 universeId, string calldata question, uint8 numberOfOutcomes) external nonReentrant {
-        (uint248 activeUniverseId, Universe storage universe, ILituusRep repToken) =
-            _getActiveUniverseAndRepToken(universeId);
+        (uint248 activeUniverseId,, ILituusRep repToken) = _getActiveUniverseAndRepToken(universeId);
 
         // Validate the question and number of outcomes
         if (numberOfOutcomes <= 2) revert InvalidNumberOfOutcomes();
@@ -231,8 +230,7 @@ contract Multiverse is ReentrancyGuard {
 
     function report(uint248 universeId, uint256 queryId, uint8 outcome) external nonReentrant {
         // Check all conditions (universe exists, query exists, outcome is valid, report is within time, etc.)
-        (uint248 activeUniverseId, Universe storage universe, ILituusRep repToken) =
-            _getActiveUniverseAndRepToken(universeId);
+        (uint248 activeUniverseId,, ILituusRep repToken) = _getActiveUniverseAndRepToken(universeId);
 
         Query storage query = queries[queryId];
         if (query.numberOfOutcomes == 0) revert InvalidQuery();
