@@ -25,11 +25,19 @@ contract Multiverse is ReentrancyGuard {
     // fork resolution. It is outside the valid outcome range [1, MAX_OUTCOMES]
 
     uint256 public constant THREE_DAYS = 3 days;
+    uint256 public constant SIXTY_DAYS = 60 days;
     uint256 public constant ONE_DAY = 1 days;
     // This is the divider for the burn depending on losingStakes on a query.
     // If burn ratio is 20% (1/5), then BURN_DIVIDER is 5.
     uint256 public constant BURN_DIVIDER = 5;
 
+    uint256 public constant SCALE = 1 ether;
+    // The volume for a three day window that needs to get booted in (when we need to calculate pre genesis).
+    uint256 public constant BOOT_VOLUME = 3;
+
+    // The profit for a three day window that needs to get booted in (when we need to calculate pre genesis).
+    // Calculated in constructor as 2 * INITIAL_BASE_FEE of Controller.
+    uint256 public immutable BOOT_PROFIT;
     uint256 public immutable GENESIS_TIMESTAMP;
     IZoltar public immutable ZOLTAR;
     IQueryFeeController public immutable QUERY_FEE_CONTROLLER;
@@ -88,20 +96,25 @@ contract Multiverse is ReentrancyGuard {
         address queryTokenizer;
     }
 
-    struct UniverseRevenues {
-        // The three day revenue for each three days that passed since GENESIS_TIMESTAMP.
-        mapping(uint256 threeDayId => uint256) threeDayRevenue;
-        // The three day profit for each three days that passed since GENESIS_TIMESTAMP.
-        mapping(uint256 threeDayId => uint256) threeDayProfit;
-        // The total revenue for this universe.
-        uint256 totalRevenue;
-        // The total profit for this universe.
-        uint256 totalProfit;
+    struct UniverseStatistics {
+        // All the 3-day info needed for every universe for the dynamic query fee calculation.
+        mapping(uint256 threeDayId => ThreeDayInfo) threeDayInfo;
+        // A 60-day volume kept for gas reasons. It is updated per query, instead of doing 20 SLOADS.
+        uint128 sixtyDayVolume;
+        // The id of the 3-day-window that last query was created into.
+        uint128 lastWindowId;
+    }
+
+    struct ThreeDayInfo {
+        // The 3-day profit of the universe for this specific 3-day info.
+        uint128 threeDayProfit;
+        // The 3-day volume aka number of the queries created of the universe for this specific 3-day info.
+        uint128 threeDayVolume;
     }
 
     /* ================================================ VARIABLES ================================================ */
     mapping(uint248 universeId => Universe) public universes;
-    mapping(uint248 universeId => UniverseRevenues) public universeRevenues;
+    mapping(uint248 universeId => UniverseStatistics) public universeStatistics;
     mapping(uint256 queryId => Query) public queries;
     mapping(uint248 universeId => mapping(uint256 queryId => QueryResolution)) public queryResolutions;
 
@@ -166,6 +179,7 @@ contract Multiverse is ReentrancyGuard {
         genesisUniverse.queryTokenizer = address(0);
 
         GENESIS_TIMESTAMP = block.timestamp;
+        BOOT_PROFIT = 2 * QUERY_FEE_CONTROLLER.INITIAL_BASE_FEE();
     }
 
     /* ============================================= WRAP FUNCTIONS ============================================== */
@@ -191,12 +205,15 @@ contract Multiverse is ReentrancyGuard {
 
         // TODO: Here we need to actually check if question contains the same numberOfOutcomes needed.
 
-        // Get the fee amount from the query fee controller
-        uint256 fee = QUERY_FEE_CONTROLLER.getQueryFee(activeUniverseId);
+        // Get the base fee amount from the query fee controller
+        uint256 baseFee = QUERY_FEE_CONTROLLER.getQueryFee(activeUniverseId);
+        // Create a global query record
+
+        // Calculate the fee depending on previous volume and update the volume.
+        uint256 fee = _calculateFeeAndApplyVolume(activeUniverseId, baseFee);
         // Transfer the query fee amount of REP token
         // TODO: permit? permit2?
         repToken.safeTransferFrom(msg.sender, address(this), fee);
-        // Create a global query record
 
         Query storage query = queries[queryCount];
         query.numberOfOutcomes = numberOfOutcomes;
@@ -306,6 +323,214 @@ contract Multiverse is ReentrancyGuard {
         // TODO: check Zoltar forking state
     }
 
+    /* ========================================== QUERY FEE EXTERNALS ============================================ */
+    /**
+     * @notice Pushes a universe's recent realized profits to the fee controller to run its monthly
+     *         base-fee hill-climb.
+     * @dev Standalone for now; it will be called from the createQuery path once incentives are wired.
+     *      Only pushes while the universe is not forking — the forking window must not move the fee.
+     *      The controller enforces the once-a-month cadence itself.
+     * @param universeId The universe whose base fee to update.
+     */
+    function updateBaseFee(uint248 universeId) external {
+        if (universes[universeId].forkState != ForkState.NotForking) revert InvalidUniverseState();
+
+        (uint256 currentProfit, uint256 lastProfit) = _getProfits(universeId);
+        QUERY_FEE_CONTROLLER.changeBaseFee(universeId, currentProfit, lastProfit);
+    }
+
+    /* ========================================== QUERY FEE INTERNALS ============================================ */
+    /**
+     * @notice Multiplies the monthly base fee by a short-term demand modifier and records this query
+     *         in the current 3-day volume bucket.
+     * @dev Demand is a live rolling 3-day window rebuilt from discrete buckets, so the fee neither ramps
+     *      within a window nor goes stale. `w` is the current window, `vol[x]` a real stored bucket, and
+     *      `f` the fraction of `w` elapsed. Bootstrap volume for pre-genesis windows is NEVER stored; it
+     *      is added only to the local values below, so storage always holds real volume only.
+     *
+     *        lastThreeDayVolume = vol[w] + (1 - f) * prevWindowVolume
+     *        lastSixtyDayVolume = vol[w] + sixtyDayVolume - f * oldestWindowVolume        (w >= 20)
+     *                           = vol[w] + sixtyDayVolume + (20 - w) * BOOT_VOLUME         (w  < 20)
+     *
+     *      where `prevWindowVolume` / `oldestWindowVolume` fall back to BOOT_VOLUME when window `w-1` /
+     *      `w-20` predates genesis. `sixtyDayVolume` is the running sum of the real windows `vol[w-1..w-20]`,
+     *      rolled forward once per new window (completed real window in, real window now older than 60 days
+     *      out; a gap >= 20 recomputes it from real storage). The query is counted only AFTER its fee is
+     *      computed, so it never prices itself.
+     * @param universeId The active universe the query is created in.
+     * @param baseFee The monthly base fee from the controller, before the demand modifier.
+     * @return fee The final query fee.
+     */
+    function _calculateFeeAndApplyVolume(uint248 universeId, uint256 baseFee) internal returns (uint256 fee) {
+        UniverseStatistics storage stats = universeStatistics[universeId];
+        uint256 currentThreeDayWindow = _getCurrentThreeDayWindow();
+        uint256 lastWindow = stats.lastWindowId;
+
+        // Roll the running sum forward. Storage holds REAL volume only — bootstrap is never stored,
+        // so nothing bootstrap-related is added or subtracted here.
+        if (currentThreeDayWindow > lastWindow) {
+            uint256 sixtyDayVolume = stats.sixtyDayVolume;
+            if (currentThreeDayWindow - lastWindow >= 20) {
+                // Idle >= 60 days: every real window in range rolled out; recompute from real storage only.
+                uint256 sum;
+                for (uint256 i = 1; i <= 20;) {
+                    // real window only; a window c-i predating genesis contributes 0 (bootstrap is not stored)
+                    if (currentThreeDayWindow >= i) {
+                        sum += stats.threeDayInfo[currentThreeDayWindow - i].threeDayVolume;
+                    }
+                    unchecked {
+                        i += 1;
+                    }
+                }
+                sixtyDayVolume = sum;
+            } else {
+                for (uint256 i = lastWindow; i < currentThreeDayWindow;) {
+                    // Completed window enters.
+                    sixtyDayVolume += stats.threeDayInfo[i].threeDayVolume;   // completed real window enters
+                    if (i >= 20) {
+                        // Real window leaves; bootstrap never subtracted (no accounting for bootstrap).
+                        sixtyDayVolume -= stats.threeDayInfo[i - 20].threeDayVolume;
+                    }
+                    unchecked {
+                        i += 1;
+                    }
+                }
+            }
+            stats.sixtyDayVolume = uint128(sixtyDayVolume);
+            stats.lastWindowId = uint128(currentThreeDayWindow);
+        }
+
+        // Fraction of the current window elapsed, in [0, SCALE).
+        uint256 proportionOfCurrentWindow = ((block.timestamp - GENESIS_TIMESTAMP) % THREE_DAYS) * SCALE / THREE_DAYS;
+
+        uint256 currentVolume = stats.threeDayInfo[currentThreeDayWindow].threeDayVolume;
+
+        // Previous window (w-1): real volume, or bootstrap if it predates genesis. Check done here, before the read.
+        uint256 previousVolume =
+            currentThreeDayWindow >= 1 ? stats.threeDayInfo[currentThreeDayWindow - 1].threeDayVolume : BOOT_VOLUME;
+
+        // recent 3-day (local): current partial + tail of the previous window
+        uint256 lastThreeDayVolume = currentVolume + (SCALE - proportionOfCurrentWindow) * previousVolume / SCALE;
+
+        // 60-day (local): current + real running sum, then trim the oldest window's rolled-out tail.
+        // Bootstrap stays local only. In both branches the oldest window (real for w >= 20, bootstrap for
+        // w < 20) contributes only its (1 - f) tail, since f of it has already slid out of the 60-day span.
+        uint256 lastSixtyDayVolume = currentVolume + stats.sixtyDayVolume;
+        if (currentThreeDayWindow >= 20) {
+            // Oldest window (w-20) is real: subtract the f-tail that rolled out.
+            uint256 oldestVolume = stats.threeDayInfo[currentThreeDayWindow - 20].threeDayVolume;
+            lastSixtyDayVolume -= proportionOfCurrentWindow * oldestVolume / SCALE;
+        } else {
+            // Missing pre-genesis windows are bootstrap. The (20 - w - 1) newer ones enter whole; the single
+            // oldest (w-20) enters only its (1 - f) tail — same trimming the real branch applies.
+            lastSixtyDayVolume += (20 - currentThreeDayWindow - 1) * BOOT_VOLUME
+                + (SCALE - proportionOfCurrentWindow) * BOOT_VOLUME / SCALE;
+        }
+
+        fee = baseFee * _calculateCurveModifier(lastSixtyDayVolume, lastThreeDayVolume) / SCALE;
+
+        // Count this query for future fees.
+        stats.threeDayInfo[currentThreeDayWindow].threeDayVolume = uint128(currentVolume + 1);
+    }
+
+    /**
+     * @notice Turns the demand ratio (recent 3-day volume vs the 60-day average) into the multiplier
+     *         applied to the base fee.
+     * @dev Ratio is SCALE-scaled: SCALE (1.0) means the recent rate equals the 60-day average. An empty
+     *      60-day window (only possible with zero history) yields a neutral 1.0, so a brand-new or idle
+     *      universe is not pushed to the bottom of the curve.
+     *
+     *      Above average (ratio >= SCALE): a gentle linear rise, 0.8 + 0.2 * ratio, so double the demand
+     *      is only +20%. Since recent3 <= sixty always, ratio is bounded by 20 and this branch by 4.8x.
+     *
+     *      Below average (ratio < SCALE): a steep drop, 1 / (1 + 100 * (1 - ratio)^6). The 6th power is
+     *      built iteratively (each step re-divided by SCALE) because (1 - ratio)^6 in SCALE fixed-point
+     *      would overflow a direct exponentiation.
+     *
+     *      TODO: the below-average branch bottoms out near ~1% of the base fee; since the fee doubles as
+     *      TODO: the reporting bond, a floor may be needed (needs testing).
+     * @param lastSixtyDayVolume The reconstructed 60-day rolling volume (denominator).
+     * @param lastThreeDayVolume The reconstructed 3-day rolling volume (numerator).
+     * @return modifier_ The SCALE-scaled multiplier to apply to the base fee.
+     */
+    function _calculateCurveModifier(
+        uint256 lastSixtyDayVolume,
+        uint256 lastThreeDayVolume
+    ) internal pure returns (uint256 modifier_) {
+        uint256 ratio = lastSixtyDayVolume == 0 ? SCALE : 20 * lastThreeDayVolume * SCALE / lastSixtyDayVolume;
+
+        if (ratio >= SCALE) {
+            // Above average: gentle linear rise, slope 0.2.
+            modifier_ = (4 * SCALE) / 5 + ratio / 5;
+        } else {
+            // Below average: steep drop.
+            uint256 shortage = SCALE - ratio;
+            uint256 powered = SCALE;
+            for (uint256 i = 0; i < 6;) {
+                powered = powered * shortage / SCALE;
+                unchecked {
+                    i += 1;
+                }
+            }
+            modifier_ = SCALE * SCALE / (SCALE + 100 * powered);
+        }
+    }
+
+    /**
+     * @notice Realized profit of the current and previous ~30-day periods for a universe, as live rolling
+     *         windows, for the controller's monthly base-fee hill-climb.
+     * @dev Same interpolation as the volume path. With `c` the current window and `f` the fraction of it
+     *      elapsed, `currentProfit` is the 30 days ending now and `lastProfit` the 30 days before that:
+     *        currentProfit = profit[c] + sum(profit[c-1..c-9]) + (1 - f) * profit[c-10]
+     *        lastProfit    = f * profit[c-10] + sum(profit[c-11..c-19]) + (1 - f) * profit[c-20]
+     *      The boundary window c-10 is split between the two periods; the oldest window c-20 contributes
+     *      only its (1 - f) tail. Windows predating genesis fall back to BOOT_PROFIT (checked before each
+     *      read). Profit only — no division here, so a zero period is harmless to the controller.
+     * @param universeId The universe to read.
+     * @return currentProfit Rolling realized profit over the last 30 days.
+     * @return lastProfit Rolling realized profit over the 30 days before those.
+     */
+    function _getProfits(uint248 universeId) internal view returns (uint256 currentProfit, uint256 lastProfit) {
+        UniverseStatistics storage stats = universeStatistics[universeId];
+        uint256 currentThreeDayWindow = _getCurrentThreeDayWindow();
+        // Fraction of the current window elapsed, in [0, SCALE).
+        uint256 proportionOfCurrentWindow = ((block.timestamp - GENESIS_TIMESTAMP) % THREE_DAYS) * SCALE / THREE_DAYS;
+
+        // Current month: current window's partial profit + the 9 completed windows behind it.
+        currentProfit = stats.threeDayInfo[currentThreeDayWindow].threeDayProfit;
+        for (uint256 i = 1; i <= 9;) {
+            currentProfit += currentThreeDayWindow >= i
+                ? stats.threeDayInfo[currentThreeDayWindow - i].threeDayProfit
+                : BOOT_PROFIT;
+            unchecked {
+                i += 1;
+            }
+        }
+
+        // Boundary window c-10 is split: (1 - f) tail to the current month, f to the previous month.
+        uint256 boundaryProfit = currentThreeDayWindow >= 10
+            ? stats.threeDayInfo[currentThreeDayWindow - 10].threeDayProfit
+            : BOOT_PROFIT;
+        currentProfit += (SCALE - proportionOfCurrentWindow) * boundaryProfit / SCALE;
+        lastProfit += proportionOfCurrentWindow * boundaryProfit / SCALE;
+
+        // Previous month: the 9 completed windows behind the boundary.
+        for (uint256 i = 11; i <= 19;) {
+            lastProfit += currentThreeDayWindow >= i
+                ? stats.threeDayInfo[currentThreeDayWindow - i].threeDayProfit
+                : BOOT_PROFIT;
+            unchecked {
+                i += 1;
+            }
+        }
+
+        // Oldest window c-20 contributes only its (1 - f) tail; the rest has rolled out of the 60-day span.
+        uint256 oldestProfit = currentThreeDayWindow >= 20
+            ? stats.threeDayInfo[currentThreeDayWindow - 20].threeDayProfit
+            : BOOT_PROFIT;
+        lastProfit += (SCALE - proportionOfCurrentWindow) * oldestProfit / SCALE;
+    }
+
     /* ========================================== ESCALATION FUNCTIONS =========================================== */
     /**
      * @notice Resolves the escalation game for a reported query: pays the query fee reward to the
@@ -358,36 +583,28 @@ contract Multiverse is ReentrancyGuard {
         // TODO-CHECK IF LITUUS HERE OR UNWRAP AND BURN REP.
         //        repToken.burn(profit);
 
-        _applyRevenuesAndProfits(universeId, queryFee, profit);
+        _applyProfit(universeId, profit);
 
         return winnerOutcome;
     }
 
     /* ====================================== RESOLUTION INTERNAL FUNCTIONS ====================================== */
     /**
-     * @notice Records a resolved query's revenue and profit into the universe's current 3-day
-     *         bucket and its running totals.
+     * @notice Records a resolved query's profit into the universe's current 3-day
+     *         bucket.
      * @dev The bucket is keyed by the 3-day window index derived from the global genesis anchor
      *      (`(block.timestamp - GENESIS_TIMESTAMP) / THREE_DAYS`). The sparse mapping avoids any
      *      age-dependent array padding and lets a fork copy a fixed window of buckets regardless of
      *      universe age. Both the windowed bucket and the running total are updated for revenue and
      *      profit.
      * @param universeId The id of the universe to credit.
-     * @param revenueAmount The revenue realized by the resolved query (its fee).
      * @param profit The profit realized by the resolved query (the REP to be burned).
      */
-    function _applyRevenuesAndProfits(uint248 universeId, uint256 revenueAmount, uint256 profit) internal {
-        uint256 current3DayWindow = (block.timestamp - GENESIS_TIMESTAMP) / THREE_DAYS;
+    function _applyProfit(uint248 universeId, uint256 profit) internal {
+        uint256 current3DayWindow = _getCurrentThreeDayWindow();
+        ThreeDayInfo storage threeDayInfo = universeStatistics[universeId].threeDayInfo[current3DayWindow];
 
-        UniverseRevenues storage universeRevenue = universeRevenues[universeId];
-
-        // Store revenues.
-        universeRevenue.threeDayRevenue[current3DayWindow] += revenueAmount;
-        universeRevenue.totalRevenue += revenueAmount;
-
-        // Store profits.
-        universeRevenue.threeDayProfit[current3DayWindow] += profit;
-        universeRevenue.totalProfit += profit;
+        threeDayInfo.threeDayProfit += uint128(profit);
     }
 
     /**
@@ -549,5 +766,12 @@ contract Multiverse is ReentrancyGuard {
             resolution.queryCreateTime = uint48(queryCreateTime);
             return queryCreateTime;
         }
+    }
+    /**
+     * @notice This function returns the current 3-day window id for all universes since GENESIS.
+     * @return currentThreeDayWindow The current 3-day window id.
+     */
+    function _getCurrentThreeDayWindow() internal view returns(uint256 currentThreeDayWindow) {
+        currentThreeDayWindow = (block.timestamp - GENESIS_TIMESTAMP) / THREE_DAYS;
     }
 }
