@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity ^0.8.35;
 
-import {IQueryFeeController} from "./interfaces/IQueryFeeController.sol";
+import { IQueryFeeController } from "./interfaces/IQueryFeeController.sol";
 
 /**
  * @title QueryFeeController
@@ -46,18 +46,14 @@ contract QueryFeeController is IQueryFeeController {
     error InvalidTimeWindow();
 
     /* ================================================= EVENTS ================================================== */
-    event BaseQueryFeeUpdated(
-        uint248 indexed universeId,
-        uint256 oldFee,
-        uint256 newFee,
-        uint48 timestamp
-    );
+    event BaseQueryFeeUpdated(uint248 indexed universeId, uint256 oldFee, uint256 newFee, uint48 timestamp);
 
     /* ================================================ MODIFIERS ================================================ */
     modifier onlyMultiverse() {
         if (msg.sender != multiverse) revert OnlyMultiverse();
         _;
     }
+
     /* ============================================ CONSTRUCTOR/SETTER =========================================== */
     constructor() {
         DEPLOYER = msg.sender;
