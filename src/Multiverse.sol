@@ -813,7 +813,8 @@ contract Multiverse is ReentrancyGuard {
         QueryResolution storage resolution = queryResolutions[universeId][queryId];
         uint256 numberOfStakes = resolution.stakes.length;
         if (numberOfStakes == 0) {
-            requiredStakeAmount = QUERY_FEE_CONTROLLER.getQueryFee(universeId);
+            Query storage query = queries[queryId];
+            requiredStakeAmount = query.fee;
         } else {
             uint256 lastStakeAmount = resolution.stakes[numberOfStakes - 1].amount;
             requiredStakeAmount = lastStakeAmount * 2;
