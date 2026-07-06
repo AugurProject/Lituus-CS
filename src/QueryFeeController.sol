@@ -55,7 +55,7 @@ contract QueryFeeController is IQueryFeeController {
 
     /* ================================================ MODIFIERS ================================================ */
     modifier onlyMultiverse() {
-        if (msg.sender == multiverse) revert OnlyMultiverse();
+        if (msg.sender != multiverse) revert OnlyMultiverse();
         _;
     }
     /* ============================================ CONSTRUCTOR/SETTER =========================================== */
