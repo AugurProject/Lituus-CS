@@ -921,6 +921,9 @@ contract Multiverse is ReentrancyGuard {
         if (zoltarOutcomeId == 1) {
             // The query is resolved in the Yes-universe
             resolution.outcome = forkingOutcomeId;
+            // Record the resolution so descendants of the Yes-universe inherit it via the ancestor scan.
+            // Children are never canonical at spawn time (the favoriteChild is designated at fork finalization).
+            _recordResolvedUniverse(queryId, childUniverseId, false);
         }
     }
 
