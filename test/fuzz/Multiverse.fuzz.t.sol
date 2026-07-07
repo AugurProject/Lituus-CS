@@ -8,6 +8,7 @@ import { ILituusRep } from "src/interfaces/ILituusRep.sol";
 import { IReputationToken } from "src/interfaces/IReputationToken.sol";
 import { MockERC20 } from "src/mock/MockERC20.sol";
 import { MockZoltar } from "src/mock/MockZoltar.sol";
+import { MockZoltarQuestionData } from "src/mock/MockZoltarQuestionData.sol";
 import { MockQueryFeeController } from "src/mock/MockQueryFeeController.sol";
 
 /// @notice Property-based tests for createQuery. The fuzzer throws random inputs at the assumptions.
@@ -17,6 +18,7 @@ contract MultiverseFuzzTest is Test {
     uint256 internal constant USER_REP_BALANCE = 1000 ether;
 
     MockERC20 internal underlying;
+    MockZoltarQuestionData internal zoltarQuestionData;
     MockZoltar internal zoltar;
     MockQueryFeeController internal feeCtl;
     Multiverse internal multiverse;
@@ -26,11 +28,12 @@ contract MultiverseFuzzTest is Test {
 
     function setUp() public {
         underlying = new MockERC20("Underlying", "U");
-        zoltar = new MockZoltar(IReputationToken(address(underlying)));
+        zoltarQuestionData = new MockZoltarQuestionData();
+        zoltar = new MockZoltar(IReputationToken(address(underlying)), zoltarQuestionData);
         feeCtl = new MockQueryFeeController(DEFAULT_FEE);
         multiverse = new Multiverse(zoltar, GENESIS_UID, feeCtl);
 
-        (ILituusRep repToken,,,,,,,,,) = multiverse.universes(GENESIS_UID);
+        (ILituusRep repToken,,,,,,,,,,,,,) = multiverse.universes(GENESIS_UID);
         genesisRep = repToken;
 
         underlying.mint(user, USER_REP_BALANCE);

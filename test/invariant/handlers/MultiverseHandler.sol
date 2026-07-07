@@ -39,9 +39,10 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
         uint256 fee = bound(feeSeed, 0, MAX_FEE);
 
         FEE_CTL.setFee(fee);
+        uint256 balanceBefore = REP.balanceOf(address(this));
         MULTIVERSE.createQuery(GENESIS_UID, "q", outcomes);
 
         ++ghostQueriesCreated;
-        ghostTotalFees += fee;
+        ghostTotalFees += balanceBefore - REP.balanceOf(address(this));
     }
 }

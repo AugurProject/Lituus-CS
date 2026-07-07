@@ -11,6 +11,7 @@ import { IReputationToken } from "src/interfaces/IReputationToken.sol";
 import { IQueryFeeController } from "src/interfaces/IQueryFeeController.sol";
 import { MockERC20 } from "src/mock/MockERC20.sol";
 import { MockZoltar } from "src/mock/MockZoltar.sol";
+import { MockZoltarQuestionData } from "src/mock/MockZoltarQuestionData.sol";
 import { MockQueryFeeController } from "src/mock/MockQueryFeeController.sol";
 
 contract MultiverseUnitTest is Test {
@@ -21,6 +22,7 @@ contract MultiverseUnitTest is Test {
     uint256 internal constant START_TIME = 1_000_000;
 
     MockERC20 internal underlying;
+    MockZoltarQuestionData internal zoltarQuestionData;
     MockZoltar internal zoltar;
     MockQueryFeeController internal feeCtl;
     Multiverse internal multiverse;
@@ -33,11 +35,12 @@ contract MultiverseUnitTest is Test {
         vm.warp(START_TIME);
 
         underlying = new MockERC20("Underlying", "U");
-        zoltar = new MockZoltar(IReputationToken(address(underlying)));
+        zoltarQuestionData = new MockZoltarQuestionData();
+        zoltar = new MockZoltar(IReputationToken(address(underlying)), zoltarQuestionData);
         feeCtl = new MockQueryFeeController(DEFAULT_FEE);
         multiverse = new Multiverse(zoltar, GENESIS_UID, feeCtl);
 
-        (ILituusRep repToken,,,,,,,,,) = multiverse.universes(GENESIS_UID);
+        (ILituusRep repToken,,,,,,,,,,,,,) = multiverse.universes(GENESIS_UID);
         genesisRep = repToken;
 
         // Fund user and bystander with REP once, as fixture setup.
@@ -88,18 +91,24 @@ contract MultiverseUnitTest is Test {
             ILituusRep repToken,
             Multiverse.ForkState forkState,
             uint48 forkTime,
+            uint16 forkDepth,
+            bool isCanonical,
             uint248 parent,
             uint248 favoriteChild,
             uint248 heir,
             bytes32 history,
             uint256 forkQuery,
             uint256 supplyBeforeFork,
-            address queryTokenizer
+            address queryTokenizer,
+            uint8 forkOutcome,
+            bool isLituusFork
         ) = newMultiverse.universes(GENESIS_UID);
 
         assertTrue(address(repToken) != address(0));
         assertEq(uint8(forkState), uint8(Multiverse.ForkState.NotForking));
         assertEq(forkTime, uint48(block.timestamp));
+        assertEq(forkDepth, 0);
+        assertTrue(isCanonical);
         assertEq(parent, 0);
         assertEq(favoriteChild, 0);
         assertEq(heir, 0);
@@ -107,6 +116,8 @@ contract MultiverseUnitTest is Test {
         assertEq(forkQuery, 0);
         assertEq(supplyBeforeFork, expectedSupply);
         assertEq(queryTokenizer, address(0));
+        assertEq(forkOutcome, 0);
+        assertFalse(isLituusFork);
     }
 
     function test_Constructor_DeploysRepToken() public view {
@@ -199,31 +210,24 @@ contract MultiverseUnitTest is Test {
         vm.prank(user);
         multiverse.createQuery(GENESIS_UID, "q0", 3);
 
-        feeCtl.setFee(2 ether);
         vm.prank(user);
         multiverse.createQuery(GENESIS_UID, "q1", 4);
 
-        feeCtl.setFee(3 ether);
         vm.prank(user);
         multiverse.createQuery(GENESIS_UID, "q2", 5);
 
         assertEq(multiverse.queryCount(), 3);
 
-        (uint8 n0,, uint256 f0, string memory q0) = multiverse.queries(0);
-        (uint8 n1,, uint256 f1, string memory q1) = multiverse.queries(1);
-        (uint8 n2,, uint256 f2, string memory q2) = multiverse.queries(2);
+        (uint8 n0,,, string memory q0) = multiverse.queries(0);
+        (uint8 n1,,, string memory q1) = multiverse.queries(1);
+        (uint8 n2,,, string memory q2) = multiverse.queries(2);
 
         assertEq(n0, 3);
-        assertEq(f0, DEFAULT_FEE);
         assertEq(q0, "q0");
         assertEq(n1, 4);
-        assertEq(f1, 2 ether);
         assertEq(q1, "q1");
         assertEq(n2, 5);
-        assertEq(f2, 3 ether);
         assertEq(q2, "q2");
-
-        assertEq(genesisRep.balanceOf(address(multiverse)), DEFAULT_FEE + 2 ether + 3 ether);
     }
 
     function test_CreateQuery_DifferentCallers() public {
@@ -235,15 +239,13 @@ contract MultiverseUnitTest is Test {
 
         assertEq(multiverse.queryCount(), 2);
 
-        (uint8 n0, uint248 u0, uint256 f0, string memory q0) = multiverse.queries(0);
-        (uint8 n1, uint248 u1, uint256 f1, string memory q1) = multiverse.queries(1);
+        (uint8 n0, uint248 u0,, string memory q0) = multiverse.queries(0);
+        (uint8 n1, uint248 u1,, string memory q1) = multiverse.queries(1);
         assertEq(n0, 3);
         assertEq(u0, GENESIS_UID);
-        assertEq(f0, DEFAULT_FEE);
         assertEq(q0, "by user");
         assertEq(n1, 4);
         assertEq(u1, GENESIS_UID);
-        assertEq(f1, DEFAULT_FEE);
         assertEq(q1, "by bystander");
     }
 

@@ -5,11 +5,12 @@ import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.s
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-import { IZoltar } from "./interfaces/IZoltar.sol";
+import { IZoltar, IZoltarQuestionData } from "./interfaces/IZoltar.sol";
 import { ILituusRep } from "./interfaces/ILituusRep.sol";
 import { LituusRep } from "./LituusRep.sol";
 import { IReputationToken } from "./interfaces/IReputationToken.sol";
 import { IQueryFeeController } from "./interfaces/IQueryFeeController.sol";
+import { LibHistory } from "./libraries/LibHistory.sol";
 
 // TODO: check zoltar forks
 
@@ -28,15 +29,27 @@ contract Multiverse is ReentrancyGuard {
     uint8 public constant UNRESOLVED = 0; // the query is not resolved yet
     uint8 public constant INVALID = 255; // an invalid outcome value used for reporting an invalid fork outcome during
     // fork resolution. It is outside the valid outcome range [1, MAX_OUTCOMES]
+    // TODO: determine the max query length based on gas costs
+    uint16 public constant MAX_QUERY_LENGTH = 2058; // maximum length of a query string
 
     uint256 public constant THREE_DAYS = 3 days;
+    uint256 public constant SIXTY_DAYS = 60 days;
     uint256 public constant ONE_DAY = 1 days;
     // This is the divider for the burn depending on losingStakes on a query.
     // If burn ratio is 20% (1/5), then BURN_DIVIDER is 5.
     uint256 public constant BURN_DIVIDER = 5;
 
+    uint256 public constant SCALE = 1 ether;
+    // The volume for a three day window that needs to get booted in (when we need to calculate pre genesis).
+    uint256 public constant BOOT_VOLUME = 3;
+
+    // The profit for a three day window that needs to get booted in (when we need to calculate pre genesis).
+    // Calculated in constructor as 2 * INITIAL_BASE_FEE of Controller.
+    uint256 public immutable BOOT_PROFIT;
     uint256 public immutable GENESIS_TIMESTAMP;
     IZoltar public immutable ZOLTAR;
+    // The ZoltarQuestionData contract is immutable in Zoltar so it can be cached here.
+    IZoltarQuestionData public immutable ZOLTAR_QUESTION_DATA;
     IQueryFeeController public immutable QUERY_FEE_CONTROLLER;
 
     /* ================================================== ENUMS ================================================== */
@@ -83,30 +96,47 @@ contract Multiverse is ReentrancyGuard {
         ForkState forkState;
         // TODO: populate the forkTime
         uint48 forkTime;
+        // The depth of the universe in the fork tree
+        // Genesis universe has depth 0, its children have depth 1, etc. Max 256.
+        uint16 forkDepth;
+        // Whether this universe lies on the canonical timeline (the genesis -> favoriteChild -> ... chain).
+        // Genesis is canonical; on a fork, only the designated favoriteChild inherits the parent's flag.
+        bool isCanonical;
         uint248 parent;
         uint248 favoriteChild;
         uint248 heir;
         // TODO: populate the history
+        // History format:
+        // Genesis universe has history 0, depth 0.
+        // First children have history 0b00 and 0b01, depth 1,
+        // second children of the second child 0b010 and 0b011, depth 2, etc.
         bytes32 history;
         uint256 forkQuery;
         uint256 supplyBeforeFork;
         address queryTokenizer;
+        uint8 forkOutcome;
+        bool isLituusFork; // If it's not Lituus fork then no payouts are necessary
     }
 
-    struct UniverseRevenues {
-        // The three day revenue for each three days that passed since GENESIS_TIMESTAMP.
-        mapping(uint256 threeDayId => uint256) threeDayRevenue;
-        // The three day profit for each three days that passed since GENESIS_TIMESTAMP.
-        mapping(uint256 threeDayId => uint256) threeDayProfit;
-        // The total revenue for this universe.
-        uint256 totalRevenue;
-        // The total profit for this universe.
-        uint256 totalProfit;
+    struct UniverseStatistics {
+        // All the 3-day info needed for every universe for the dynamic query fee calculation.
+        mapping(uint256 threeDayId => ThreeDayInfo) threeDayInfo;
+        // A 60-day volume kept for gas reasons. It is updated per query, instead of doing 20 SLOADS.
+        uint128 sixtyDayVolume;
+        // The id of the 3-day-window that last query was created into.
+        uint128 lastWindowId;
+    }
+
+    struct ThreeDayInfo {
+        // The 3-day profit of the universe for this specific 3-day info.
+        uint128 threeDayProfit;
+        // The 3-day volume aka number of the queries created of the universe for this specific 3-day info.
+        uint128 threeDayVolume;
     }
 
     /* ================================================ VARIABLES ================================================ */
     mapping(uint248 universeId => Universe) public universes;
-    mapping(uint248 universeId => UniverseRevenues) public universeRevenues;
+    mapping(uint248 universeId => UniverseStatistics) public universeStatistics;
     mapping(uint256 queryId => Query) public queries;
     mapping(uint248 universeId => mapping(uint256 queryId => QueryResolution)) public queryResolutions;
 
@@ -141,11 +171,19 @@ contract Multiverse is ReentrancyGuard {
     error QueryExpired();
     error AppealPeriodOver();
     error InvalidUniverseState();
+    error ZoltarQueryCreationFailed();
+    error ZoltarUniverseIsNotForking();
+    error InvalidZoltarQuestion();
+    error QueryTooLong();
+    error ZeroStakeAmount();
+    error ForkingNotImplemented();
 
     /* =============================================== CONSTRUCTOR =============================================== */
     constructor(IZoltar _zoltar, uint248 _initialZoltarUniverseId, IQueryFeeController _queryFeeController) {
         ZOLTAR = _zoltar;
         if (address(ZOLTAR) == address(0)) revert ZeroAddress();
+        ZOLTAR_QUESTION_DATA = ZOLTAR.zoltarQuestionData();
+        if (address(ZOLTAR_QUESTION_DATA) == address(0)) revert ZeroAddress();
         QUERY_FEE_CONTROLLER = _queryFeeController;
         if (address(QUERY_FEE_CONTROLLER) == address(0)) revert ZeroAddress();
 
@@ -164,13 +202,17 @@ contract Multiverse is ReentrancyGuard {
         genesisUniverse.forkState = ForkState.NotForking;
         genesisUniverse.forkTime = uint48(block.timestamp);
         genesisUniverse.heir = 0;
+        // Genesis is the root of the fork tree: an empty inheritance path, and the root of the canonical timeline.
         genesisUniverse.history = 0;
+        genesisUniverse.forkDepth = 0;
+        genesisUniverse.isCanonical = true;
         genesisUniverse.forkQuery = 0;
         // TODO: fill in the correct supply
         genesisUniverse.supplyBeforeFork = ZOLTAR.getUniverseTheoreticalSupply(_initialZoltarUniverseId);
         genesisUniverse.queryTokenizer = address(0);
 
         GENESIS_TIMESTAMP = block.timestamp;
+        BOOT_PROFIT = 2 * QUERY_FEE_CONTROLLER.INITIAL_BASE_FEE();
     }
 
     /* ============================================= WRAP FUNCTIONS ============================================== */
@@ -187,21 +229,25 @@ contract Multiverse is ReentrancyGuard {
 
     /* ============================================= QUERY FUNCTIONS ============================================= */
     function createQuery(uint248 universeId, string calldata question, uint8 numberOfOutcomes) external nonReentrant {
-        (uint248 activeUniverseId,,ILituusRep repToken) = _getActiveUniverseAndRepToken(universeId);
+        (uint248 activeUniverseId,, ILituusRep repToken) = _getActiveUniverseAndRepToken(universeId);
 
         // Validate the question and number of outcomes
         // Only meaningful outcomes should be included. UNRESOLVED and INVALID are accounted for separately
         if (numberOfOutcomes < MIN_OUTCOMES) revert InvalidNumberOfOutcomes();
         if (numberOfOutcomes > MAX_OUTCOMES) revert InvalidNumberOfOutcomes();
+        if (bytes(question).length > MAX_QUERY_LENGTH) revert QueryTooLong();
 
         // TODO: Here we need to actually check if question contains the same numberOfOutcomes needed.
 
-        // Get the fee amount from the query fee controller
-        uint256 fee = QUERY_FEE_CONTROLLER.getQueryFee(activeUniverseId);
+        // Get the base fee amount from the query fee controller
+        uint256 baseFee = QUERY_FEE_CONTROLLER.getQueryFee(activeUniverseId);
+        // Create a global query record
+
+        // Calculate the fee depending on previous volume and update the volume.
+        uint256 fee = _calculateFeeAndApplyVolume(activeUniverseId, baseFee);
         // Transfer the query fee amount of REP token
         // TODO: permit? permit2?
         repToken.safeTransferFrom(msg.sender, address(this), fee);
-        // Create a global query record
 
         Query storage query = queries[queryCount];
         query.numberOfOutcomes = numberOfOutcomes;
@@ -222,13 +268,19 @@ contract Multiverse is ReentrancyGuard {
 
     function report(uint248 universeId, uint256 queryId, uint8 outcome) external nonReentrant {
         // Check all conditions (universe exists, query exists, outcome is valid, report is within time, etc.)
-        (uint248 activeUniverseId,,ILituusRep repToken) = _getActiveUniverseAndRepToken(universeId);
+        (uint248 activeUniverseId,, ILituusRep repToken) = _getActiveUniverseAndRepToken(universeId);
 
         Query storage query = queries[queryId];
         if (query.numberOfOutcomes == 0) revert InvalidQuery();
 
         QueryResolution storage resolution = queryResolutions[activeUniverseId][queryId];
         if (resolution.outcome != UNRESOLVED) revert QueryAlreadyResolved();
+        // A query resolved in an ancestor universe is inherited by this lineage (via getOutcome), so it
+        // cannot be reported on again here. The ancestor set is fixed per lineage, so this only needs to
+        // be checked on the first report; later stakes in the same escalation are already covered.
+        if (resolution.stakes.length == 0 && _findAncestorResolution(activeUniverseId, queryId) != UNRESOLVED) {
+            revert QueryAlreadyResolved();
+        }
 
         // Outcome should be between 1 and numberOfOutcomes unless the query should be reported as INVALID
         if (outcome == UNRESOLVED) revert InvalidOutcome();
@@ -247,15 +299,29 @@ contract Multiverse is ReentrancyGuard {
             if (lastStake.time + ONE_DAY < block.timestamp) revert AppealPeriodOver();
         }
 
-        uint256 requiredStakeAmount = _requiredStakeAmount(activeUniverseId, queryId);
+        (uint256 requiredStakeAmount, uint256 forkThreshold) =
+            _requiredStakeAmountAndForkThreshold(activeUniverseId, queryId);
+        // A zero stake would allow free reports and an escalation ladder stuck at 0.
+        if (requiredStakeAmount == 0) revert ZeroStakeAmount();
+        // TODO: If the bond before a fork bond is placed so that the next appeal would cause a fork,
+        // and its not possible to fork because the parent has still not resolved their fork,
+        // then the bond placing is reverted and the query is frozen until the parent universe resolves the fork.
 
         // Transfer the stake
         repToken.safeTransferFrom(msg.sender, address(this), requiredStakeAmount);
 
-        uint256 forkThreshold = ZOLTAR.getForkThreshold(activeUniverseId); // TODO: actual Lituus threshold will differ
         if (requiredStakeAmount >= forkThreshold) {
             // TODO: fork logic in a separate call
-            // If the universe cannot fork then revert
+            // If the universe cannot fork then:
+            // revert or keep the stake and freeze the query (TBD)
+            // Check conditions:
+            // 1. Current state of the universe
+            // 2. Zoltar universe is not forking
+
+            // Fork the universe here and in Zoltar and create child universes
+            // If Zoltar doesn't allow forking (maybe due to rate limiting)
+            // then accept the stake and freeze the query
+            revert ForkingNotImplemented();
         }
 
         // Update the resolution record for the universe
@@ -274,8 +340,7 @@ contract Multiverse is ReentrancyGuard {
     }
 
     function resolve(uint248 universeId, uint256 queryId) external nonReentrant {
-        (uint248 activeUniverseId,,) =
-            _getActiveUniverseAndRepToken(universeId);
+        (uint248 activeUniverseId, Universe storage activeUniverse,) = _getActiveUniverseAndRepToken(universeId);
 
         Query storage query = queries[queryId];
         if (query.numberOfOutcomes == 0) revert InvalidQuery();
@@ -286,8 +351,13 @@ contract Multiverse is ReentrancyGuard {
         uint48 queryCreateTime = _getAndUpdateQueryCreateTime(activeUniverseId, queryId);
 
         if (resolution.stakes.length == 0 && queryCreateTime + THREE_DAYS < block.timestamp) {
+            // No report ever landed here, so the ancestor check was never run by report(): a query
+            // resolved in an ancestor is inherited by this lineage (via getOutcome) and must not be
+            // resolved again. The stakes branch below is already covered by report()'s first-stake check.
+            if (_findAncestorResolution(activeUniverseId, queryId) != UNRESOLVED) revert QueryAlreadyResolved();
             // If the report period has passed and the query was not reported on then resolve the query as INVALID
             resolution.outcome = INVALID;
+            _recordResolvedUniverse(queryId, activeUniverseId, activeUniverse.isCanonical);
             emit QueryResolved(msg.sender, activeUniverseId, queryId, INVALID);
             // TODO: Payout to the resolver, another clock auction
         } else if (resolution.stakes.length > 0) {
@@ -296,6 +366,7 @@ contract Multiverse is ReentrancyGuard {
                 // TODO: Unless the query is 1 step from fork threshold, then we should wait for the fork to finish
                 uint8 outcome = _calculateOutcomeAndEscalationPayoffs(activeUniverseId, queryId);
                 resolution.outcome = outcome;
+                _recordResolvedUniverse(queryId, activeUniverseId, activeUniverse.isCanonical);
                 emit QueryResolved(msg.sender, activeUniverseId, queryId, outcome);
                 // TODO: Payouts
             } else {
@@ -308,6 +379,220 @@ contract Multiverse is ReentrancyGuard {
         }
 
         // TODO: check Zoltar forking state
+        if (activeUniverse.forkState == ForkState.NotForking) {
+            // Check if Zoltar universe is forking
+            if (ZOLTAR.universes(activeUniverseId).forkTime != 0) {
+                // If Zoltar is forking, then we should mirror the fork in this universe.
+                _mirrorZoltarFork(activeUniverseId);
+            }
+        }
+    }
+
+    /* ========================================== QUERY FEE EXTERNALS ============================================ */
+    /**
+     * @notice Pushes a universe's recent realized profits to the fee controller to run its monthly
+     *         base-fee hill-climb.
+     * @dev Standalone for now; it will be called from the createQuery path once incentives are wired.
+     *      Only pushes while the universe is not forking — the forking window must not move the fee.
+     *      The controller enforces the once-a-month cadence itself.
+     * @param universeId The universe whose base fee to update.
+     */
+    function updateBaseFee(uint248 universeId) external {
+        if (universes[universeId].forkState != ForkState.NotForking) revert InvalidUniverseState();
+
+        (uint256 currentProfit, uint256 lastProfit) = _getProfits(universeId);
+        QUERY_FEE_CONTROLLER.changeBaseFee(universeId, currentProfit, lastProfit);
+    }
+
+    /* ========================================== QUERY FEE INTERNALS ============================================ */
+    /**
+     * @notice Multiplies the monthly base fee by a short-term demand modifier and records this query
+     *         in the current 3-day volume bucket.
+     * @dev Demand is a live rolling 3-day window rebuilt from discrete buckets, so the fee neither ramps
+     *      within a window nor goes stale. `w` is the current window, `vol[x]` a real stored bucket, and
+     *      `f` the fraction of `w` elapsed. Bootstrap volume for pre-genesis windows is NEVER stored; it
+     *      is added only to the local values below, so storage always holds real volume only.
+     *
+     *        lastThreeDayVolume = vol[w] + (1 - f) * prevWindowVolume
+     *        lastSixtyDayVolume = vol[w] + sixtyDayVolume - f * oldestWindowVolume        (w >= 20)
+     *                           = vol[w] + sixtyDayVolume + (20 - w) * BOOT_VOLUME         (w  < 20)
+     *
+     *      where `prevWindowVolume` / `oldestWindowVolume` fall back to BOOT_VOLUME when window `w-1` /
+     *      `w-20` predates genesis. `sixtyDayVolume` is the running sum of the real windows `vol[w-1..w-20]`,
+     *      rolled forward once per new window (completed real window in, real window now older than 60 days
+     *      out; a gap >= 20 recomputes it from real storage). The query is counted only AFTER its fee is
+     *      computed, so it never prices itself.
+     * @param universeId The active universe the query is created in.
+     * @param baseFee The monthly base fee from the controller, before the demand modifier.
+     * @return fee The final query fee.
+     */
+    function _calculateFeeAndApplyVolume(uint248 universeId, uint256 baseFee) internal returns (uint256 fee) {
+        UniverseStatistics storage stats = universeStatistics[universeId];
+        uint256 currentThreeDayWindow = _getCurrentThreeDayWindow();
+        uint256 lastWindow = stats.lastWindowId;
+
+        // Roll the running sum forward. Storage holds REAL volume only — bootstrap is never stored,
+        // so nothing bootstrap-related is added or subtracted here.
+        if (currentThreeDayWindow > lastWindow) {
+            uint256 sixtyDayVolume = stats.sixtyDayVolume;
+            if (currentThreeDayWindow - lastWindow >= 20) {
+                // Idle >= 60 days: every real window in range rolled out; recompute from real storage only.
+                uint256 sum;
+                for (uint256 i = 1; i <= 20;) {
+                    // real window only; a window c-i predating genesis contributes 0 (bootstrap is not stored)
+                    if (currentThreeDayWindow >= i) {
+                        sum += stats.threeDayInfo[currentThreeDayWindow - i].threeDayVolume;
+                    }
+                    unchecked {
+                        i += 1;
+                    }
+                }
+                sixtyDayVolume = sum;
+            } else {
+                for (uint256 i = lastWindow; i < currentThreeDayWindow;) {
+                    // Completed window enters.
+                    sixtyDayVolume += stats.threeDayInfo[i].threeDayVolume; // completed real window enters
+                    if (i >= 20) {
+                        // Real window leaves; bootstrap never subtracted (no accounting for bootstrap).
+                        sixtyDayVolume -= stats.threeDayInfo[i - 20].threeDayVolume;
+                    }
+                    unchecked {
+                        i += 1;
+                    }
+                }
+            }
+            stats.sixtyDayVolume = uint128(sixtyDayVolume);
+            stats.lastWindowId = uint128(currentThreeDayWindow);
+        }
+
+        // Fraction of the current window elapsed, in [0, SCALE).
+        uint256 proportionOfCurrentWindow = ((block.timestamp - GENESIS_TIMESTAMP) % THREE_DAYS) * SCALE / THREE_DAYS;
+
+        uint256 currentVolume = stats.threeDayInfo[currentThreeDayWindow].threeDayVolume;
+
+        // Previous window (w-1): real volume, or bootstrap if it predates genesis. Check done here, before the read.
+        uint256 previousVolume =
+            currentThreeDayWindow >= 1 ? stats.threeDayInfo[currentThreeDayWindow - 1].threeDayVolume : BOOT_VOLUME;
+
+        // recent 3-day (local): current partial + tail of the previous window
+        uint256 lastThreeDayVolume = currentVolume + (SCALE - proportionOfCurrentWindow) * previousVolume / SCALE;
+
+        // 60-day (local): current + real running sum, then trim the oldest window's rolled-out tail.
+        // Bootstrap stays local only. In both branches the oldest window (real for w >= 20, bootstrap for
+        // w < 20) contributes only its (1 - f) tail, since f of it has already slid out of the 60-day span.
+        uint256 lastSixtyDayVolume = currentVolume + stats.sixtyDayVolume;
+        if (currentThreeDayWindow >= 20) {
+            // Oldest window (w-20) is real: subtract the f-tail that rolled out.
+            uint256 oldestVolume = stats.threeDayInfo[currentThreeDayWindow - 20].threeDayVolume;
+            lastSixtyDayVolume -= proportionOfCurrentWindow * oldestVolume / SCALE;
+        } else {
+            // Missing pre-genesis windows are bootstrap. The (20 - w - 1) newer ones enter whole; the single
+            // oldest (w-20) enters only its (1 - f) tail — same trimming the real branch applies.
+            lastSixtyDayVolume += (20 - currentThreeDayWindow - 1) * BOOT_VOLUME + (SCALE - proportionOfCurrentWindow)
+                * BOOT_VOLUME / SCALE;
+        }
+
+        fee = baseFee * _calculateCurveModifier(lastSixtyDayVolume, lastThreeDayVolume) / SCALE;
+
+        // Count this query for future fees.
+        stats.threeDayInfo[currentThreeDayWindow].threeDayVolume = uint128(currentVolume + 1);
+    }
+
+    /**
+     * @notice Turns the demand ratio (recent 3-day volume vs the 60-day average) into the multiplier
+     *         applied to the base fee.
+     * @dev Ratio is SCALE-scaled: SCALE (1.0) means the recent rate equals the 60-day average. An empty
+     *      60-day window (only possible with zero history) yields a neutral 1.0, so a brand-new or idle
+     *      universe is not pushed to the bottom of the curve.
+     *
+     *      Above average (ratio >= SCALE): a gentle linear rise, 0.8 + 0.2 * ratio, so double the demand
+     *      is only +20%. Since recent3 <= sixty always, ratio is bounded by 20 and this branch by 4.8x.
+     *
+     *      Below average (ratio < SCALE): a steep drop, 1 / (1 + 100 * (1 - ratio)^6). The 6th power is
+     *      built iteratively (each step re-divided by SCALE) because (1 - ratio)^6 in SCALE fixed-point
+     *      would overflow a direct exponentiation.
+     *
+     *      TODO: the below-average branch bottoms out near ~1% of the base fee; since the fee doubles as
+     *      TODO: the reporting bond, a floor may be needed (needs testing).
+     * @param lastSixtyDayVolume The reconstructed 60-day rolling volume (denominator).
+     * @param lastThreeDayVolume The reconstructed 3-day rolling volume (numerator).
+     * @return modifier_ The SCALE-scaled multiplier to apply to the base fee.
+     */
+    function _calculateCurveModifier(uint256 lastSixtyDayVolume, uint256 lastThreeDayVolume)
+        internal
+        pure
+        returns (uint256 modifier_)
+    {
+        uint256 ratio = lastSixtyDayVolume == 0 ? SCALE : 20 * lastThreeDayVolume * SCALE / lastSixtyDayVolume;
+
+        if (ratio >= SCALE) {
+            // Above average: gentle linear rise, slope 0.2.
+            modifier_ = (4 * SCALE) / 5 + ratio / 5;
+        } else {
+            // Below average: steep drop.
+            uint256 shortage = SCALE - ratio;
+            uint256 powered = SCALE;
+            for (uint256 i = 0; i < 6;) {
+                powered = powered * shortage / SCALE;
+                unchecked {
+                    i += 1;
+                }
+            }
+            modifier_ = SCALE * SCALE / (SCALE + 100 * powered);
+        }
+    }
+
+    /**
+     * @notice Realized profit of the current and previous ~30-day periods for a universe, as live rolling
+     *         windows, for the controller's monthly base-fee hill-climb.
+     * @dev Same interpolation as the volume path. With `c` the current window and `f` the fraction of it
+     *      elapsed, `currentProfit` is the 30 days ending now and `lastProfit` the 30 days before that:
+     *        currentProfit = profit[c] + sum(profit[c-1..c-9]) + (1 - f) * profit[c-10]
+     *        lastProfit    = f * profit[c-10] + sum(profit[c-11..c-19]) + (1 - f) * profit[c-20]
+     *      The boundary window c-10 is split between the two periods; the oldest window c-20 contributes
+     *      only its (1 - f) tail. Windows predating genesis fall back to BOOT_PROFIT (checked before each
+     *      read). Profit only — no division here, so a zero period is harmless to the controller.
+     * @param universeId The universe to read.
+     * @return currentProfit Rolling realized profit over the last 30 days.
+     * @return lastProfit Rolling realized profit over the 30 days before those.
+     */
+    function _getProfits(uint248 universeId) internal view returns (uint256 currentProfit, uint256 lastProfit) {
+        UniverseStatistics storage stats = universeStatistics[universeId];
+        uint256 currentThreeDayWindow = _getCurrentThreeDayWindow();
+        // Fraction of the current window elapsed, in [0, SCALE).
+        uint256 proportionOfCurrentWindow = ((block.timestamp - GENESIS_TIMESTAMP) % THREE_DAYS) * SCALE / THREE_DAYS;
+
+        // Current month: current window's partial profit + the 9 completed windows behind it.
+        currentProfit = stats.threeDayInfo[currentThreeDayWindow].threeDayProfit;
+        for (uint256 i = 1; i <= 9;) {
+            currentProfit += currentThreeDayWindow >= i
+                ? stats.threeDayInfo[currentThreeDayWindow - i].threeDayProfit
+                : BOOT_PROFIT;
+            unchecked {
+                i += 1;
+            }
+        }
+
+        // Boundary window c-10 is split: (1 - f) tail to the current month, f to the previous month.
+        uint256 boundaryProfit =
+            currentThreeDayWindow >= 10 ? stats.threeDayInfo[currentThreeDayWindow - 10].threeDayProfit : BOOT_PROFIT;
+        currentProfit += (SCALE - proportionOfCurrentWindow) * boundaryProfit / SCALE;
+        lastProfit += proportionOfCurrentWindow * boundaryProfit / SCALE;
+
+        // Previous month: the 9 completed windows behind the boundary.
+        for (uint256 i = 11; i <= 19;) {
+            lastProfit += currentThreeDayWindow >= i
+                ? stats.threeDayInfo[currentThreeDayWindow - i].threeDayProfit
+                : BOOT_PROFIT;
+            unchecked {
+                i += 1;
+            }
+        }
+
+        // Oldest window c-20 contributes only its (1 - f) tail; the rest has rolled out of the 60-day span.
+        uint256 oldestProfit =
+            currentThreeDayWindow >= 20 ? stats.threeDayInfo[currentThreeDayWindow - 20].threeDayProfit : BOOT_PROFIT;
+        lastProfit += (SCALE - proportionOfCurrentWindow) * oldestProfit / SCALE;
     }
 
     /* ========================================== ESCALATION FUNCTIONS =========================================== */
@@ -362,36 +647,28 @@ contract Multiverse is ReentrancyGuard {
         // TODO-CHECK IF LITUUS HERE OR UNWRAP AND BURN REP.
         //        repToken.burn(profit);
 
-        _applyRevenuesAndProfits(universeId, queryFee, profit);
+        _applyProfit(universeId, profit);
 
         return winnerOutcome;
     }
 
     /* ====================================== RESOLUTION INTERNAL FUNCTIONS ====================================== */
     /**
-     * @notice Records a resolved query's revenue and profit into the universe's current 3-day
-     *         bucket and its running totals.
+     * @notice Records a resolved query's profit into the universe's current 3-day
+     *         bucket.
      * @dev The bucket is keyed by the 3-day window index derived from the global genesis anchor
      *      (`(block.timestamp - GENESIS_TIMESTAMP) / THREE_DAYS`). The sparse mapping avoids any
      *      age-dependent array padding and lets a fork copy a fixed window of buckets regardless of
      *      universe age. Both the windowed bucket and the running total are updated for revenue and
      *      profit.
      * @param universeId The id of the universe to credit.
-     * @param revenueAmount The revenue realized by the resolved query (its fee).
      * @param profit The profit realized by the resolved query (the REP to be burned).
      */
-    function _applyRevenuesAndProfits(uint248 universeId, uint256 revenueAmount, uint256 profit) internal {
-        uint256 current3DayWindow = (block.timestamp - GENESIS_TIMESTAMP) / THREE_DAYS;
+    function _applyProfit(uint248 universeId, uint256 profit) internal {
+        uint256 current3DayWindow = _getCurrentThreeDayWindow();
+        ThreeDayInfo storage threeDayInfo = universeStatistics[universeId].threeDayInfo[current3DayWindow];
 
-        UniverseRevenues storage universeRevenue = universeRevenues[universeId];
-
-        // Store revenues.
-        universeRevenue.threeDayRevenue[current3DayWindow] += revenueAmount;
-        universeRevenue.totalRevenue += revenueAmount;
-
-        // Store profits.
-        universeRevenue.threeDayProfit[current3DayWindow] += profit;
-        universeRevenue.totalProfit += profit;
+        threeDayInfo.threeDayProfit += uint128(profit);
     }
 
     /**
@@ -469,24 +746,95 @@ contract Multiverse is ReentrancyGuard {
     }
 
     /* ========================================= PUBLIC VIEW FUNCTIONS =========================================== */
+    /**
+     * @notice Returns the outcome of a query as seen from a given universe.
+     * @dev If the query is resolved in this universe, that outcome is returned directly. Otherwise the
+     *      query's resolutions are scanned for one recorded in an ancestor of this universe (a prefix
+     *      match on the inheritance path). A query is resolved at most once along any single lineage,
+     *      so the first ancestor match is the applicable resolution. Returns UNRESOLVED if neither this
+     *      universe nor any ancestor has resolved the query.
+     * @param universeId The universe to read the outcome from.
+     * @param queryId The query to read.
+     * @return The resolved outcome, or UNRESOLVED if none applies to this universe.
+     */
     function getOutcome(uint248 universeId, uint256 queryId) external view returns (uint8) {
-        // TODO: outcome lookup in ancestor universes if unresolved in the current universe
-        return queryResolutions[universeId][queryId].outcome;
+        // Fast path: resolved in this universe.
+        uint8 localOutcome = queryResolutions[universeId][queryId].outcome;
+        if (localOutcome != UNRESOLVED) return localOutcome;
+
+        // Forward to the heir if this universe has forked, so we read from the active universe where
+        // report()/resolve() record resolutions. Reverts only if the universe does not exist; outcomes
+        // remain readable while the universe is forking (no fork-state check, unlike report/resolve).
+        (uint248 activeUniverseId,) = _getActiveUniverse(universeId);
+        if (activeUniverseId != universeId) {
+            uint8 heirOutcome = queryResolutions[activeUniverseId][queryId].outcome;
+            if (heirOutcome != UNRESOLVED) return heirOutcome;
+        }
+
+        // Otherwise inherit the resolution from an ancestor universe, if any.
+        return _findAncestorResolution(activeUniverseId, queryId);
     }
 
-    function _requiredStakeAmount(uint248 universeId, uint256 queryId) public view returns (uint256) {
+    /* ========================================= HISTORY FUNCTIONS =========================================== */
+
+    /**
+     * @notice Returns the outcome of the first ancestor of `universeId` that has resolved `queryId`.
+     * @dev Scans the query's recorded resolution universes and prefix-matches their inheritance path
+     *      against `universeId`'s path. A query is resolved at most once along any single
+     *      lineage, so the first ancestor match is authoritative. Returns UNRESOLVED if no ancestor
+     *      has resolved the query.
+     */
+    function _findAncestorResolution(uint248 universeId, uint256 queryId) internal view returns (uint8) {
+        Universe storage universe = universes[universeId];
+        bytes32 history = universe.history;
+        uint16 forkDepth = universe.forkDepth;
+
+        uint248[] storage resolvedUniverses = queries[queryId].resolvedUniverses;
+        uint256 length = resolvedUniverses.length;
+        for (uint256 i = 0; i < length; i++) {
+            uint248 resolvedUniverseId = resolvedUniverses[i];
+            Universe storage candidate = universes[resolvedUniverseId];
+            if (LibHistory.isAncestor(candidate.history, candidate.forkDepth, history, forkDepth)) {
+                return queryResolutions[resolvedUniverseId][queryId].outcome;
+            }
+        }
+        return UNRESOLVED;
+    }
+
+    /**
+     * @notice Records `universeId` as a universe where `queryId` is resolved.
+     * @dev Keeps a canonical universe's entry at index 0 so `_findAncestorResolution` finds the canonical
+     *      resolution first (the common-case read). Safe because the canonical chain is a single linear
+     *      path, so at most one canonical universe ever resolves a given query. Saves gas during lookups.
+     */
+    function _recordResolvedUniverse(uint256 queryId, uint248 universeId, bool isCanonical) internal {
+        uint248[] storage resolvedUniverses = queries[queryId].resolvedUniverses;
+        if (isCanonical && resolvedUniverses.length > 0) {
+            resolvedUniverses.push(resolvedUniverses[0]); // move current head to the tail
+            resolvedUniverses[0] = universeId; // canonical entry takes index 0
+        } else {
+            resolvedUniverses.push(universeId);
+        }
+    }
+
+    function _requiredStakeAmountAndForkThreshold(uint248 universeId, uint256 queryId)
+        public
+        view
+        returns (uint256 requiredStakeAmount, uint256 forkThreshold)
+    {
+        forkThreshold = ZOLTAR.getForkThreshold(universeId);
         QueryResolution storage resolution = queryResolutions[universeId][queryId];
         uint256 numberOfStakes = resolution.stakes.length;
         if (numberOfStakes == 0) {
-            return QUERY_FEE_CONTROLLER.getQueryFee(universeId);
+            Query storage query = queries[queryId];
+            requiredStakeAmount = query.fee;
         } else {
             uint256 lastStakeAmount = resolution.stakes[numberOfStakes - 1].amount;
-            uint256 requiredStakeAmount = lastStakeAmount * 2;
-            uint256 forkThreshold = ZOLTAR.getForkThreshold(universeId);
+            requiredStakeAmount = lastStakeAmount * 2;
             if (requiredStakeAmount >= forkThreshold / 2) {
-                return forkThreshold;
+                requiredStakeAmount = forkThreshold;
             } else {
-                return requiredStakeAmount;
+                requiredStakeAmount = requiredStakeAmount;
             }
         }
     }
@@ -497,24 +845,149 @@ contract Multiverse is ReentrancyGuard {
      */
 
     /* ============================================ FORKING FUNCTIONS ============================================ */
-    function forkUniverse(uint248 universeId, uint256 queryId) internal {
+    /// @notice Internal function for forking the universe
+    /// @dev All preconditions should be checked before calling this function.
+    function _forkLituusUniverse(uint248 universeId, uint256 queryId, uint8 outcomeId) internal {
+        Universe storage universe = universes[universeId];
+        // Create a question in ZOLTAR
+        // Form a string for the question.
+        // The question will be:
+        // "Is Green the valid outcome to the question "Color of the sky: Red/Blue/Green"?"
+        // Outcomes are YES and NO.
+        string memory question = _createForkQuestionString(queryId, outcomeId);
+
+        IZoltarQuestionData.QuestionData memory questionData;
+        questionData.title = question;
+        questionData.description = "";
+        questionData.startTime = block.timestamp - 1 days;
+        // in Zoltar: require(block.timestamp >= endTime, 'Question has not ended');
+        questionData.endTime = block.timestamp - 1 days;
+        questionData.numTicks = 0;
+        questionData.displayValueMin = 0;
+        questionData.displayValueMax = 0;
+        questionData.answerUnit = "";
+
+        string[] memory outcomes = new string[](2);
+        outcomes[0] = "NO";
+        outcomes[1] = "YES";
+
+        // Create a ZOLTAR binary fork query
+        uint256 zoltarQueryId = ZOLTAR_QUESTION_DATA.createQuestion(questionData, outcomes);
+        if (zoltarQueryId == 0) revert ZoltarQueryCreationFailed();
+
+        // REP token will get burned by Zoltar without approval
+        // Create a fork in ZOLTAR
+        // TODO: possibly wrap in try-catch to avoid wasting gas if the decision is to keep the fork stake
+        ZOLTAR.forkUniverse(universeId, zoltarQueryId);
+        // Deploy child universes in Zoltar
+        // NO-universe
+        ZOLTAR.deployChild(universeId, 0);
+        // YES-universe
+        ZOLTAR.deployChild(universeId, 1);
+        _spawnChildUniverse(universeId, queryId, outcomeId, 0);
+        _spawnChildUniverse(universeId, queryId, outcomeId, 1);
+        // TODO: Split the REP token supply in the child universes via Zoltar
+        universe.forkState = ForkState.Migration;
+        universe.forkQuery = queryId;
+        universe.isLituusFork = true;
+        universe.forkOutcome = outcomeId;
+    }
+
+    function _spawnChildUniverse(uint248 universeId, uint256 queryId, uint8 forkingOutcomeId, uint8 zoltarOutcomeId)
+        internal
+    {
+        uint248 childUniverseId = ZOLTAR.getChildUniverseId(universeId, zoltarOutcomeId);
+        if (childUniverseId == 0) revert InvalidUniverse();
+
+        Universe storage parentUniverse = universes[universeId];
+
+        IReputationToken childUniverseZoltarRepToken = ZOLTAR.getRepToken(childUniverseId);
+        // Deploy a Lituus REP token that wraps the Zoltar REP token
+        // TODO: Discuss the format of the suffix if the forks are for binary queries.
+        ILituusRep childUniverseRepToken =
+            new LituusRep(address(this), address(childUniverseZoltarRepToken), "Lituus Reputation Token", "REP0.0");
+        Universe storage childUniverse = universes[childUniverseId];
+        childUniverse.repToken = childUniverseRepToken;
+        childUniverse.forkState = ForkState.Forming;
+        childUniverse.forkTime = uint48(block.timestamp);
+        childUniverse.parent = universeId;
+        childUniverse.favoriteChild = 0;
+        childUniverse.heir = 0;
+        // The child extends the parent's inheritance path by the branch it was spawned on.
+        (childUniverse.history, childUniverse.forkDepth) =
+            LibHistory.appendHistory(parentUniverse.history, parentUniverse.forkDepth, zoltarOutcomeId);
+        // isCanonical stays false at spawn time: only the favoriteChild inherits the canonical flag,
+        // and it is designated at fork finalization.
+        childUniverse.forkQuery = 0;
+        childUniverse.supplyBeforeFork = ZOLTAR.getUniverseTheoreticalSupply(childUniverseId);
+
+        // Set outcomes in forking queries in child universes
+        QueryResolution storage resolution = queryResolutions[childUniverseId][queryId];
+        resolution.queryCreateTime = uint48(block.timestamp);
+        if (zoltarOutcomeId == 1) {
+            // The query is resolved in the Yes-universe
+            resolution.outcome = forkingOutcomeId;
+            // Record the resolution so descendants of the Yes-universe inherit it via the ancestor scan.
+            // Children are never canonical at spawn time (the favoriteChild is designated at fork finalization).
+            _recordResolvedUniverse(queryId, childUniverseId, false);
+        }
+    }
+
+    function mirrorZoltarFork(uint248 universeId) external nonReentrant {
+        _mirrorZoltarFork(universeId);
+    }
+
+    /// @dev Guard-free internal variant
+    function _mirrorZoltarFork(uint248 universeId) internal {
         // TODO
         // Check if the universe can fork (state of the universe)
-        // Check if ZOLTAR is not forking, revert if it's forking
-        // Handle if the query should fork but the universe cannot fork
-        // Create a ZOLTAR binary fork query
-        // Approve REP for ZOLTAR
-        // Create a fork in ZOLTAR
-        // TODO: Update the universe's fork state to Awaiting children and set the forkQuery
-        // Spawn child universes
+        Universe storage universe = universes[universeId];
+        if (universe.forkState != ForkState.NotForking) revert InvalidUniverseState();
+        // Check if ZOLTAR universe is forking, revert if it's not forking
+        IZoltar.Universe memory zoltarUniverse = ZOLTAR.universes(universeId);
+        if (zoltarUniverse.forkTime == 0) revert ZoltarUniverseIsNotForking();
+
+        // Import a ZOLTAR binary fork query
+        uint256 forkQuestionId = zoltarUniverse.forkQuestionId;
+        IZoltarQuestionData.QuestionData memory questionData = ZOLTAR_QUESTION_DATA.questions(forkQuestionId);
+        if (questionData.endTime == 0) revert InvalidZoltarQuestion();
+
+        uint256 queryId = queryCount;
+
+        Query storage query = queries[queryId];
+        query.numberOfOutcomes = 2; // 1 is NO, 2 is YES (0 stays UNRESOLVED)
+        query.originUniverse = universeId;
+        query.fee = 0;
+        query.question = questionData.title;
+
+        // Emit an event
+        emit QueryCreated(msg.sender, queryId, universeId, questionData.title, 2);
+
+        queryCount++;
+
+        // Spawn child universes. The mirrored query resolves as YES (outcome 2) in the YES-child only;
+        // in the NO-child it stays unresolved.
+        // TODO: what if the Zoltar query has more than 2 outcomes?
+        _spawnChildUniverse(universeId, queryId, 2, 0);
+        _spawnChildUniverse(universeId, queryId, 2, 1);
         // Set outcomes in child universes and update their states to Forming
+        universe.forkState = ForkState.Migration;
+        universe.forkQuery = queryId;
+        universe.forkOutcome = 2;
     }
 
     /* =========================================== INTERNAL HELPERS ============================================== */
-    function _getActiveUniverseAndRepToken(uint248 universeId)
+    /**
+     * @notice Resolves a universe id to the active universe, forwarding to the heir if it has forked.
+     * @dev Reverts with InvalidUniverse only if the universe (or its heir) does not exist (repToken == 0).
+     *      Does NOT check the fork state, so callers that must operate only on an active/forming universe
+     *      (report/resolve) layer that check on top; read-only callers (getOutcome) can use this directly
+     *      to stay readable while a universe is forking.
+     */
+    function _getActiveUniverse(uint248 universeId)
         internal
         view
-        returns (uint248 activeUniverseId, Universe storage universe, ILituusRep repToken)
+        returns (uint248 activeUniverseId, Universe storage universe)
     {
         universe = universes[universeId];
         if (address(universe.repToken) == address(0)) revert InvalidUniverse();
@@ -528,6 +1001,14 @@ contract Multiverse is ReentrancyGuard {
         } else {
             activeUniverseId = universeId;
         }
+    }
+
+    function _getActiveUniverseAndRepToken(uint248 universeId)
+        internal
+        view
+        returns (uint248 activeUniverseId, Universe storage universe, ILituusRep repToken)
+    {
+        (activeUniverseId, universe) = _getActiveUniverse(universeId);
         // Sanity check: if the universe is not active or forming,
         // then the reporting should have been forwarded to the heir.
         ForkState forkState = universe.forkState;
@@ -545,6 +1026,7 @@ contract Multiverse is ReentrancyGuard {
         if (resolution.queryCreateTime != 0) {
             return resolution.queryCreateTime;
         } else {
+            // TODO: check query flow after forks
             // If the queryCreateTime is not set, it means the query was not created in this universe but was reported
             // on in this universe. In this case, we should use the forkTime of the universe as the queryCreateTime,
             // since the query becomes reportable in this universe after the fork.
@@ -553,5 +1035,19 @@ contract Multiverse is ReentrancyGuard {
             resolution.queryCreateTime = uint48(queryCreateTime);
             return queryCreateTime;
         }
+    }
+
+    function _createForkQuestionString(uint256 queryId, uint8 outcomeId) internal view returns (string memory) {
+        // TODO: Placeholder for now
+        Query storage query = queries[queryId];
+        return query.question;
+    }
+
+    /**
+     * @notice This function returns the current 3-day window id for all universes since GENESIS.
+     * @return currentThreeDayWindow The current 3-day window id.
+     */
+    function _getCurrentThreeDayWindow() internal view returns (uint256 currentThreeDayWindow) {
+        currentThreeDayWindow = (block.timestamp - GENESIS_TIMESTAMP) / THREE_DAYS;
     }
 }
