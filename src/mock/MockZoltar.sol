@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity ^0.8.35;
 
-import { IZoltar } from "../interfaces/IZoltar.sol";
+import { IZoltar, IZoltarQuestionData } from "../interfaces/IZoltar.sol";
 import { IReputationToken } from "../interfaces/IReputationToken.sol";
 
 contract MockZoltar is IZoltar {
     uint256 constant FORK_THRESHOLD_DIVISOR = 20; // 5% of total supply atm
 
-    IReputationToken public repToken;
+    IReputationToken public immutable repToken;
+    IZoltarQuestionData public immutable zoltarQuestionData;
 
-    constructor(IReputationToken repToken_) {
+    constructor(IReputationToken repToken_, IZoltarQuestionData zoltarQuestionData_) {
         repToken = repToken_;
+        zoltarQuestionData = zoltarQuestionData_;
     }
 
     function getChildUniverseId(uint248 universeId, uint256) external pure returns (uint248) {
@@ -27,5 +29,25 @@ contract MockZoltar is IZoltar {
 
     function getForkThreshold(uint248 universeId) public view returns (uint256) {
         return getUniverseTheoreticalSupply(universeId) / FORK_THRESHOLD_DIVISOR;
+    }
+
+    /// @notice Stubbed implementation of `IZoltar.universes`.
+    /// @dev `forkTime` is `block.timestamp` for the genesis universe (id 0) and `0`
+    ///      for any other universe. The remaining fields are zero / the shared REP
+    ///      token. Lets tests instantiate the mock against the full interface.
+    function universes(uint248 universeId) external view returns (Universe memory u) {
+        u.forkTime = universeId == 0 ? block.timestamp : 0;
+        u.forkQuestionId = 0;
+        u.forkingOutcomeIndex = 0;
+        u.reputationToken = repToken;
+        u.parentUniverseId = 0;
+    }
+
+    function forkUniverse(uint248, uint256) external {
+        // no-op
+    }
+
+    function deployChild(uint248, uint256) external {
+        // no-op
     }
 }
