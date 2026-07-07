@@ -25,7 +25,7 @@ contract Multiverse is ReentrancyGuard {
     uint8 public constant INVALID = 254; // an invalid outcome value used for reporting an invalid fork outcome during
     // fork resolution. It is outside the valid outcome range [1, MAX_OUTCOMES]
     // TODO: determine the max query length based on gas costs
-    uint16 public constant MAX_QUERY_LENGTH = 1024; // maximum length of a query string
+    uint16 public constant MAX_QUERY_LENGTH = 2058; // maximum length of a query string
 
     uint256 public constant THREE_DAYS = 3 days;
     uint256 public constant SIXTY_DAYS = 60 days;
@@ -169,6 +169,9 @@ contract Multiverse is ReentrancyGuard {
     error ZoltarQueryCreationFailed();
     error ZoltarUniverseIsNotForking();
     error InvalidZoltarQuestion();
+    error QueryTooLong();
+    error ZeroStakeAmount();
+    error ForkingNotImplemented();
 
     /* =============================================== CONSTRUCTOR =============================================== */
     constructor(IZoltar _zoltar, uint248 _initialZoltarUniverseId, IQueryFeeController _queryFeeController) {
@@ -226,6 +229,7 @@ contract Multiverse is ReentrancyGuard {
         // Validate the question and number of outcomes
         if (numberOfOutcomes <= 2) revert InvalidNumberOfOutcomes();
         if (numberOfOutcomes > MAX_OUTCOMES) revert InvalidNumberOfOutcomes();
+        if (bytes(question).length > MAX_QUERY_LENGTH) revert QueryTooLong();
 
         // TODO: Here we need to actually check if question contains the same numberOfOutcomes needed.
 
@@ -291,6 +295,8 @@ contract Multiverse is ReentrancyGuard {
 
         (uint256 requiredStakeAmount, uint256 forkThreshold) =
             _requiredStakeAmountAndForkThreshold(activeUniverseId, queryId);
+        // A zero stake would allow free reports and an escalation ladder stuck at 0.
+        if (requiredStakeAmount == 0) revert ZeroStakeAmount();
         // TODO: If the bond before a fork bond is placed so that the next appeal would cause a fork,
         // and its not possible to fork because the parent has still not resolved their fork,
         // then the bond placing is reverted and the query is frozen until the parent universe resolves the fork.
@@ -309,6 +315,7 @@ contract Multiverse is ReentrancyGuard {
             // Fork the universe here and in Zoltar and create child universes
             // If Zoltar doesn't allow forking (maybe due to rate limiting)
             // then accept the stake and freeze the query
+            revert ForkingNotImplemented();
         }
 
         // Update the resolution record for the universe
@@ -369,8 +376,8 @@ contract Multiverse is ReentrancyGuard {
         if (activeUniverse.forkState == ForkState.NotForking) {
             // Check if Zoltar universe is forking
             if (ZOLTAR.universes(activeUniverseId).forkTime != 0) {
-                // If Zoltar is forking, then we should mirror the fork in this universe
-                mirrorZoltarFork(activeUniverseId);
+                // If Zoltar is forking, then we should mirror the fork in this universe.
+                _mirrorZoltarFork(activeUniverseId);
             }
         }
     }
@@ -886,6 +893,8 @@ contract Multiverse is ReentrancyGuard {
         uint248 childUniverseId = ZOLTAR.getChildUniverseId(universeId, zoltarOutcomeId);
         if (childUniverseId == 0) revert InvalidUniverse();
 
+        Universe storage parentUniverse = universes[universeId];
+
         IReputationToken childUniverseZoltarRepToken = ZOLTAR.getRepToken(childUniverseId);
         // Deploy a Lituus REP token that wraps the Zoltar REP token
         // TODO: Discuss the format of the suffix if the forks are for binary queries.
@@ -898,8 +907,11 @@ contract Multiverse is ReentrancyGuard {
         childUniverse.parent = universeId;
         childUniverse.favoriteChild = 0;
         childUniverse.heir = 0;
-        // TODO: populate the history
-        childUniverse.history = 0;
+        // The child extends the parent's inheritance path by the branch it was spawned on.
+        (childUniverse.history, childUniverse.forkDepth) =
+            LibHistory.appendHistory(parentUniverse.history, parentUniverse.forkDepth, zoltarOutcomeId);
+        // isCanonical stays false at spawn time: only the favoriteChild inherits the canonical flag,
+        // and it is designated at fork finalization.
         childUniverse.forkQuery = 0;
         childUniverse.supplyBeforeFork = ZOLTAR.getUniverseTheoreticalSupply(childUniverseId);
 
@@ -912,7 +924,12 @@ contract Multiverse is ReentrancyGuard {
         }
     }
 
-    function mirrorZoltarFork(uint248 universeId) public nonReentrant {
+    function mirrorZoltarFork(uint248 universeId) external nonReentrant {
+        _mirrorZoltarFork(universeId);
+    }
+
+    /// @dev Guard-free internal variant
+    function _mirrorZoltarFork(uint248 universeId) internal {
         // TODO
         // Check if the universe can fork (state of the universe)
         Universe storage universe = universes[universeId];
@@ -929,8 +946,7 @@ contract Multiverse is ReentrancyGuard {
         uint256 queryId = queryCount;
 
         Query storage query = queries[queryId];
-        // TODO: check if the outcomes should be YES and NO and what should be their indexes
-        query.numberOfOutcomes = 3; // 0 is Unresolved, 1 is NO, 2 is YES
+        query.numberOfOutcomes = 2; // 1 is NO, 2 is YES (0 stays UNRESOLVED)
         query.originUniverse = universeId;
         query.fee = 0;
         query.question = questionData.title;
@@ -940,15 +956,15 @@ contract Multiverse is ReentrancyGuard {
 
         queryCount++;
 
-        // Spawn child universes
-        // TODO: check if the outcomes should be YES and NO or the same as in Zoltar
+        // Spawn child universes. The mirrored query resolves as YES (outcome 2) in the YES-child only;
+        // in the NO-child it stays unresolved.
         // TODO: what if the Zoltar query has more than 2 outcomes?
-        _spawnChildUniverse(universeId, queryId, 1, 0); // Forking over outcome 1 in Zoltar
-        _spawnChildUniverse(universeId, queryId, 1, 1);
+        _spawnChildUniverse(universeId, queryId, 2, 0);
+        _spawnChildUniverse(universeId, queryId, 2, 1);
         // Set outcomes in child universes and update their states to Forming
         universe.forkState = ForkState.Migration;
         universe.forkQuery = queryId;
-        universe.forkOutcome = 1;
+        universe.forkOutcome = 2;
     }
 
     /* =========================================== INTERNAL HELPERS ============================================== */

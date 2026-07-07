@@ -9,6 +9,9 @@ contract MockZoltarQuestionData is IZoltarQuestionData {
     }
 
     function questions(uint256) external pure returns (QuestionData memory questionData) {
+        // Non-zero endTime so the Multiverse accepts the question as an existing Zoltar fork question.
+        questionData.title = "Mock Zoltar question";
+        questionData.endTime = 1;
         return questionData;
     }
 }
