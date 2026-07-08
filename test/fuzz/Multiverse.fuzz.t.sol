@@ -78,7 +78,7 @@ contract MultiverseFuzzTest is Test {
 
     /// @dev Property: the exact fee reported by the controller is charged and stored.
     function testFuzz_CreateQuery_VaryingFee(uint256 fee) public {
-        fee = bound(fee, 0, USER_REP_BALANCE);
+        fee = bound(fee, 1, USER_REP_BALANCE);
         feeCtl.setFee(fee);
         uint256 userBalanceBefore = genesisRep.balanceOf(user);
 
