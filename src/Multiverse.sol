@@ -82,10 +82,10 @@ contract Multiverse is ReentrancyGuard {
         uint48 queryCreateTime;
         // if this is 0, then UNRESOLVED, otherwise it is RESOLVED.
         uint8 outcome;
-        // Escalation totals, frozen at resolution, so withdraw() computes each payout in O(1).
+        // Escalation settlement totals, frozen at resolution, so claim() computes each payout in O(1).
+        // totalDistributable is the losers' pool minus the burn cut, computed once at resolution.
         // REP amounts are bounded by max supply (100M * 1e18), comfortably within uint96.
-        // Packed with queryCreateTime + outcome: 48 + 8 + 96 + 96 = 248 bits, one slot.
-        uint96 totalStaked;
+        uint96 totalDistributable;
         uint96 winnerStaked;
         // The stakes for this query.
         Stake[] stakes;
@@ -165,12 +165,11 @@ contract Multiverse is ReentrancyGuard {
         uint256 stakeAmount
     );
     event QueryResolved(address indexed resolver, uint248 indexed universeId, uint256 indexed queryId, uint8 outcome);
-    event StakeWithdrawn(
-        address indexed caller,
+    event StakeClaimed(
+        address indexed reporter,
         uint248 indexed universeId,
         uint256 indexed queryId,
         uint256 stakeIndex,
-        address reporter,
         uint256 payout
     );
 
@@ -193,8 +192,10 @@ contract Multiverse is ReentrancyGuard {
     error ZeroStakeAmount();
     error ForkingNotImplemented();
     error QueryNotResolved();
-    error StakeAlreadyWithdrawn();
+    error StakeAlreadyClaimed();
     error NotAWinningStake();
+    error NotStakeOwner();
+    error InvalidClaimBatch();
 
     /* =============================================== CONSTRUCTOR =============================================== */
     /**
@@ -217,7 +218,7 @@ contract Multiverse is ReentrancyGuard {
         // token symbol will use universe.history as a suffix. Genesis universe will have symbol "REP0"
         // TODO: Discuss the format of the suffix if the forks are for binary queries.
         ILituusRep repToken =
-                    new LituusRep(address(this), address(initialZoltarRepToken), "Lituus Reputation Token", "REP0");
+            new LituusRep(address(this), address(initialZoltarRepToken), "Lituus Reputation Token", "REP0");
 
         Universe storage genesisUniverse = universes[0];
         genesisUniverse.favoriteChild = 0;
@@ -269,7 +270,8 @@ contract Multiverse is ReentrancyGuard {
      *      The query is counted in the current 3-day volume bucket only after its own fee is computed.
      * @param universeId The universe to create the query in (forwarded to the heir if it has forked).
      * @param question The question text alongside the possible answers (to be checked).
-     * @param numberOfOutcomes The number of reportable outcomes (UNRESOLVED and INVALID are always available separately).
+     * @param numberOfOutcomes The number of reportable outcomes (UNRESOLVED and INVALID are always available
+     * separately).
      */
     function createQuery(uint248 universeId, string calldata question, uint8 numberOfOutcomes) external nonReentrant {
         (uint248 activeUniverseId,, ILituusRep repToken) = _getActiveUniverseAndRepToken(universeId);
@@ -353,7 +355,7 @@ contract Multiverse is ReentrancyGuard {
         }
 
         (uint256 requiredStakeAmount, uint256 forkThreshold) =
-                        _requiredStakeAmountAndForkThreshold(activeUniverseId, queryId);
+            _requiredStakeAmountAndForkThreshold(activeUniverseId, queryId);
         // A zero stake would allow free reports and an escalation ladder stuck at 0.
         if (requiredStakeAmount == 0) revert ZeroStakeAmount();
         // TODO: If the bond before a fork bond is placed so that the next appeal would cause a fork,
@@ -464,35 +466,78 @@ contract Multiverse is ReentrancyGuard {
     /**
      * @notice Claims a winning stake's payout from a resolved query: the stake back plus its pro-rata
      *         share of the losing stakes (after the burn cut).
-     * @dev Payouts are computed from the totals frozen at resolution, never by looping stakes. A stake's amount is
-     *      zeroed on settlement, so amount == 0 also applies as the claimed flag.
-     *      TODO-Check if anyone can call it or only msg.sender == reporter
-     *      TODO-Maybe add withdrawMultiple
+     * @dev Payouts are computed from the totals frozen at resolution, never by looping stakes. A stake's
+     *      amount is zeroed on settlement, so amount == 0 also applies as the claimed flag.
      * @param universeId The universe the query was resolved in.
      * @param queryId The resolved query.
      * @param stakeIndex The index of the stake being claimed.
      */
-    function withdraw(uint248 universeId, uint256 queryId, uint256 stakeIndex) external nonReentrant {
+    function claim(uint248 universeId, uint256 queryId, uint256 stakeIndex) external nonReentrant {
+        uint256 payout = _claim(universeId, queryId, stakeIndex);
+
+        universes[universeId].repToken.safeTransfer(msg.sender, payout);
+
+        emit StakeClaimed(msg.sender, universeId, queryId, stakeIndex, payout);
+    }
+
+    /**
+     * @notice Claims multiple winning stakes of the caller across queries of one universe, in a single
+     *         transfer.
+     * @dev Entry i claims stakeIndices[i] on queryIds[i]; the two arrays must align and be non-empty.
+     *      Same guards per stake as claim(). A repeated (queryId, stakeIndex) pair reverts on its second
+     *      occurrence (amount == 0), failing the whole batch.
+     * @param universeId The universe the queries were resolved in.
+     * @param queryIds The resolved queries being claimed from.
+     * @param stakeIndices The index of the caller's stake in the matching query.
+     */
+    function claimMultiple(uint248 universeId, uint256[] calldata queryIds, uint256[] calldata stakeIndices)
+        external
+        nonReentrant
+    {
+        uint256 length = queryIds.length;
+        if (length == 0 || length != stakeIndices.length) revert InvalidClaimBatch();
+
+        uint256 totalPayout;
+        for (uint256 i = 0; i < length;) {
+            uint256 payout = _claim(universeId, queryIds[i], stakeIndices[i]);
+            totalPayout += payout;
+
+            emit StakeClaimed(msg.sender, universeId, queryIds[i], stakeIndices[i], payout);
+
+            unchecked {
+                i += 1;
+            }
+        }
+
+        universes[universeId].repToken.safeTransfer(msg.sender, totalPayout);
+    }
+
+    /**
+     * @notice Validates and settles a single stake for the caller, returning its payout.
+     * @dev Only the stake's reporter can claim it. Zeroes the amount (the settled flag) before any
+     *      transfer happens in the callers.
+     * @param universeId The universe the query was resolved in.
+     * @param queryId The resolved query the stake belongs to.
+     * @param stakeIndex The index of the stake being claimed.
+     * @return payout The stake amount plus its pro-rata share of the distributable losing stakes.
+     */
+    function _claim(uint248 universeId, uint256 queryId, uint256 stakeIndex) internal returns (uint256 payout) {
         QueryResolution storage resolution = queryResolutions[universeId][queryId];
-        if (resolution.outcome == 0) revert QueryNotResolved();
+        if (resolution.outcome == UNRESOLVED) revert QueryNotResolved();
 
         Stake storage stake = resolution.stakes[stakeIndex];
+        if (stake.reporter != msg.sender) revert NotStakeOwner();
+
         uint256 amount = stake.amount;
-        if (amount == 0) revert StakeAlreadyWithdrawn();
+        if (amount == 0) revert StakeAlreadyClaimed();
         if (stake.reportedOutcome != resolution.outcome) revert NotAWinningStake();
 
-        // amount == 0 is the settled flag — set before the transfer.
+        // amount == 0 is the settled flag, which should be set before the transfer.
         stake.amount = 0;
 
         uint256 winnerStaked = uint256(resolution.winnerStaked);
-        uint256 totalLosersStaked = uint256(resolution.totalStaked) - winnerStaked;
-        // Same integer math as the burn at resolution, so burn + payouts never exceed the stakes held.
-        uint256 totalDistributable = totalLosersStaked - totalLosersStaked / BURN_DIVIDER;
-        uint256 payout = amount + amount * totalDistributable / winnerStaked;
-
-        universes[universeId].repToken.safeTransfer(stake.reporter, payout);
-
-        emit StakeWithdrawn(msg.sender, universeId, queryId, stakeIndex, stake.reporter, payout);
+        uint256 totalDistributable = uint256(resolution.totalDistributable);
+        payout = amount + amount * totalDistributable / winnerStaked;
     }
 
     /* ========================================== QUERY FEE EXTERNALS ============================================ */
@@ -626,9 +671,9 @@ contract Multiverse is ReentrancyGuard {
      * @return modifier_ The SCALE-scaled multiplier to apply to the base fee.
      */
     function _calculateCurveModifier(uint256 lastSixtyDayVolume, uint256 lastThreeDayVolume)
-    internal
-    pure
-    returns (uint256 modifier_)
+        internal
+        pure
+        returns (uint256 modifier_)
     {
         uint256 ratio = lastSixtyDayVolume == 0 ? SCALE : 20 * lastThreeDayVolume * SCALE / lastSixtyDayVolume;
 
@@ -721,7 +766,7 @@ contract Multiverse is ReentrancyGuard {
      *      the Lituus wrap/unwrap path (TODO).
      *
      *      Winner stake refunds and their proportional share of the remaining 80% of losing stakes
-     *      are NOT settled here — those are claimed separately at withdrawal time.
+     *      are NOT settled here — those are claimed separately through claim().
      * @param universeId The id of the universe the query is being resolved in.
      * @param queryId The id of the query being resolved.
      * @return winnerOutcome The winning outcome of the resolved query.
@@ -744,23 +789,23 @@ contract Multiverse is ReentrancyGuard {
         // Ramps to the full fee over the reporting window; a first correct report after day 3 earns it whole.
         uint256 reporterPay = _timeBasedFeeShare(queryFee, reportingTimestamp - queryCreateTime);
 
-        uint256 profit = totalLoserStakes / BURN_DIVIDER + (queryFee - reporterPay);
+        uint256 loserBurn = totalLoserStakes / BURN_DIVIDER;
+        uint256 profit = loserBurn + (queryFee - reporterPay);
 
         ILituusRep repToken = universes[universeId].repToken;
 
         QueryResolution storage resolution = queryResolutions[universeId][queryId];
-        // Store the escalation totals so withdraw() can compute each winner's payout without looping again.
-        resolution.totalStaked = uint96(totalStaked);
+        // Store the escalation totals so claim() can compute each winner's payout without looping again.
+        resolution.totalDistributable = uint96(totalLoserStakes - loserBurn);
         resolution.winnerStaked = uint96(winnerOutcomeStaked);
 
         // Consecutive reports must differ, so no-losers <=> exactly one stake: settle the sole winner
-        // here in one transfer (bond refund + reporter reward) instead of requiring a withdraw() call.
+        // here in one transfer (bond refund + reporter reward) instead of requiring a claim() call.
         if (resolution.stakes.length == 1) {
             resolution.stakes[0].amount = 0; // amount == 0 marks the stake settled
             repToken.safeTransfer(reporter, reporterPay + totalStaked);
         }
-        // In the case of more than one stakes, then even the reporter that gets paid, needs to withdraw.
-        // TODO-Check if that makes sense or we also provider here the losing stakes to him (since transfer happens anyways).
+        // In the case of more than one stakes, then even the reporter that gets paid, needs to claim.
         else {
             repToken.safeTransfer(reporter, reporterPay);
         }
@@ -826,15 +871,15 @@ contract Multiverse is ReentrancyGuard {
      * @return reportingTimestamp The timestamp when the stake acquiring the query fee reward occurred.
      */
     function _extractWinnerOutcomeAndTotals(uint248 universeId, uint256 queryId)
-    internal
-    view
-    returns (
-        uint256 totalStaked,
-        uint256 winnerOutcomeStaked,
-        uint8 winnerOutcome,
-        address reporter,
-        uint48 reportingTimestamp
-    )
+        internal
+        view
+        returns (
+            uint256 totalStaked,
+            uint256 winnerOutcomeStaked,
+            uint8 winnerOutcome,
+            address reporter,
+            uint48 reportingTimestamp
+        )
     {
         Stake[] storage stakes = queryResolutions[universeId][queryId].stakes;
         uint256 length = stakes.length;
@@ -959,9 +1004,9 @@ contract Multiverse is ReentrancyGuard {
      * @return forkThreshold The stake level at which posting triggers a fork.
      */
     function _requiredStakeAmountAndForkThreshold(uint248 universeId, uint256 queryId)
-    internal
-    view
-    returns (uint256 requiredStakeAmount, uint256 forkThreshold)
+        internal
+        view
+        returns (uint256 requiredStakeAmount, uint256 forkThreshold)
     {
         forkThreshold = ZOLTAR.getForkThreshold(universeId);
         QueryResolution storage resolution = queryResolutions[universeId][queryId];
@@ -1049,7 +1094,7 @@ contract Multiverse is ReentrancyGuard {
      * @param zoltarOutcomeId The Zoltar branch id (0 = NO, 1 = YES).
      */
     function _spawnChildUniverse(uint248 universeId, uint256 queryId, uint8 forkingOutcomeId, uint8 zoltarOutcomeId)
-    internal
+        internal
     {
         uint248 childUniverseId = ZOLTAR.getChildUniverseId(universeId, zoltarOutcomeId);
         if (childUniverseId == 0) revert InvalidUniverse();
@@ -1060,7 +1105,7 @@ contract Multiverse is ReentrancyGuard {
         // Deploy a Lituus REP token that wraps the Zoltar REP token
         // TODO: Discuss the format of the suffix if the forks are for binary queries.
         ILituusRep childUniverseRepToken =
-                    new LituusRep(address(this), address(childUniverseZoltarRepToken), "Lituus Reputation Token", "REP0.0");
+            new LituusRep(address(this), address(childUniverseZoltarRepToken), "Lituus Reputation Token", "REP0.0");
         Universe storage childUniverse = universes[childUniverseId];
         childUniverse.repToken = childUniverseRepToken;
         childUniverse.forkState = ForkState.Forming;
@@ -1070,7 +1115,7 @@ contract Multiverse is ReentrancyGuard {
         childUniverse.heir = 0;
         // The child extends the parent's inheritance path by the branch it was spawned on.
         (childUniverse.history, childUniverse.forkDepth) =
-        LibHistory.appendHistory(parentUniverse.history, parentUniverse.forkDepth, zoltarOutcomeId);
+            LibHistory.appendHistory(parentUniverse.history, parentUniverse.forkDepth, zoltarOutcomeId);
         // isCanonical stays false at spawn time: only the favoriteChild inherits the canonical flag,
         // and it is designated at fork finalization.
         childUniverse.forkQuery = 0;
@@ -1146,9 +1191,9 @@ contract Multiverse is ReentrancyGuard {
      *      to stay readable while a universe is forking.
      */
     function _getActiveUniverse(uint248 universeId)
-    internal
-    view
-    returns (uint248 activeUniverseId, Universe storage universe)
+        internal
+        view
+        returns (uint248 activeUniverseId, Universe storage universe)
     {
         universe = universes[universeId];
         if (address(universe.repToken) == address(0)) revert InvalidUniverse();
@@ -1174,9 +1219,9 @@ contract Multiverse is ReentrancyGuard {
      * @return repToken The active universe's Lituus REP token.
      */
     function _getActiveUniverseAndRepToken(uint248 universeId)
-    internal
-    view
-    returns (uint248 activeUniverseId, Universe storage universe, ILituusRep repToken)
+        internal
+        view
+        returns (uint248 activeUniverseId, Universe storage universe, ILituusRep repToken)
     {
         (activeUniverseId, universe) = _getActiveUniverse(universeId);
         // Sanity check: if the universe is not active or forming,
@@ -1197,8 +1242,8 @@ contract Multiverse is ReentrancyGuard {
      * @return queryCreateTime The timestamp the query became reportable in this universe.
      */
     function _getAndUpdateQueryCreateTime(uint248 universeId, uint256 queryId)
-    internal
-    returns (uint48 queryCreateTime)
+        internal
+        returns (uint48 queryCreateTime)
     {
         QueryResolution storage resolution = queryResolutions[universeId][queryId];
         if (resolution.queryCreateTime != 0) {
