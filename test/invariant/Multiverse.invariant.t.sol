@@ -15,7 +15,8 @@ import { MultiverseHandler } from "./handlers/MultiverseHandler.sol";
 /// @notice Stateful fuzzing of createQuery. Random sequences of handler calls must never
 ///         violate the global invariants below.
 contract MultiverseInvariantTest is Test {
-    uint248 internal constant GENESIS_UID = 0;
+    // Nonzero on purpose: catches code paths that wrongly assume the genesis universe lives at id 0.
+    uint248 internal constant GENESIS_UID = 42;
     uint256 internal constant DEFAULT_FEE = 1 ether;
     // Large REP balance for the handler so cumulative fees never exhaust it during a run.
     uint256 internal constant HANDLER_REP_BALANCE = 1e40;

@@ -13,7 +13,8 @@ import { MockQueryFeeController } from "src/mock/MockQueryFeeController.sol";
 
 /// @notice Property-based tests for createQuery. The fuzzer throws random inputs at the assumptions.
 contract MultiverseFuzzTest is Test {
-    uint248 internal constant GENESIS_UID = 0;
+    // Nonzero on purpose: catches code paths that wrongly assume the genesis universe lives at id 0.
+    uint248 internal constant GENESIS_UID = 42;
     uint256 internal constant DEFAULT_FEE = 1 ether;
     uint256 internal constant USER_REP_BALANCE = 1000 ether;
 
