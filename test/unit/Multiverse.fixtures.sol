@@ -16,7 +16,9 @@ import { MockQueryFeeController } from "src/mock/MockQueryFeeController.sol";
 ///      Currently provides a basic deploy fixture (`setUp`) and a query creation fixture
 ///      (`_createDefaultQuery`); fixtures for other cases will be added as the suites grow.
 abstract contract MultiverseFixtures is Test {
-    uint248 internal constant GENESIS_UID = 0;
+    // Nonzero on purpose: Lituus universe ids mirror Zoltar universe ids, and a nonzero genesis
+    // catches any code path that wrongly assumes the genesis universe lives at id 0.
+    uint248 internal constant GENESIS_UID = 42;
     uint256 internal constant DEFAULT_FEE = 1 ether;
     uint256 internal constant USER_REP_BALANCE = 1000 ether;
     uint8 internal constant DEFAULT_NUMBER_OF_OUTCOMES = 3;

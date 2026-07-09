@@ -37,7 +37,7 @@ contract MultiverseConstructorTest is MultiverseFixtures {
 
         (
             ILituusRep repToken,
-            Multiverse.ForkState forkState,
+            Multiverse.UniverseState universeState,
             uint48 forkTime,
             uint16 forkDepth,
             bool isCanonical,
@@ -53,7 +53,7 @@ contract MultiverseConstructorTest is MultiverseFixtures {
         ) = newMultiverse.universes(GENESIS_UID);
 
         assertTrue(address(repToken) != address(0));
-        assertEq(uint8(forkState), uint8(Multiverse.ForkState.NotForking));
+        assertEq(uint8(universeState), uint8(Multiverse.UniverseState.Active));
         assertEq(forkTime, uint48(block.timestamp));
         assertEq(forkDepth, 0);
         assertTrue(isCanonical);

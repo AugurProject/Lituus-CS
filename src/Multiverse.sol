@@ -53,15 +53,16 @@ contract Multiverse is ReentrancyGuard {
     IQueryFeeController public immutable QUERY_FEE_CONTROLLER;
 
     /* ================================================== ENUMS ================================================== */
-    enum ForkState {
-        NotForking, // 0 - default; universe is operating normally, not forking
-        AwaitingChildren, // 1 - system frozen, waiting for forkUniverse() to be called
-        Migration, // 2 - forking in progress; REP holders migrate to child universes
-        SupplyRestoration1, // 3 - SR attempt 1
-        SupplyRestoration2, // 4 - SR attempt 2
-        SupplyRestoration3, // 5 - SR attempt 3
-        PostFork, // 6 - fork finalized
-        Forming // 7 - child universe still being formed
+    enum UniverseState {
+        NotExisting, // 0 - universe does not exist yet
+        Active, // 1 - default; universe is operating normally, not forking
+        AwaitingChildren, // 2 - system frozen, waiting for forkUniverse() to be called
+        Migration, // 3 - forking in progress; REP holders migrate to child universes
+        SupplyRestoration1, // 4 - SR attempt 1
+        SupplyRestoration2, // 5 - SR attempt 2
+        SupplyRestoration3, // 6 - SR attempt 3
+        PostFork, // 7 - fork finalized
+        Forming // 8 - child universe still being formed
     }
 
     /* ================================================= STRUCTS ================================================= */
@@ -93,7 +94,7 @@ contract Multiverse is ReentrancyGuard {
 
     struct Universe {
         ILituusRep repToken;
-        ForkState forkState;
+        UniverseState universeState;
         // TODO: populate the forkTime
         uint48 forkTime;
         // The depth of the universe in the fork tree
@@ -191,7 +192,8 @@ contract Multiverse is ReentrancyGuard {
     /**
      * @notice Wires the Zoltar address, seeds the genesis universe, and sets the fee controller.
      * @param _zoltar The Zoltar address.
-     * @param _initialZoltarUniverseId The Zoltar universe id treated as the Lituus genesis.
+     * @param _initialZoltarUniverseId The Zoltar universe id treated as the Lituus genesis. It is also
+     * the genesis universe's id here: Lituus universe ids mirror Zoltar universe ids.
      * @param _queryFeeController The controller owning each universe's monthly base fee.
      */
     constructor(IZoltar _zoltar, uint248 _initialZoltarUniverseId, IQueryFeeController _queryFeeController) {
@@ -210,11 +212,13 @@ contract Multiverse is ReentrancyGuard {
         ILituusRep repToken =
             new LituusRep(address(this), address(initialZoltarRepToken), "Lituus Reputation Token", "REP0");
 
-        Universe storage genesisUniverse = universes[0];
+        // Lituus universe ids mirror Zoltar universe ids (children already use Zoltar's child ids via
+        // getChildUniverseId), so the genesis must be keyed by its Zoltar id.
+        Universe storage genesisUniverse = universes[_initialZoltarUniverseId];
         genesisUniverse.favoriteChild = 0;
         genesisUniverse.parent = 0;
         genesisUniverse.repToken = repToken;
-        genesisUniverse.forkState = ForkState.NotForking;
+        genesisUniverse.universeState = UniverseState.Active;
         genesisUniverse.forkTime = uint48(block.timestamp);
         genesisUniverse.heir = 0;
         // Genesis is the root of the fork tree: an empty inheritance path, and the root of the canonical timeline.
@@ -267,7 +271,13 @@ contract Multiverse is ReentrancyGuard {
      * separately).
      */
     function createQuery(uint248 universeId, string calldata question, uint8 numberOfOutcomes) external nonReentrant {
-        (uint248 activeUniverseId,, ILituusRep repToken) = _getActiveUniverseAndRepToken(universeId);
+        (uint248 activeUniverseId, Universe storage activeUniverse) = _getHeirUniverse(universeId);
+        // Queries can only be created in an operating or still-forming universe; any later state
+        // should already have been forwarded to the heir.
+        UniverseState universeState = activeUniverse.universeState;
+        if ((universeState != UniverseState.Active) && (universeState != UniverseState.Forming)) {
+            revert InvalidUniverseState();
+        }
 
         // Validate the question and number of outcomes
         // Only meaningful outcomes should be included. UNRESOLVED and INVALID are accounted for separately
@@ -291,7 +301,7 @@ contract Multiverse is ReentrancyGuard {
         if (fee >= ZOLTAR.getForkThreshold(activeUniverseId) / 2) revert FeeAboveForkThreshold();
         // Transfer the query fee amount of REP token
         // TODO: permit? permit2?
-        repToken.safeTransferFrom(msg.sender, address(this), fee);
+        activeUniverse.repToken.safeTransferFrom(msg.sender, address(this), fee);
 
         Query storage query = queries[queryCount];
         query.numberOfOutcomes = numberOfOutcomes;
@@ -325,7 +335,13 @@ contract Multiverse is ReentrancyGuard {
      */
     function report(uint248 universeId, uint256 queryId, uint8 outcome) external nonReentrant {
         // Check all conditions (universe exists, query exists, outcome is valid, report is within time, etc.)
-        (uint248 activeUniverseId,, ILituusRep repToken) = _getActiveUniverseAndRepToken(universeId);
+        (uint248 activeUniverseId, Universe storage activeUniverse) = _getHeirUniverse(universeId);
+        // Reports can only be placed in an operating or still-forming universe; any later state
+        // should already have been forwarded to the heir.
+        UniverseState universeState = activeUniverse.universeState;
+        if ((universeState != UniverseState.Active) && (universeState != UniverseState.Forming)) {
+            revert InvalidUniverseState();
+        }
 
         Query storage query = queries[queryId];
         if (query.numberOfOutcomes == 0) revert InvalidQuery();
@@ -363,7 +379,7 @@ contract Multiverse is ReentrancyGuard {
         // then the bond placing is reverted and the query is frozen until the parent universe resolves the fork.
 
         // Transfer the stake
-        repToken.safeTransferFrom(msg.sender, address(this), requiredStakeAmount);
+        activeUniverse.repToken.safeTransferFrom(msg.sender, address(this), requiredStakeAmount);
 
         if (requiredStakeAmount >= forkThreshold) {
             // TODO: fork logic in a separate call
@@ -406,7 +422,13 @@ contract Multiverse is ReentrancyGuard {
      * @param queryId The query to resolve.
      */
     function resolve(uint248 universeId, uint256 queryId) external nonReentrant {
-        (uint248 activeUniverseId, Universe storage activeUniverse,) = _getActiveUniverseAndRepToken(universeId);
+        (uint248 activeUniverseId, Universe storage activeUniverse) = _getHeirUniverse(universeId);
+        // Queries can only be resolved in an operating or still-forming universe; any later state
+        // should already have been forwarded to the heir.
+        UniverseState universeState = activeUniverse.universeState;
+        if ((universeState != UniverseState.Active) && (universeState != UniverseState.Forming)) {
+            revert InvalidUniverseState();
+        }
 
         Query storage query = queries[queryId];
         if (query.numberOfOutcomes == 0) revert InvalidQuery();
@@ -445,7 +467,7 @@ contract Multiverse is ReentrancyGuard {
         }
 
         // TODO: check Zoltar forking state
-        if (activeUniverse.forkState == ForkState.NotForking) {
+        if (activeUniverse.universeState == UniverseState.Active) {
             // Check if Zoltar universe is forking
             if (ZOLTAR.universes(activeUniverseId).forkTime != 0) {
                 // If Zoltar is forking, then we should mirror the fork in this universe.
@@ -464,7 +486,7 @@ contract Multiverse is ReentrancyGuard {
      * @param universeId The universe whose base fee to update.
      */
     function updateBaseFee(uint248 universeId) external {
-        if (universes[universeId].forkState != ForkState.NotForking) revert InvalidUniverseState();
+        if (universes[universeId].universeState != UniverseState.Active) revert InvalidUniverseState();
 
         (uint256 currentProfit, uint256 lastProfit) = _getProfits(universeId);
         QUERY_FEE_CONTROLLER.changeBaseFee(universeId, currentProfit, lastProfit);
@@ -831,7 +853,7 @@ contract Multiverse is ReentrancyGuard {
         // Forward to the heir if this universe has forked, so we read from the active universe where
         // report()/resolve() record resolutions. Reverts only if the universe does not exist; outcomes
         // remain readable while the universe is forking (no fork-state check, unlike report/resolve).
-        (uint248 activeUniverseId,) = _getActiveUniverse(universeId);
+        (uint248 activeUniverseId,) = _getHeirUniverse(universeId);
         if (activeUniverseId != universeId) {
             uint8 heirOutcome = queryResolutions[activeUniverseId][queryId].outcome;
             if (heirOutcome != UNRESOLVED) return heirOutcome;
@@ -869,7 +891,7 @@ contract Multiverse is ReentrancyGuard {
         view
         returns (uint256 requiredStakeAmount, uint256 forkThreshold)
     {
-        (uint248 activeUniverseId,) = _getActiveUniverse(universeId);
+        (uint248 activeUniverseId,) = _getHeirUniverse(universeId);
         return _requiredStakeAmountAndForkThreshold(activeUniverseId, queryId);
     }
 
@@ -917,8 +939,9 @@ contract Multiverse is ReentrancyGuard {
 
     /**
      * @notice Computes the stake required for the report on a query and the universe's fork threshold.
-     * @dev The first report requires the query fee; each subsequent report doubles the previous stake, and
-     *      once that would reach half the fork threshold it is clamped to the full fork threshold.
+     * @dev The next stake is the query fee for the first report and double the previous stake for each
+     *      subsequent report. Either way, once it reaches half the fork threshold it is clamped up to the
+     *      full fork threshold (a fork-level stake).
      * @param universeId The (active) universe the query lives in.
      * @param queryId The query being reported on.
      * @return requiredStakeAmount The stake the reporter must post.
@@ -997,7 +1020,7 @@ contract Multiverse is ReentrancyGuard {
         _spawnChildUniverse(universeId, queryId, outcomeId, 0);
         _spawnChildUniverse(universeId, queryId, outcomeId, 1);
         // TODO: Split the REP token supply in the child universes via Zoltar
-        universe.forkState = ForkState.Migration;
+        universe.universeState = UniverseState.Migration;
         universe.forkQuery = uint128(queryId);
         universe.isLituusFork = true;
         universe.forkOutcome = outcomeId;
@@ -1020,6 +1043,8 @@ contract Multiverse is ReentrancyGuard {
     {
         uint248 childUniverseId = ZOLTAR.getChildUniverseId(universeId, zoltarOutcomeId);
         if (childUniverseId == 0) revert InvalidUniverse();
+        // Never overwrite an existing universe.
+        if (universes[childUniverseId].universeState != UniverseState.NotExisting) revert InvalidUniverse();
 
         Universe storage parentUniverse = universes[universeId];
 
@@ -1030,11 +1055,14 @@ contract Multiverse is ReentrancyGuard {
             new LituusRep(address(this), address(childUniverseZoltarRepToken), "Lituus Reputation Token", "REP0.0");
         Universe storage childUniverse = universes[childUniverseId];
         childUniverse.repToken = childUniverseRepToken;
-        childUniverse.forkState = ForkState.Forming;
+        childUniverse.universeState = UniverseState.Forming;
         childUniverse.forkTime = uint48(block.timestamp);
         childUniverse.parent = universeId;
         childUniverse.favoriteChild = 0;
         childUniverse.heir = 0;
+
+        // TODO: inherit the parent's base fee
+
         // The child extends the parent's inheritance path by the branch it was spawned on.
         (childUniverse.history, childUniverse.forkDepth) =
             LibHistory.appendHistory(parentUniverse.history, parentUniverse.forkDepth, zoltarOutcomeId);
@@ -1058,7 +1086,7 @@ contract Multiverse is ReentrancyGuard {
     /**
      * @notice Mirrors an in-progress Zoltar fork into this Multiverse, spawning the matching child universes.
      * @dev Reentrancy-guarded external wrapper over _mirrorZoltarFork. Reverts unless this universe is
-     *      NotForking and its Zoltar counterpart is actually forking.
+     *      Active and its Zoltar counterpart is actually forking.
      * @param universeId The universe whose Zoltar fork to mirror.
      */
     function mirrorZoltarFork(uint248 universeId) external nonReentrant {
@@ -1070,7 +1098,7 @@ contract Multiverse is ReentrancyGuard {
         // TODO
         // Check if the universe can fork (state of the universe)
         Universe storage universe = universes[universeId];
-        if (universe.forkState != ForkState.NotForking) revert InvalidUniverseState();
+        if (universe.universeState != UniverseState.Active) revert InvalidUniverseState();
         // Check if ZOLTAR universe is forking, revert if it's not forking
         IZoltar.Universe memory zoltarUniverse = ZOLTAR.universes(universeId);
         if (zoltarUniverse.forkTime == 0) revert ZoltarUniverseIsNotForking();
@@ -1099,7 +1127,7 @@ contract Multiverse is ReentrancyGuard {
         _spawnChildUniverse(universeId, queryId, 2, 0);
         _spawnChildUniverse(universeId, queryId, 2, 1);
         // Set outcomes in child universes and update their states to Forming
-        universe.forkState = ForkState.Migration;
+        universe.universeState = UniverseState.Migration;
         universe.forkQuery = uint128(queryId);
         universe.forkOutcome = 2;
     }
@@ -1107,52 +1135,27 @@ contract Multiverse is ReentrancyGuard {
     /* =========================================== INTERNAL HELPERS ============================================== */
     /**
      * @notice Resolves a universe id to the active universe, forwarding to the heir if it has forked.
-     * @dev Reverts with InvalidUniverse only if the universe (or its heir) does not exist (repToken == 0).
-     *      Does NOT check the fork state, so callers that must operate only on an active/forming universe
-     *      (report/resolve) layer that check on top; read-only callers (getOutcome) can use this directly
-     *      to stay readable while a universe is forking.
+     * @dev Reverts with InvalidUniverse only if the universe (or its heir) does not exist
+     *      (universeState == NotExisting). Does NOT check the fork progress, so callers that must operate
+     *      only on an active/forming universe (report/resolve) layer that check on top.
      */
-    function _getActiveUniverse(uint248 universeId)
+    function _getHeirUniverse(uint248 universeId)
         internal
         view
         returns (uint248 activeUniverseId, Universe storage universe)
     {
         universe = universes[universeId];
-        if (address(universe.repToken) == address(0)) revert InvalidUniverse();
+        if (universe.universeState == UniverseState.NotExisting) revert InvalidUniverse();
         // Forward to the heir if this universe has forked.
         // If heir is not 0 and not itself, then the universe has forked.
         uint248 heirId = universe.heir;
         if (heirId != universeId && heirId != 0) {
             universe = universes[heirId];
-            if (address(universe.repToken) == address(0)) revert InvalidUniverse();
+            if (universe.universeState == UniverseState.NotExisting) revert InvalidUniverse();
             activeUniverseId = heirId;
         } else {
             activeUniverseId = universeId;
         }
-    }
-
-    /**
-     * @notice Resolves a universe id to its active universe and REP token, reverting past reportable states.
-     * @dev Forwards through forks via _getActiveUniverse. Reverts unless the resolved universe is NotForking
-     *      or Forming — any later state should already have been forwarded to the heir.
-     * @param universeId The universe id to resolve.
-     * @return activeUniverseId The active universe id.
-     * @return universe The active universe storage reference.
-     * @return repToken The active universe's Lituus REP token.
-     */
-    function _getActiveUniverseAndRepToken(uint248 universeId)
-        internal
-        view
-        returns (uint248 activeUniverseId, Universe storage universe, ILituusRep repToken)
-    {
-        (activeUniverseId, universe) = _getActiveUniverse(universeId);
-        // Sanity check: if the universe is not active or forming,
-        // then the reporting should have been forwarded to the heir.
-        ForkState forkState = universe.forkState;
-        if ((forkState != ForkState.NotForking) && (forkState != ForkState.Forming)) {
-            revert InvalidUniverseState();
-        }
-        repToken = universe.repToken;
     }
 
     /**
