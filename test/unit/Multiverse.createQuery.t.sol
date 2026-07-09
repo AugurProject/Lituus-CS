@@ -23,7 +23,7 @@ contract MultiverseCreateQueryTest is MultiverseFixtures {
         assertEq(fee, DEFAULT_FEE);
         assertEq(question, DEFAULT_QUESTION);
 
-        (uint48 queryCreateTime, uint8 outcome) = multiverse.queryResolutions(GENESIS_UID, queryId);
+        (uint48 queryCreateTime, uint8 outcome,,) = multiverse.queryResolutions(GENESIS_UID, queryId);
         assertEq(queryCreateTime, uint48(block.timestamp));
         assertEq(outcome, multiverse.UNRESOLVED());
 

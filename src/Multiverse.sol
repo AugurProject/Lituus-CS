@@ -88,6 +88,11 @@ contract Multiverse is ReentrancyGuard {
         uint48 queryCreateTime;
         // if this is 0, then UNRESOLVED, otherwise it is RESOLVED.
         uint8 outcome;
+        // Escalation settlement totals, frozen at resolution, so claim() computes each payout in O(1).
+        // totalDistributable is the losers' pool minus the burn cut, computed once at resolution.
+        // REP amounts are bounded by max supply (100M * 1e18), comfortably within uint96.
+        uint96 totalDistributable;
+        uint96 winnerStaked;
         // The stakes for this query.
         Stake[] stakes;
     }
@@ -107,8 +112,8 @@ contract Multiverse is ReentrancyGuard {
         // The child on the canonical timeline. On a fork, one child is designated the favoriteChild and
         // inherits the parent's canonical flag; the other branches stay non-canonical.
         uint248 favoriteChild;
-        // The current active universe for this lineage. On fork finalization every ancestor's heir is
-        // repointed to the final active universe (not just the immediate child), so resolving the active
+        // The current universe for this lineage. On fork finalization every ancestor's heir is
+        // repointed to the final current universe (not just the immediate child), so resolving the current
         // universe is always a single hop with no chain walk.
         uint248 heir;
         // TODO: populate the history
@@ -166,6 +171,17 @@ contract Multiverse is ReentrancyGuard {
         uint256 stakeAmount
     );
     event QueryResolved(address indexed resolver, uint248 indexed universeId, uint256 indexed queryId, uint8 outcome);
+    event StakeClaimed(
+        address indexed reporter,
+        uint248 indexed universeId,
+        uint256 indexed queryId,
+        uint256 stakeIndex,
+        uint256 payout
+    );
+    // Logs a fee-reward outflow paid on its own: the reporter reward on a multi-stake escalation
+    // resolution and the resolver reward on INVALID-by-expiry. A single-stake resolution instead folds
+    // the reward into its StakeClaimed payout (one transfer, one event).
+    event FeeRewardPaid(address indexed recipient, uint248 indexed universeId, uint256 indexed queryId, uint256 amount);
 
     /* ================================================= ERRORS ================================================== */
     error ZeroAddress();
@@ -184,9 +200,15 @@ contract Multiverse is ReentrancyGuard {
     error InvalidZoltarQuestion();
     error QueryTooLong();
     error ZeroFee();
+    error ZeroStakeAmount();
     error FeeAboveForkThreshold();
     error QueryNotInherited();
     error ForkingNotImplemented();
+    error QueryNotResolved();
+    error StakeAlreadyClaimed();
+    error NotAWinningStake();
+    error NotStakeOwner();
+    error InvalidClaimBatch();
 
     /* =============================================== CONSTRUCTOR =============================================== */
     /**
@@ -271,10 +293,10 @@ contract Multiverse is ReentrancyGuard {
      * separately).
      */
     function createQuery(uint248 universeId, string calldata question, uint8 numberOfOutcomes) external nonReentrant {
-        (uint248 activeUniverseId, Universe storage activeUniverse) = _getHeirUniverse(universeId);
+        (uint248 currentUniverseId, Universe storage currentUniverse) = _getCurrentUniverse(universeId);
         // Queries can only be created in an operating or still-forming universe; any later state
         // should already have been forwarded to the heir.
-        UniverseState universeState = activeUniverse.universeState;
+        UniverseState universeState = currentUniverse.universeState;
         if ((universeState != UniverseState.Active) && (universeState != UniverseState.Forming)) {
             revert InvalidUniverseState();
         }
@@ -288,34 +310,34 @@ contract Multiverse is ReentrancyGuard {
         // TODO: Here we need to actually check if question contains the same numberOfOutcomes needed.
 
         // Get the base fee amount from the query fee controller
-        uint256 baseFee = QUERY_FEE_CONTROLLER.getQueryFee(activeUniverseId);
+        uint256 baseFee = QUERY_FEE_CONTROLLER.getQueryFee(currentUniverseId);
         // Create a global query record
 
         // Calculate the fee depending on previous volume and update the volume.
-        uint256 fee = _calculateFeeAndApplyVolume(activeUniverseId, baseFee);
+        uint256 fee = _calculateFeeAndApplyVolume(currentUniverseId, baseFee);
         if (fee == 0) revert ZeroFee();
         // The first report's stake equals the query fee, and any stake that reaches half the fork
         // threshold is clamped up to the full threshold (a fork-level stake) — the same rule
         // _requiredStakeAmountAndForkThreshold applies. A fee at or above half the threshold would
         // therefore make the query's very first report a fork trigger, so reject it here.
-        if (fee >= ZOLTAR.getForkThreshold(activeUniverseId) / 2) revert FeeAboveForkThreshold();
+        if (fee >= ZOLTAR.getForkThreshold(currentUniverseId) / 2) revert FeeAboveForkThreshold();
         // Transfer the query fee amount of REP token
         // TODO: permit? permit2?
-        activeUniverse.repToken.safeTransferFrom(msg.sender, address(this), fee);
+        currentUniverse.repToken.safeTransferFrom(msg.sender, address(this), fee);
 
         Query storage query = queries[queryCount];
         query.numberOfOutcomes = numberOfOutcomes;
-        query.originUniverse = activeUniverseId;
+        query.originUniverse = currentUniverseId;
         query.fee = fee;
         query.question = question;
 
         // A universe-specific resolution record starts with outcome == UNRESOLVED.
         // Set the queryCreateTime so the reporting window can be enforced in this universe.
-        QueryResolution storage resolution = queryResolutions[activeUniverseId][queryCount];
+        QueryResolution storage resolution = queryResolutions[currentUniverseId][queryCount];
         resolution.queryCreateTime = uint48(block.timestamp);
 
         // Emit an event
-        emit QueryCreated(msg.sender, queryCount, activeUniverseId, question, numberOfOutcomes);
+        emit QueryCreated(msg.sender, queryCount, currentUniverseId, question, numberOfOutcomes);
 
         queryCount++;
     }
@@ -335,10 +357,10 @@ contract Multiverse is ReentrancyGuard {
      */
     function report(uint248 universeId, uint256 queryId, uint8 outcome) external nonReentrant {
         // Check all conditions (universe exists, query exists, outcome is valid, report is within time, etc.)
-        (uint248 activeUniverseId, Universe storage activeUniverse) = _getHeirUniverse(universeId);
+        (uint248 currentUniverseId, Universe storage currentUniverse) = _getCurrentUniverse(universeId);
         // Reports can only be placed in an operating or still-forming universe; any later state
         // should already have been forwarded to the heir.
-        UniverseState universeState = activeUniverse.universeState;
+        UniverseState universeState = currentUniverse.universeState;
         if ((universeState != UniverseState.Active) && (universeState != UniverseState.Forming)) {
             revert InvalidUniverseState();
         }
@@ -346,13 +368,13 @@ contract Multiverse is ReentrancyGuard {
         Query storage query = queries[queryId];
         if (query.numberOfOutcomes == 0) revert InvalidQuery();
 
-        QueryResolution storage resolution = queryResolutions[activeUniverseId][queryId];
+        QueryResolution storage resolution = queryResolutions[currentUniverseId][queryId];
         if (resolution.outcome != UNRESOLVED) revert QueryAlreadyResolved();
         uint256 numberOfStakes = resolution.stakes.length;
         // A query resolved in an ancestor universe is inherited by this lineage (via getOutcome), so it
         // cannot be reported on again here. The ancestor set is fixed per lineage, so this only needs to
         // be checked on the first report; later stakes in the same escalation are already covered.
-        if (numberOfStakes == 0 && _findAncestorResolution(activeUniverseId, queryId) != UNRESOLVED) {
+        if (numberOfStakes == 0 && _findAncestorResolution(currentUniverseId, queryId) != UNRESOLVED) {
             revert QueryAlreadyResolved();
         }
 
@@ -360,7 +382,7 @@ contract Multiverse is ReentrancyGuard {
         if (outcome == UNRESOLVED) revert InvalidOutcome();
         if ((outcome > query.numberOfOutcomes) && (outcome != INVALID)) revert InvalidOutcome();
 
-        uint48 queryCreateTime = _getAndUpdateQueryCreateTime(activeUniverseId, queryId);
+        uint48 queryCreateTime = _getAndUpdateQueryCreateTime(currentUniverseId, queryId);
 
         // Check that the reporting window for the query is not over yet
         if (numberOfStakes == 0 && queryCreateTime + THREE_DAYS < block.timestamp) revert QueryExpired();
@@ -373,13 +395,15 @@ contract Multiverse is ReentrancyGuard {
         }
 
         (uint256 requiredStakeAmount, uint256 forkThreshold) =
-            _requiredStakeAmountAndForkThreshold(activeUniverseId, queryId);
+            _requiredStakeAmountAndForkThreshold(currentUniverseId, queryId);
+        // A zero stake would allow free reports and an escalation ladder stuck at 0.
+        if (requiredStakeAmount == 0) revert ZeroStakeAmount();
         // TODO: If the bond before a fork bond is placed so that the next appeal would cause a fork,
         // and its not possible to fork because the parent has still not resolved their fork,
         // then the bond placing is reverted and the query is frozen until the parent universe resolves the fork.
 
         // Transfer the stake
-        activeUniverse.repToken.safeTransferFrom(msg.sender, address(this), requiredStakeAmount);
+        currentUniverse.repToken.safeTransferFrom(msg.sender, address(this), requiredStakeAmount);
 
         if (requiredStakeAmount >= forkThreshold) {
             // TODO: fork logic in a separate call
@@ -406,7 +430,7 @@ contract Multiverse is ReentrancyGuard {
         newStake.amount = requiredStakeAmount;
 
         // Emit an event
-        emit QueryReported(msg.sender, activeUniverseId, queryId, outcome, requiredStakeAmount);
+        emit QueryReported(msg.sender, currentUniverseId, queryId, outcome, requiredStakeAmount);
     }
 
     /**
@@ -422,10 +446,10 @@ contract Multiverse is ReentrancyGuard {
      * @param queryId The query to resolve.
      */
     function resolve(uint248 universeId, uint256 queryId) external nonReentrant {
-        (uint248 activeUniverseId, Universe storage activeUniverse) = _getHeirUniverse(universeId);
+        (uint248 currentUniverseId, Universe storage currentUniverse) = _getCurrentUniverse(universeId);
         // Queries can only be resolved in an operating or still-forming universe; any later state
         // should already have been forwarded to the heir.
-        UniverseState universeState = activeUniverse.universeState;
+        UniverseState universeState = currentUniverse.universeState;
         if ((universeState != UniverseState.Active) && (universeState != UniverseState.Forming)) {
             revert InvalidUniverseState();
         }
@@ -433,30 +457,38 @@ contract Multiverse is ReentrancyGuard {
         Query storage query = queries[queryId];
         if (query.numberOfOutcomes == 0) revert InvalidQuery();
 
-        QueryResolution storage resolution = queryResolutions[activeUniverseId][queryId];
+        QueryResolution storage resolution = queryResolutions[currentUniverseId][queryId];
         if (resolution.outcome != UNRESOLVED) revert QueryAlreadyResolved();
 
-        uint48 queryCreateTime = _getAndUpdateQueryCreateTime(activeUniverseId, queryId);
+        uint48 queryCreateTime = _getAndUpdateQueryCreateTime(currentUniverseId, queryId);
 
         if (resolution.stakes.length == 0 && queryCreateTime + THREE_DAYS < block.timestamp) {
             // No report ever landed here, so the ancestor check was never run by report(): a query
             // resolved in an ancestor is inherited by this lineage (via getOutcome) and must not be
             // resolved again. The stakes branch below is already covered by report()'s first-stake check.
-            if (_findAncestorResolution(activeUniverseId, queryId) != UNRESOLVED) revert QueryAlreadyResolved();
+            if (_findAncestorResolution(currentUniverseId, queryId) != UNRESOLVED) revert QueryAlreadyResolved();
             // If the report period has passed and the query was not reported on then resolve the query as INVALID
             resolution.outcome = INVALID;
-            _recordResolvedUniverse(queryId, activeUniverseId, activeUniverse.isCanonical);
-            emit QueryResolved(msg.sender, activeUniverseId, queryId, INVALID);
-            // TODO: Payout to the resolver, another clock auction
+            _recordResolvedUniverse(queryId, currentUniverseId, currentUniverse.isCanonical);
+
+            // The resolver setting this query to INVALID earns a share of the fee
+            // that ramps from 0 at the reporting deadline to the full fee three days later, then stays
+            // whole with no deadline.
+            uint256 queryFee = queries[queryId].fee;
+            uint256 resolverPay = _timeBasedFeeShare(queryFee, block.timestamp - (queryCreateTime + THREE_DAYS));
+            emit FeeRewardPaid(msg.sender, currentUniverseId, queryId, resolverPay);
+            currentUniverse.repToken.safeTransfer(msg.sender, resolverPay);
+            _applyProfit(currentUniverseId, queryFee - resolverPay);
+
+            emit QueryResolved(msg.sender, currentUniverseId, queryId, INVALID);
         } else if (resolution.stakes.length > 0) {
             if (resolution.stakes[resolution.stakes.length - 1].time + ONE_DAY < block.timestamp) {
                 // If there are stakes and the appeal period has passed then resolve the query with the last outcome
                 // TODO: Unless the query is 1 step from fork threshold, then we should wait for the fork to finish
-                uint8 outcome = _calculateOutcomeAndEscalationPayoffs(activeUniverseId, queryId);
+                uint8 outcome = _calculateOutcomeAndEscalationPayoffs(currentUniverseId, queryId);
                 resolution.outcome = outcome;
-                _recordResolvedUniverse(queryId, activeUniverseId, activeUniverse.isCanonical);
-                emit QueryResolved(msg.sender, activeUniverseId, queryId, outcome);
-                // TODO: Payouts
+                _recordResolvedUniverse(queryId, currentUniverseId, currentUniverse.isCanonical);
+                emit QueryResolved(msg.sender, currentUniverseId, queryId, outcome);
             } else {
                 // Appeal period is not over yet, cannot resolve
                 revert QueryNotReadyToResolve();
@@ -467,13 +499,90 @@ contract Multiverse is ReentrancyGuard {
         }
 
         // TODO: check Zoltar forking state
-        if (activeUniverse.universeState == UniverseState.Active) {
+        if (currentUniverse.universeState == UniverseState.Active) {
             // Check if Zoltar universe is forking
-            if (ZOLTAR.universes(activeUniverseId).forkTime != 0) {
+            if (ZOLTAR.universes(currentUniverseId).forkTime != 0) {
                 // If Zoltar is forking, then we should mirror the fork in this universe.
-                _mirrorZoltarFork(activeUniverseId);
+                _mirrorZoltarFork(currentUniverseId);
             }
         }
+    }
+
+    /**
+     * @notice Claims a winning stake's payout from a resolved query: the stake back plus its pro-rata
+     *         share of the losing stakes (after the burn cut).
+     * @dev Payouts are computed from the totals frozen at resolution, never by looping stakes. A stake's
+     *      amount is zeroed on settlement, so amount == 0 also applies as the claimed flag.
+     * @param universeId The universe the query was resolved in.
+     * @param queryId The resolved query.
+     * @param stakeIndex The index of the stake being claimed.
+     */
+    function claim(uint248 universeId, uint256 queryId, uint256 stakeIndex) external nonReentrant {
+        uint256 payout = _claim(universeId, queryId, stakeIndex);
+
+        universes[universeId].repToken.safeTransfer(msg.sender, payout);
+
+        emit StakeClaimed(msg.sender, universeId, queryId, stakeIndex, payout);
+    }
+
+    /**
+     * @notice Claims multiple winning stakes of the caller across queries of one universe, in a single
+     *         transfer.
+     * @dev Entry i claims stakeIndices[i] on queryIds[i]; the two arrays must align and be non-empty.
+     *      Same guards per stake as claim(). A repeated (queryId, stakeIndex) pair reverts on its second
+     *      occurrence (amount == 0), failing the whole batch.
+     * @param universeId The universe the queries were resolved in.
+     * @param queryIds The resolved queries being claimed from.
+     * @param stakeIndices The indices of the caller's stakes in the matching queries.
+     */
+    function claimMultiple(uint248 universeId, uint256[] calldata queryIds, uint256[] calldata stakeIndices)
+        external
+        nonReentrant
+    {
+        uint256 length = queryIds.length;
+        if (length == 0 || length != stakeIndices.length) revert InvalidClaimBatch();
+
+        uint256 totalPayout;
+        for (uint256 i = 0; i < length;) {
+            uint256 payout = _claim(universeId, queryIds[i], stakeIndices[i]);
+            totalPayout += payout;
+
+            emit StakeClaimed(msg.sender, universeId, queryIds[i], stakeIndices[i], payout);
+
+            unchecked {
+                i += 1;
+            }
+        }
+
+        universes[universeId].repToken.safeTransfer(msg.sender, totalPayout);
+    }
+
+    /**
+     * @notice Validates and settles a single stake for the caller, returning its payout.
+     * @dev Only the stake's reporter can claim it. Zeroes the amount (the settled flag) before any
+     *      transfer happens in the callers.
+     * @param universeId The universe the query was resolved in.
+     * @param queryId The resolved query the stake belongs to.
+     * @param stakeIndex The index of the stake being claimed.
+     * @return payout The stake amount plus its pro-rata share of the distributable losing stakes.
+     */
+    function _claim(uint248 universeId, uint256 queryId, uint256 stakeIndex) internal returns (uint256 payout) {
+        QueryResolution storage resolution = queryResolutions[universeId][queryId];
+        if (resolution.outcome == UNRESOLVED) revert QueryNotResolved();
+
+        Stake storage stake = resolution.stakes[stakeIndex];
+        if (stake.reporter != msg.sender) revert NotStakeOwner();
+
+        uint256 amount = stake.amount;
+        if (amount == 0) revert StakeAlreadyClaimed();
+        if (stake.reportedOutcome != resolution.outcome) revert NotAWinningStake();
+
+        // amount == 0 is the settled flag, which should be set before the transfer.
+        stake.amount = 0;
+
+        uint256 winnerStaked = uint256(resolution.winnerStaked);
+        uint256 totalDistributable = uint256(resolution.totalDistributable);
+        payout = amount + amount * totalDistributable / winnerStaked;
     }
 
     /* ========================================== QUERY FEE EXTERNALS ============================================ */
@@ -510,7 +619,7 @@ contract Multiverse is ReentrancyGuard {
      *      rolled forward once per new window (completed real window in, real window now older than 60 days
      *      out; a gap >= 20 recomputes it from real storage). The query is counted only AFTER its fee is
      *      computed, so it never prices itself.
-     * @param universeId The active universe the query is created in.
+     * @param universeId The current universe the query is created in.
      * @param baseFee The monthly base fee from the controller, before the demand modifier.
      * @return fee The final query fee.
      */
@@ -702,7 +811,8 @@ contract Multiverse is ReentrancyGuard {
      *      the Lituus wrap/unwrap path (TODO).
      *
      *      Winner stake refunds and their proportional share of the remaining 80% of losing stakes
-     *      are NOT settled here — those are claimed separately at withdrawal time.
+     *      are NOT settled here — those are claimed separately through claim() (except the case of
+     *      a single stake, which is settled here in one transfer).
      * @param universeId The id of the universe the query is being resolved in.
      * @param queryId The id of the query being resolved.
      * @return winnerOutcome The winning outcome of the resolved query.
@@ -722,16 +832,33 @@ contract Multiverse is ReentrancyGuard {
         uint48 queryCreateTime = queryResolutions[universeId][queryId].queryCreateTime;
 
         uint256 totalLoserStakes = totalStaked - winnerOutcomeStaked;
-        uint256 reporterPay = queryFee * uint256(reportingTimestamp - queryCreateTime) / THREE_DAYS;
-        // Here because the report for the winner query can come after escalation starts, sometimes it might extend over
-        // 3 days, so we should make it equal to queryFee in that case
-        if (reporterPay > queryFee) reporterPay = queryFee;
+        // Ramps to the full fee over the reporting window; a first correct report after day 3 earns it whole.
+        uint256 reporterPay = _timeBasedFeeShare(queryFee, reportingTimestamp - queryCreateTime);
 
-        uint256 profit = totalLoserStakes / BURN_DIVIDER + (queryFee - reporterPay);
+        uint256 loserBurn = totalLoserStakes / BURN_DIVIDER;
+        uint256 profit = loserBurn + (queryFee - reporterPay);
 
         ILituusRep repToken = universes[universeId].repToken;
-        // TODO-Check if makes sense to also calculate reporterStake and losing side.
-        repToken.safeTransfer(reporter, reporterPay);
+
+        QueryResolution storage resolution = queryResolutions[universeId][queryId];
+        // Store the escalation totals so claim() can compute each winner's payout without looping again.
+        resolution.totalDistributable = uint96(totalLoserStakes - loserBurn);
+        resolution.winnerStaked = uint96(winnerOutcomeStaked);
+
+        // Consecutive reports must differ, so no-losers <=> exactly one stake: settle the sole winner
+        // here in one transfer and one event (bond refund + reporter reward) instead of requiring a
+        // claim() call.
+        if (resolution.stakes.length == 1) {
+            resolution.stakes[0].amount = 0; // amount == 0 marks the stake settled
+            uint256 totalPayout = reporterPay + totalStaked;
+            emit StakeClaimed(reporter, universeId, queryId, 0, totalPayout);
+            repToken.safeTransfer(reporter, totalPayout);
+        }
+        // In the case of more than one stakes, then even the reporter that gets paid, needs to claim.
+        else {
+            emit FeeRewardPaid(reporter, universeId, queryId, reporterPay);
+            repToken.safeTransfer(reporter, reporterPay);
+        }
         // TODO-CHECK IF LITUUS HERE OR UNWRAP AND BURN REP.
         //        repToken.burn(profit);
 
@@ -757,6 +884,18 @@ contract Multiverse is ReentrancyGuard {
         ThreeDayInfo storage threeDayInfo = universeStatistics[universeId].threeDayInfo[current3DayWindow];
 
         threeDayInfo.threeDayProfit += uint128(profit);
+    }
+
+    /**
+     * @notice Time-proportional share of a query fee: ramps linearly over THREE_DAYS, then caps at the
+     *         full fee with no deadline.
+     * @dev Works both for the query fee after reporting and when no reporting exists (INVALID on resolve).
+     * @param fee The query fee the share is drawn from.
+     * @param elapsed Seconds since the ramp's origin.
+     * @return The earned share.
+     */
+    function _timeBasedFeeShare(uint256 fee, uint256 elapsed) internal pure returns (uint256) {
+        return elapsed >= THREE_DAYS ? fee : fee * elapsed / THREE_DAYS;
     }
 
     /**
@@ -850,17 +989,17 @@ contract Multiverse is ReentrancyGuard {
         uint8 localOutcome = queryResolutions[universeId][queryId].outcome;
         if (localOutcome != UNRESOLVED) return localOutcome;
 
-        // Forward to the heir if this universe has forked, so we read from the active universe where
+        // Forward to the heir if this universe has forked, so we read from the current universe where
         // report()/resolve() record resolutions. Reverts only if the universe does not exist; outcomes
         // remain readable while the universe is forking (no fork-state check, unlike report/resolve).
-        (uint248 activeUniverseId,) = _getHeirUniverse(universeId);
-        if (activeUniverseId != universeId) {
-            uint8 heirOutcome = queryResolutions[activeUniverseId][queryId].outcome;
+        (uint248 currentUniverseId,) = _getCurrentUniverse(universeId);
+        if (currentUniverseId != universeId) {
+            uint8 heirOutcome = queryResolutions[currentUniverseId][queryId].outcome;
             if (heirOutcome != UNRESOLVED) return heirOutcome;
         }
 
         // Otherwise inherit the resolution from an ancestor universe, if any.
-        return _findAncestorResolution(activeUniverseId, queryId);
+        return _findAncestorResolution(currentUniverseId, queryId);
     }
 
     /**
@@ -891,8 +1030,8 @@ contract Multiverse is ReentrancyGuard {
         view
         returns (uint256 requiredStakeAmount, uint256 forkThreshold)
     {
-        (uint248 activeUniverseId,) = _getHeirUniverse(universeId);
-        return _requiredStakeAmountAndForkThreshold(activeUniverseId, queryId);
+        (uint248 currentUniverseId,) = _getCurrentUniverse(universeId);
+        return _requiredStakeAmountAndForkThreshold(currentUniverseId, queryId);
     }
 
     /* ========================================= HISTORY FUNCTIONS =========================================== */
@@ -942,7 +1081,7 @@ contract Multiverse is ReentrancyGuard {
      * @dev The next stake is the query fee for the first report and double the previous stake for each
      *      subsequent report. Either way, once it reaches half the fork threshold it is clamped up to the
      *      full fork threshold (a fork-level stake).
-     * @param universeId The (active) universe the query lives in.
+     * @param universeId The (current) universe the query lives in.
      * @param queryId The query being reported on.
      * @return requiredStakeAmount The stake the reporter must post.
      * @return forkThreshold The stake level at which posting triggers a fork.
@@ -1134,27 +1273,27 @@ contract Multiverse is ReentrancyGuard {
 
     /* =========================================== INTERNAL HELPERS ============================================== */
     /**
-     * @notice Resolves a universe id to the active universe, forwarding to the heir if it has forked.
+     * @notice Resolves a universe id to the current universe, forwarding to the heir if it has forked.
      * @dev Reverts with InvalidUniverse only if the universe (or its heir) does not exist
      *      (universeState == NotExisting). Does NOT check the fork progress, so callers that must operate
      *      only on an active/forming universe (report/resolve) layer that check on top.
      */
-    function _getHeirUniverse(uint248 universeId)
+    function _getCurrentUniverse(uint248 universeId)
         internal
         view
-        returns (uint248 activeUniverseId, Universe storage universe)
+        returns (uint248 currentUniverseId, Universe storage currentUniverse)
     {
-        universe = universes[universeId];
-        if (universe.universeState == UniverseState.NotExisting) revert InvalidUniverse();
+        currentUniverse = universes[universeId];
+        if (currentUniverse.universeState == UniverseState.NotExisting) revert InvalidUniverse();
         // Forward to the heir if this universe has forked.
         // If heir is not 0 and not itself, then the universe has forked.
-        uint248 heirId = universe.heir;
+        uint248 heirId = currentUniverse.heir;
         if (heirId != universeId && heirId != 0) {
-            universe = universes[heirId];
-            if (universe.universeState == UniverseState.NotExisting) revert InvalidUniverse();
-            activeUniverseId = heirId;
+            currentUniverse = universes[heirId];
+            if (currentUniverse.universeState == UniverseState.NotExisting) revert InvalidUniverse();
+            currentUniverseId = heirId;
         } else {
-            activeUniverseId = universeId;
+            currentUniverseId = universeId;
         }
     }
 
