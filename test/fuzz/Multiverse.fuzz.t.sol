@@ -78,7 +78,10 @@ contract MultiverseFuzzTest is Test {
 
     /// @dev Property: the exact fee reported by the controller is charged and stored.
     function testFuzz_CreateQuery_VaryingFee(uint256 fee) public {
-        fee = bound(fee, 1, USER_REP_BALANCE);
+        // Fees at or above half the fork threshold are rejected by createQuery (FeeAboveForkThreshold),
+        // matching the stake clamp in _requiredStakeAmountAndForkThreshold, so the valid range tops
+        // out just below that.
+        fee = bound(fee, 1, zoltar.getForkThreshold(GENESIS_UID) / 2 - 1);
         feeCtl.setFee(fee);
         uint256 userBalanceBefore = genesisRep.balanceOf(user);
 
