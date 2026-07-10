@@ -177,10 +177,14 @@ contract Multiverse is ReentrancyGuard {
         uint256 stakeIndex,
         uint256 payout
     );
-    // Logs a fee-reward outflow paid on its own: the reporter reward on a multi-stake escalation
-    // resolution and the resolver reward on INVALID-by-expiry. A single-stake resolution instead folds
-    // the reward into its StakeClaimed payout (one transfer, one event).
-    event FeeRewardPaid(address indexed recipient, uint248 indexed universeId, uint256 indexed queryId, uint256 amount);
+    // The first correct reporter's share of the query fee, paid when the escalation game resolves.
+    event ReporterRewardPaid(
+        address indexed reporter, uint248 indexed universeId, uint256 indexed queryId, uint256 amount
+    );
+    // The resolver's share of the query fee for resolving an unreported query INVALID after expiry.
+    event ResolverRewardPaid(
+        address indexed resolver, uint248 indexed universeId, uint256 indexed queryId, uint256 amount
+    );
 
     /* ================================================= ERRORS ================================================== */
     error ZeroAddress();
@@ -475,7 +479,7 @@ contract Multiverse is ReentrancyGuard {
             // whole with no deadline.
             uint256 queryFee = queries[queryId].fee;
             uint256 resolverPay = _timeBasedFeeShare(queryFee, block.timestamp - (queryCreateTime + THREE_DAYS));
-            emit FeeRewardPaid(msg.sender, currentUniverseId, queryId, resolverPay);
+            emit ResolverRewardPaid(msg.sender, currentUniverseId, queryId, resolverPay);
             currentUniverse.repToken.safeTransfer(msg.sender, resolverPay);
             _applyProfit(currentUniverseId, queryFee - resolverPay);
 
@@ -844,18 +848,17 @@ contract Multiverse is ReentrancyGuard {
         resolution.totalDistributable = uint96(totalLoserStakes - loserBurn);
         resolution.winnerStaked = uint96(winnerOutcomeStaked);
 
+        emit ReporterRewardPaid(reporter, universeId, queryId, reporterPay);
         // Consecutive reports must differ, so no-losers <=> exactly one stake: settle the sole winner
-        // here in one transfer and one event (bond refund + reporter reward) instead of requiring a
-        // claim() call.
+        // here in one transfer (bond refund + reporter reward) instead of requiring a claim() call.
+        // The two events stay separate so StakeClaimed payouts don't include a fee reward.
         if (resolution.stakes.length == 1) {
             resolution.stakes[0].amount = 0; // amount == 0 marks the stake settled
-            uint256 totalPayout = reporterPay + totalStaked;
-            emit StakeClaimed(reporter, universeId, queryId, 0, totalPayout);
-            repToken.safeTransfer(reporter, totalPayout);
+            emit StakeClaimed(reporter, universeId, queryId, 0, totalStaked);
+            repToken.safeTransfer(reporter, reporterPay + totalStaked);
         }
         // In the case of more than one stakes, then even the reporter that gets paid, needs to claim.
         else {
-            emit FeeRewardPaid(reporter, universeId, queryId, reporterPay);
             repToken.safeTransfer(reporter, reporterPay);
         }
         // TODO-CHECK IF LITUUS HERE OR UNWRAP AND BURN REP.
