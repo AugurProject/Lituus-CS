@@ -55,10 +55,15 @@ contract QueryFeeController is IQueryFeeController {
     }
 
     /* ============================================ CONSTRUCTOR/SETTER =========================================== */
-    constructor() {
+    /**
+     * @notice Seeds the genesis universe's fee state.
+     * @param genesisUniverseId The genesis universe id — the Zoltar universe id the Multiverse is
+     * deployed with, since Lituus universe ids mirror Zoltar universe ids.
+     */
+    constructor(uint248 genesisUniverseId) {
         DEPLOYER = msg.sender;
 
-        FeeState storage feeState = feeStates[0];
+        FeeState storage feeState = feeStates[genesisUniverseId];
         feeState.baseFee = uint128(INITIAL_BASE_FEE);
         feeState.timeFeeLastChanged = uint48(block.timestamp);
     }

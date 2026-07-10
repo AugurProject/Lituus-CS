@@ -32,11 +32,11 @@ contract MockZoltar is IZoltar {
     }
 
     /// @notice Stubbed implementation of `IZoltar.universes`.
-    /// @dev `forkTime` is `block.timestamp` for the genesis universe (id 0) and `0`
-    ///      for any other universe. The remaining fields are zero / the shared REP
-    ///      token. Lets tests instantiate the mock against the full interface.
-    function universes(uint248 universeId) external view returns (Universe memory u) {
-        u.forkTime = universeId == 0 ? block.timestamp : 0;
+    /// @dev `forkTime` is always `0` (not forking), so resolution tests don't trigger fork
+    ///      mirroring. The remaining fields are zero / the shared REP token. Lets tests
+    ///      instantiate the mock against the full interface.
+    function universes(uint248) external view returns (Universe memory u) {
+        u.forkTime = 0;
         u.forkQuestionId = 0;
         u.forkingOutcomeIndex = 0;
         u.reputationToken = repToken;
