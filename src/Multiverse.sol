@@ -56,13 +56,12 @@ contract Multiverse is ReentrancyGuard {
     enum UniverseState {
         NotExisting, // 0 - universe does not exist yet
         Active, // 1 - default; universe is operating normally, not forking
-        AwaitingChildren, // 2 - system frozen, waiting for forkUniverse() to be called
-        Migration, // 3 - forking in progress; REP holders migrate to child universes
-        SupplyRestoration1, // 4 - SR attempt 1
-        SupplyRestoration2, // 5 - SR attempt 2
-        SupplyRestoration3, // 6 - SR attempt 3
-        PostFork, // 7 - fork finalized
-        Forming // 8 - child universe still being formed
+        Migration, // 2 - forking in progress; REP holders migrate to child universes
+        SupplyRestoration1, // 3 - SR attempt 1
+        SupplyRestoration2, // 4 - SR attempt 2
+        SupplyRestoration3, // 5 - SR attempt 3
+        PostFork, // 6 - fork finalized
+        Forming // 7 - child universe still being formed
     }
 
     /* ================================================= STRUCTS ================================================= */
