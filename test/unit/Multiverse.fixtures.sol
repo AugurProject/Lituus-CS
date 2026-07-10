@@ -68,7 +68,15 @@ abstract contract MultiverseFixtures is Test {
     /// @return queryId The id of the created query.
     function _createDefaultQuery() internal returns (uint256 queryId) {
         queryId = multiverse.queryCount();
+        uint256 userBalanceBefore = genesisRep.balanceOf(user);
+        uint256 multiverseBalanceBefore = genesisRep.balanceOf(address(multiverse));
+        uint256 queryCountBefore = multiverse.queryCount();
+
         vm.prank(user);
         multiverse.createQuery(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
+
+        assertEq(multiverse.queryCount(), queryCountBefore + 1);
+        assertGt(genesisRep.balanceOf(address(multiverse)), multiverseBalanceBefore);
+        assertLt(genesisRep.balanceOf(user), userBalanceBefore);
     }
 }
