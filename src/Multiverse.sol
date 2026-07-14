@@ -1006,22 +1006,24 @@ contract Multiverse is ReentrancyGuard {
 
     /**
      * @notice Returns the stakes placed on a query in a universe.
-     * @dev Reads the raw per-universe record and does NOT forward to the heir — pass the universe the
-     *      stakes were placed in. The escalation chain is short (stakes double towards the fork
-     *      threshold), so returning the full array is safe.
+     * @dev Rejects a nonexistent query; an existing query with no stakes in the given universe
+     *      returns an empty array. Reads the raw per-universe record and does NOT forward to the
+     *      heir — pass the universe the stakes were placed in. The escalation chain is short
+     *      (stakes double towards the fork threshold), so returning the full array is safe.
      * @param universeId The universe whose resolution record to read.
      * @param queryId The query whose stakes to read.
      * @return The stakes placed on the query in that universe, in reporting order.
      */
     function getStakes(uint248 universeId, uint256 queryId) external view returns (Stake[] memory) {
+        if (queries[queryId].numberOfOutcomes == 0) revert InvalidQuery();
         return queryResolutions[universeId][queryId].stakes;
     }
 
     /**
      * @notice Returns the stake the next report on a query must post, and the universe's fork threshold.
-     * @dev Forwards to the heir exactly like report() does, so `requiredStakeAmount` is the amount
-     *      report() would pull from the caller. A required stake at or above `forkThreshold` means the
-     *      next report triggers the fork path.
+     * @dev Rejects a nonexistent query or universe. Forwards to the heir exactly like report()
+     *      does, so `requiredStakeAmount` is the amount report() would pull from the caller. A
+     *      required stake at or above `forkThreshold` means the next report triggers the fork path.
      * @param universeId The universe to report in (forwarded to the heir if it has forked).
      * @param queryId The query to report on.
      * @return requiredStakeAmount The stake the next reporter must post.
@@ -1032,6 +1034,7 @@ contract Multiverse is ReentrancyGuard {
         view
         returns (uint256 requiredStakeAmount, uint256 forkThreshold)
     {
+        if (queries[queryId].numberOfOutcomes == 0) revert InvalidQuery();
         (uint248 currentUniverseId,) = _getCurrentUniverse(universeId);
         return _requiredStakeAmountAndForkThreshold(currentUniverseId, queryId);
     }
