@@ -115,6 +115,48 @@ abstract contract MultiverseFixtures is Test {
         _report(user, queryId, outcome);
     }
 
+    /// @dev Warps to one second past the query's 3-day reporting window — the earliest moment an
+    ///      unreported query becomes resolvable (as INVALID).
+    function _warpPastReportingWindow(uint256 queryId) internal {
+        (uint48 queryCreateTime,,,) = multiverse.queryResolutions(GENESIS_UID, queryId);
+        vm.warp(uint256(queryCreateTime) + multiverse.THREE_DAYS() + 1);
+    }
+
+    /// @dev Warps to one second past the last stake's 1-day appeal window — the earliest moment a
+    ///      reported query becomes resolvable.
+    function _warpPastAppealWindow(uint256 queryId) internal {
+        Multiverse.Stake[] memory stakes = multiverse.getStakes(GENESIS_UID, queryId);
+        vm.warp(uint256(stakes[stakes.length - 1].time) + multiverse.ONE_DAY() + 1);
+    }
+
+    /// @dev Expired query fixture: `user` creates a default query that is never reported, then time
+    ///      passes the reporting window, so it is resolvable as INVALID.
+    /// @return queryId The id of the created and expired query.
+    function _createExpiredQuery() internal returns (uint256 queryId) {
+        queryId = _createDefaultQuery();
+        _warpPastReportingWindow(queryId);
+    }
+
+    /// @dev Resolvable reported query fixture: `user` creates a default query, places the first
+    ///      report on it, and time passes the appeal window, so it is resolvable to `outcome`.
+    /// @return queryId The id of the created, reported, and resolvable query.
+    function _createResolvableReportedQuery(uint8 outcome) internal returns (uint256 queryId) {
+        queryId = _createReportedQuery(outcome);
+        _warpPastAppealWindow(queryId);
+    }
+
+    /// @dev Resolve fixture: `resolver` resolves `queryId` in the genesis universe, asserting the
+    ///      resolution record left UNRESOLVED and that getOutcome agrees with it.
+    /// @return outcome The outcome the query resolved to.
+    function _resolve(address resolver, uint256 queryId) internal returns (uint8 outcome) {
+        vm.prank(resolver);
+        multiverse.resolve(GENESIS_UID, queryId);
+
+        (, outcome,,) = multiverse.queryResolutions(GENESIS_UID, queryId);
+        assertTrue(outcome != multiverse.UNRESOLVED());
+        assertEq(multiverse.getOutcome(GENESIS_UID, queryId), outcome);
+    }
+
     /// @dev Escalation ladder fixture: each reporter in turn reports their outcome on `queryId`,
     ///      12 hours after the previous step — within the first-report window and every appeal window.
     ///      Tracks time in a local variable: with via-ir the optimizer may cache `block.timestamp`
