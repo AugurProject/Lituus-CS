@@ -163,6 +163,12 @@ contract MultiverseCreateQueryTest is MultiverseFixtures {
         multiverse.createQuery(GENESIS_UID, string(tooLong), 3);
     }
 
+    function test_RevertWhen_MaxOutcomesExceeded() public {
+        vm.prank(user);
+        vm.expectRevert(Multiverse.InvalidNumberOfOutcomes.selector);
+        multiverse.createQuery(GENESIS_UID, "q", 255);
+    }
+
     function test_RevertWhen_ZeroFee() public {
         feeCtl.setFee(0);
         vm.prank(user);
