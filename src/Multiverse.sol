@@ -204,7 +204,6 @@ contract Multiverse is ReentrancyGuard {
     error QueryTooLong();
     error ZeroFee();
     error ZeroStakeAmount();
-    error FeeAboveForkThreshold();
     error QueryNotInherited();
     error ForkingNotImplemented();
     error QueryNotResolved();
@@ -287,9 +286,11 @@ contract Multiverse is ReentrancyGuard {
      * @notice Creates a query in a universe, charging the dynamic fee and recording it as demand volume.
      * @dev Fee = controller base fee times the short-term demand modifier (see _calculateFeeAndApplyVolume).
      *      The query is counted in the current 3-day volume bucket only after its own fee is computed.
-     *      The fee must be nonzero and below half the universe's fork threshold — the fee doubles as the
-     *      first report's stake, and any stake reaching half the threshold is clamped up to the full
-     *      threshold, so a higher fee would trigger the fork on the first report.
+     *      The fee must be nonzero and is capped at half the universe's fork threshold — the fee doubles
+     *      as the first report's stake, and any stake exceeding half the threshold is clamped up to the
+     *      full threshold (a fork-level stake), so an uncapped fee above half would make the very first
+     *      report the fork trigger. At the cap, the first report is an ordinary stake and the fork level
+     *      can only be reached by escalating (the second report).
      * @param universeId The universe to create the query in (forwarded to the heir if it has forked).
      * @param question The question text alongside the possible answers (to be checked).
      * @param numberOfOutcomes The number of reportable outcomes (UNRESOLVED and INVALID are always available
@@ -319,11 +320,12 @@ contract Multiverse is ReentrancyGuard {
         // Calculate the fee depending on previous volume and update the volume.
         uint256 fee = _calculateFeeAndApplyVolume(currentUniverseId, baseFee);
         if (fee == 0) revert ZeroFee();
-        // The first report's stake equals the query fee, and any stake that reaches half the fork
+        // The first report's stake equals the query fee, and any stake that exceeds half the fork
         // threshold is clamped up to the full threshold (a fork-level stake) — the same rule
-        // _requiredStakeAmountAndForkThreshold applies. A fee at or above half the threshold would
-        // therefore make the query's very first report a fork trigger, so reject it here.
-        if (fee >= ZOLTAR.getForkThreshold(currentUniverseId) / 2) revert FeeAboveForkThreshold();
+        // _requiredStakeAmountAndForkThreshold applies. Capping the fee at exactly half keeps the
+        // first report an ordinary stake; the fork level can then only be reached by escalating.
+        uint256 forkThreshold = ZOLTAR.getForkThreshold(currentUniverseId) / 2;
+        if (fee >= forkThreshold) fee = forkThreshold;
         // Transfer the query fee amount of REP token
         // TODO: permit? permit2?
         currentUniverse.repToken.safeTransferFrom(msg.sender, address(this), fee);
@@ -1084,8 +1086,9 @@ contract Multiverse is ReentrancyGuard {
     /**
      * @notice Computes the stake required for the report on a query and the universe's fork threshold.
      * @dev The next stake is the query fee for the first report and double the previous stake for each
-     *      subsequent report. Either way, once it reaches half the fork threshold it is clamped up to the
-     *      full fork threshold (a fork-level stake).
+     *      subsequent report. Either way, once it exceeds half the fork threshold it is clamped up to the
+     *      full fork threshold (a fork-level stake); a stake of exactly half is left untouched — its own
+     *      doubling lands exactly on the threshold.
      * @param universeId The (current) universe the query lives in.
      * @param queryId The query being reported on.
      * @return requiredStakeAmount The stake the reporter must post.
@@ -1110,9 +1113,9 @@ contract Multiverse is ReentrancyGuard {
             nextStakeAmount = lastStakeAmount * 2;
         }
 
-        // Once the next stake reaches half the fork threshold, clamp it to the full threshold so the
+        // Once the next stake exceeds half the fork threshold, clamp it to the full threshold so the
         // escalation ends exactly at the fork level instead of overshooting it on the next doubling.
-        bool reachesForkLevel = nextStakeAmount >= forkThreshold / 2;
+        bool reachesForkLevel = nextStakeAmount > forkThreshold / 2;
         requiredStakeAmount = reachesForkLevel ? forkThreshold : nextStakeAmount;
     }
 
