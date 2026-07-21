@@ -27,6 +27,10 @@ abstract contract MultiverseFuzzFixtures is Test {
     ILituusRep internal genesisRep;
 
     address internal user = makeAddr("user");
+    address internal reporter = makeAddr("reporter");
+    // The resolver is deliberately never funded: resolving costs nothing, so its balance isolates
+    // exactly what resolve() pays the caller.
+    address internal resolver = makeAddr("resolver");
 
     function setUp() public virtual {
         underlying = new MockERC20("Underlying", "U");
@@ -38,10 +42,16 @@ abstract contract MultiverseFuzzFixtures is Test {
         (ILituusRep repToken,,,,,,,,,,,,,) = multiverse.universes(GENESIS_UID);
         genesisRep = repToken;
 
-        underlying.mint(user, USER_REP_BALANCE);
-        vm.startPrank(user);
+        _fundWithRep(user, USER_REP_BALANCE);
+        _fundWithRep(reporter, USER_REP_BALANCE);
+    }
+
+    /// @dev Mint underlying, wrap into REP, approve from the account to the multiverse.
+    function _fundWithRep(address account, uint256 amount) internal {
+        underlying.mint(account, amount);
+        vm.startPrank(account);
         underlying.approve(address(genesisRep), type(uint256).max);
-        multiverse.wrap(GENESIS_UID, USER_REP_BALANCE);
+        multiverse.wrap(GENESIS_UID, amount);
         genesisRep.approve(address(multiverse), type(uint256).max);
         vm.stopPrank();
     }
