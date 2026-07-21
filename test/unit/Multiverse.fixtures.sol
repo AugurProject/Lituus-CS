@@ -6,16 +6,19 @@ import { Test } from "forge-std/Test.sol";
 import { Multiverse } from "src/Multiverse.sol";
 import { ILituusRep } from "src/interfaces/ILituusRep.sol";
 import { IReputationToken } from "src/interfaces/IReputationToken.sol";
+import { IQueryFeeController } from "src/interfaces/IQueryFeeController.sol";
 import { MockERC20 } from "src/mock/MockERC20.sol";
 import { MockZoltar } from "src/mock/MockZoltar.sol";
 import { MockZoltarQuestionData } from "src/mock/MockZoltarQuestionData.sol";
 import { MockQueryFeeController } from "src/mock/MockQueryFeeController.sol";
 
-/// @notice Shared fixtures for the Multiverse unit test suites.
-/// @dev Test files inherit this contract instead of duplicating deployment and funding logic.
-///      Currently provides a basic deploy fixture (`setUp`) and a query creation fixture
-///      (`_createDefaultQuery`); fixtures for other cases will be added as the suites grow.
-abstract contract MultiverseFixtures is Test {
+/// @notice Protocol deployment fixture: mocks + Multiverse wired at START_TIME, no funding.
+/// @dev The bottom fixture layer. It deploys the protocol and nothing else — balances are the
+///      responsibility of the layers (or suites) above, so a suite's economics can never drift
+///      because an unrelated suite changed the shared funding. Suites that need a different fee
+///      controller override `_deployFeeController` (and `_afterProtocolDeploy` for post-wiring)
+///      instead of rewriting the deployment.
+abstract contract MultiverseDeployFixture is Test {
     // Nonzero on purpose: Lituus universe ids mirror Zoltar universe ids, and a nonzero genesis
     // catches any code path that wrongly assumes the genesis universe lives at id 0.
     uint248 internal constant GENESIS_UID = 42;
@@ -32,6 +35,7 @@ abstract contract MultiverseFixtures is Test {
     MockERC20 internal underlying;
     MockZoltarQuestionData internal zoltarQuestionData;
     MockZoltar internal zoltar;
+    // Set by the default _deployFeeController; suites overriding the hook leave it unset.
     MockQueryFeeController internal feeCtl;
     Multiverse internal multiverse;
     ILituusRep internal genesisRep;
@@ -40,26 +44,34 @@ abstract contract MultiverseFixtures is Test {
     address internal bystander = makeAddr("bystander");
     address internal challenger = makeAddr("challenger");
 
-    /// @dev Basic deploy fixture: mocks + Multiverse deployed at START_TIME, actors funded with REP.
+    /// @dev Deploys the protocol at START_TIME. Funds nothing.
     function setUp() public virtual {
         vm.warp(START_TIME);
 
         underlying = new MockERC20("Underlying", "U");
         zoltarQuestionData = new MockZoltarQuestionData();
         zoltar = new MockZoltar(IReputationToken(address(underlying)), zoltarQuestionData);
-        feeCtl = new MockQueryFeeController(DEFAULT_FEE);
-        multiverse = new Multiverse(zoltar, GENESIS_UID, feeCtl);
+        IQueryFeeController controller = _deployFeeController();
+        multiverse = new Multiverse(zoltar, GENESIS_UID, controller);
 
         (ILituusRep repToken,,,,,,,,,,,,,) = multiverse.universes(GENESIS_UID);
         genesisRep = repToken;
 
-        // Fund the actors with REP once, as fixture setup.
-        _fundWithRep(user, USER_REP_BALANCE);
-        _fundWithRep(bystander, USER_REP_BALANCE);
-        _fundWithRep(challenger, USER_REP_BALANCE);
+        _afterProtocolDeploy();
     }
 
-    /// @dev Mint underlying, wrap into REP, approve from the user to the multiverse.
+    /// @dev Fee controller hook: the mock with a settable flat fee by default. Suites that need the
+    ///      production controller override this (deploy order: controller first, then the Multiverse).
+    function _deployFeeController() internal virtual returns (IQueryFeeController) {
+        feeCtl = new MockQueryFeeController(DEFAULT_FEE);
+        return IQueryFeeController(address(feeCtl));
+    }
+
+    /// @dev Post-deploy hook, runs after the Multiverse exists. Empty by default; the production
+    ///      controller suite wires `setMultiverse` here.
+    function _afterProtocolDeploy() internal virtual { }
+
+    /// @dev Funding tool (not invoked here): mint underlying, wrap into REP, approve the multiverse.
     function _fundWithRep(address account, uint256 amount) internal {
         underlying.mint(account, amount);
         vm.startPrank(account);
@@ -67,6 +79,21 @@ abstract contract MultiverseFixtures is Test {
         genesisRep.approve(address(multiverse), type(uint256).max);
         multiverse.wrap(GENESIS_UID, amount);
         vm.stopPrank();
+    }
+}
+
+/// @notice Funded functional fixture: the deploy layer plus the three standard actors funded, and
+///         the behavioral step helpers used by the functional suites.
+/// @dev Amounts here serve the functional suites (createQuery/report/resolve), which only need
+///      actors with enough REP; suites with economic assumptions (stress, spikes) must NOT inherit
+///      this layer — they extend MultiverseDeployFixture and pin their own economy.
+abstract contract MultiverseFixtures is MultiverseDeployFixture {
+    function setUp() public virtual override {
+        super.setUp();
+
+        _fundWithRep(user, USER_REP_BALANCE);
+        _fundWithRep(bystander, USER_REP_BALANCE);
+        _fundWithRep(challenger, USER_REP_BALANCE);
     }
 
     /// @dev Query creation fixture: `user` creates a default query in the genesis universe.

@@ -9,12 +9,12 @@ import { IQueryFeeController } from "src/interfaces/IQueryFeeController.sol";
 import { MockERC20 } from "src/mock/MockERC20.sol";
 import { MockZoltar } from "src/mock/MockZoltar.sol";
 import { MockZoltarQuestionData } from "src/mock/MockZoltarQuestionData.sol";
-import { MultiverseFixtures } from "./Multiverse.fixtures.sol";
+import { MultiverseDeployFixture } from "./Multiverse.fixtures.sol";
 
 /// @notice Shared expected-fee math for the query fee suites.
 /// @dev Mirrors the contract's integer operations (same order, same floors), so expected values are
 ///      derived from scenario parameters instead of being hardcoded.
-abstract contract QueryFeeTestHelpers is MultiverseFixtures {
+abstract contract QueryFeeTestHelpers is MultiverseDeployFixture {
     /// @dev Warps to window `window` with `elapsed` seconds of it gone by.
     function _warpToWindow(uint256 window, uint256 elapsed) internal {
         vm.warp(multiverse.GENESIS_TIMESTAMP() + window * multiverse.THREE_DAYS() + elapsed);
@@ -51,7 +51,8 @@ abstract contract QueryFeeTestHelpers is MultiverseFixtures {
     }
 
     /// @dev Mirror of `_calculateFeeAndApplyVolume`'s local-volume math, both regimes. Volumes are
-    ///      the test-known query counts.
+    ///      the test-known query counts. The mirror predicts the UNCAPPED fee: the half-fork-threshold
+    ///      cap applied by createQuery is asserted directly in the fee-cap tests, never mirrored.
     /// @param baseFee The controller base fee the modifier applies to.
     /// @param windowId The current window id.
     /// @param fractionElapsed Fraction of the current window elapsed, SCALE-scaled.
@@ -88,11 +89,17 @@ abstract contract QueryFeeTestHelpers is MultiverseFixtures {
 }
 
 /// @notice Unit suite for the per-query demand modifier (volume windows, interpolation, bootstrap).
-/// @dev Uses the mock controller from the base fixture.
+
+/// @notice Unit suite for the per-query demand modifier (volume windows, interpolation, bootstrap).
+/// @dev Uses the mock controller from the deploy fixture; only `user` is funded — the modifier
+///      tests have no other actors and no economic assumptions beyond the base fee constant.
 contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
-    /*//////////////////////////////////////////////////////////////
-                        GENESIS / BOOTSTRAP REGIME
-    //////////////////////////////////////////////////////////////*/
+    function setUp() public override {
+        super.setUp();
+
+        _fundWithRep(user, USER_REP_BALANCE);
+    }
+
     function test_QueryFee_FirstQueryAtGenesisIsNeutral() public {
         // At genesis (w = 0, f = 0, zero volume) the bootstrap makes the recent window exactly 1/20
         // of the sixty-day window: ratio 1.0, modifier 1.0, fee = base. This also proves the query
@@ -347,14 +354,93 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
         multiverse.createQuery(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
     }
 
-    function test_QueryFee_RevertsOnFeeAtHalfForkThreshold() public {
-        // At genesis-neutral the modifier is exactly 1.0, so final fee == base fee: a base at half
-        // the fork threshold makes the very first report a fork trigger and must be rejected.
-        feeCtl.setFee(zoltar.getForkThreshold(GENESIS_UID) / 2);
+    /*//////////////////////////////////////////////////////////////
+                    FEE CAP (HALF THE FORK THRESHOLD)
+    //////////////////////////////////////////////////////////////*/
+    function test_QueryFee_ClampsFeeToHalfForkThreshold() public {
+        // Successor of the removed FeeAboveForkThreshold revert test: a base fee ABOVE the cap no
+        // longer blocks creation — the query is created and charged exactly half the fork threshold
+        // (= 1% of supply, imkharn's cap). With this suite's supply (1000e18, threshold supply/20)
+        // the cap is 25e18; the base is set to double that so the clamp is observable, not a no-op.
+        uint256 cap = zoltar.getForkThreshold(GENESIS_UID) / 2;
+        feeCtl.setFee(2 * cap);
+
+        uint256 chargedFee = _chargedFee();
+
+        assertEq(chargedFee, cap);
+        (,, uint256 storedFee,) = multiverse.queries(0);
+        assertEq(storedFee, cap);
+    }
+
+    function test_QueryFee_FeeJustBelowCapIsUntouched() public {
+        // The cap's lower boundary: a base one wei below the cap (genesis-neutral modifier is exactly
+        // 1.0) is charged unchanged — the cap never touches legal fees.
+        uint256 cap = zoltar.getForkThreshold(GENESIS_UID) / 2;
+        feeCtl.setFee(cap - 1);
+
+        uint256 chargedFee = _chargedFee();
+
+        assertEq(chargedFee, cap - 1);
+        (,, uint256 storedFee,) = multiverse.queries(0);
+        assertEq(storedFee, cap - 1);
+    }
+
+    function test_QueryFee_ModifierPushesFeeIntoCap() public {
+        // The cap also catches the DYNAMIC overshoot: a perfectly legal base (cap / 2) crosses the
+        // cap once the demand modifier passes 2.0x. Queries are created while the predicted uncapped
+        // fee is still below the cap; the first query predicted at or over it is created charged
+        // exactly the cap.
+        uint256 cap = zoltar.getForkThreshold(GENESIS_UID) / 2;
+        uint256 base = cap / 2;
+        feeCtl.setFee(base);
+
+        uint256 volume = 0;
+        while (_expectedFee(base, 0, 0, volume, 0, 0, 0) < cap) {
+            _chargedFee();
+            volume++;
+        }
+
+        assertEq(_chargedFee(), cap);
+    }
+
+    function test_QueryFee_CappedQueryStillCountsAsVolume() public {
+        // The cap clamps the price, not the demand signal: a capped query must still enter the
+        // volume bucket. Proven behaviorally — after one capped query, a small base prices strictly
+        // above neutral, matching the mirror with currentVol = 1. If the capped query were not
+        // counted, the second charge would be exactly DEFAULT_FEE.
+        uint256 cap = zoltar.getForkThreshold(GENESIS_UID) / 2;
+        feeCtl.setFee(2 * cap);
+        assertEq(_chargedFee(), cap);
+
+        feeCtl.setFee(DEFAULT_FEE);
+        uint256 chargedFee = _chargedFee();
+
+        assertEq(chargedFee, _expectedFee(DEFAULT_FEE, 0, 0, 1, 0, 0, 0));
+        assertGt(chargedFee, DEFAULT_FEE);
+    }
+
+    function test_QueryFee_CappedFeeQueryIsReportable() public {
+        // Regression pin for the fee-cap boundary (the `>` fix in the stake rule): a query whose
+        // fee was capped to exactly half the fork threshold must accept its first report as an
+        // ORDINARY stake. The required stake equals the capped fee and stays strictly below the
+        // fork threshold; under the pre-fix `>=` stake rule this exact report escalated to the
+        // full threshold and reverted with ForkingNotImplemented, making capped queries dead on
+        // arrival. Lives here rather than the report suite to keep the cap tests self-contained.
+        uint256 cap = zoltar.getForkThreshold(GENESIS_UID) / 2;
+        feeCtl.setFee(2 * cap);
+        assertEq(_chargedFee(), cap);
+
+        (uint256 requiredStakeAmount, uint256 forkThreshold) = multiverse.getNextRequiredStake(GENESIS_UID, 0);
+        assertEq(requiredStakeAmount, cap);
+        assertEq(forkThreshold, zoltar.getForkThreshold(GENESIS_UID));
+        assertLt(requiredStakeAmount, forkThreshold);
 
         vm.prank(user);
-        vm.expectRevert(Multiverse.FeeAboveForkThreshold.selector);
-        multiverse.createQuery(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
+        multiverse.report(GENESIS_UID, 0, OUTCOME_A);
+
+        Multiverse.Stake[] memory stakes = multiverse.getStakes(GENESIS_UID, 0);
+        assertEq(stakes.length, 1);
+        assertEq(stakes[0].amount, cap);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -362,6 +448,24 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
     //////////////////////////////////////////////////////////////*/
     function test_QueryFee_BootProfitDerivedFromControllerInitialFee() public view {
         assertEq(multiverse.BOOT_PROFIT(), 2 * feeCtl.INITIAL_BASE_FEE());
+    }
+
+}
+
+/// @notice Stress suite for the fee algorithm's limits, on a pinned economy.
+/// @dev Extends the deploy fixture directly and defines its own funding, so the numbers below are
+///      immune to changes in the functional fixtures. The economy, spelled out: one payer wraps
+///      STRESS_SUPPLY, so total supply = 2000e18; fork threshold = supply / 20 = 100e18; the
+///      createQuery bound = threshold / 2 = 50e18; the spike base = bound / 2 = 25e18; the demand
+///      spike needs ~22 queries costing ~847e18 in total, plus the capped probes at 50e18 each —
+///      always affordable, since the single payer holds the entire supply.
+contract MultiverseQueryFeeStressTest is QueryFeeTestHelpers {
+    uint256 internal constant STRESS_SUPPLY = 2000 ether;
+
+    function setUp() public override {
+        super.setUp();
+
+        _fundWithRep(user, STRESS_SUPPLY);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -404,25 +508,26 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
         assertEq(_chargedFee(), 1);
     }
 
-    function test_QueryFee_Stress_DemandSpikePushesLegalBaseOverForkBound() public {
-        // A base fee that is perfectly legal at neutral (threshold/4) crosses threshold/2 once the
-        // demand modifier passes 2.0x. Queries are created while the predicted next fee is still
-        // legal; the first query predicted at or over the bound must revert. High demand can
-        // therefore DoS query creation for large bases — the flip side of checking the final fee
-        // against the fork bound.
-        uint256 bound = zoltar.getForkThreshold(GENESIS_UID) / 2;
-        uint256 base = bound / 2;
+    function test_QueryFee_Stress_DemandSpikeSaturatesAtCap() public {
+        // Inversion of the removed DemandSpikePushesLegalBaseOverForkBound revert test, after the
+        // cap replaced the revert: a legal base (cap / 2) pushed over the cap by a demand spike no
+        // longer blocks query creation. The first formerly-forbidden query is created charged
+        // exactly the cap, and the cap stays sticky while the spike volume keeps the uncapped
+        // prediction above it. High demand throttles the price at 1% of supply instead of DoS-ing
+        // the universe.
+        uint256 cap = zoltar.getForkThreshold(GENESIS_UID) / 2;
+        uint256 base = cap / 2;
         feeCtl.setFee(base);
 
         uint256 volume = 0;
-        while (_expectedFee(base, 0, 0, volume, 0, 0, 0) < bound) {
+        while (_expectedFee(base, 0, 0, volume, 0, 0, 0) < cap) {
             _chargedFee();
             volume++;
         }
 
-        vm.prank(user);
-        vm.expectRevert(Multiverse.FeeAboveForkThreshold.selector);
-        multiverse.createQuery(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
+        assertEq(_chargedFee(), cap);
+        assertEq(_chargedFee(), cap);
+        assertEq(_chargedFee(), cap);
     }
 
     function test_QueryFee_Stress_DeepIdleFloorIsBaseOver101() public {
@@ -439,28 +544,25 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
 }
 
 /// @notice Integration suite for updateBaseFee with the real QueryFeeController wired in.
-/// @dev Overrides the fixture deploy to use the production controller (controller first, then the
-///      Multiverse, then setMultiverse) instead of the mock, and drives the monthly hill-climb through
-///      the Multiverse push path.
+/// @dev Uses the deploy fixture's controller hooks: `_deployFeeController` returns the production
+///      controller (deployed before the Multiverse) and `_afterProtocolDeploy` wires setMultiverse.
+///      The monthly hill-climb is then driven through the Multiverse push path.
 contract MultiverseUpdateBaseFeeTest is QueryFeeTestHelpers {
     QueryFeeController internal controller;
 
-    function setUp() public override {
-        vm.warp(START_TIME);
-
-        underlying = new MockERC20("Underlying", "U");
-        zoltarQuestionData = new MockZoltarQuestionData();
-        zoltar = new MockZoltar(IReputationToken(address(underlying)), zoltarQuestionData);
-
+    function _deployFeeController() internal override returns (IQueryFeeController) {
         controller = new QueryFeeController(GENESIS_UID);
-        multiverse = new Multiverse(zoltar, GENESIS_UID, IQueryFeeController(address(controller)));
-        controller.setMultiverse(address(multiverse));
+        return IQueryFeeController(address(controller));
+    }
 
-        (ILituusRep repToken,,,,,,,,,,,,,) = multiverse.universes(GENESIS_UID);
-        genesisRep = repToken;
+    function _afterProtocolDeploy() internal override {
+        controller.setMultiverse(address(multiverse));
+    }
+
+    function setUp() public override {
+        super.setUp();
 
         _fundWithRep(user, USER_REP_BALANCE);
-        _fundWithRep(bystander, USER_REP_BALANCE);
     }
 
     /*//////////////////////////////////////////////////////////////

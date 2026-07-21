@@ -176,25 +176,6 @@ contract MultiverseCreateQueryTest is MultiverseFixtures {
         multiverse.createQuery(GENESIS_UID, "free", 3);
     }
 
-    function test_RevertWhen_FeeAboveForkThreshold() public {
-        // A fee at half the fork threshold would make the first report's stake a fork trigger,
-        // so createQuery rejects it. Exactly at the boundary (fee == threshold / 2) must revert.
-        // The charged fee equals the base fee (halfThreshold).
-        uint256 halfThreshold = zoltar.getForkThreshold(GENESIS_UID) / 2;
-
-        feeCtl.setFee(halfThreshold);
-        vm.prank(user);
-        vm.expectRevert(Multiverse.FeeAboveForkThreshold.selector);
-        multiverse.createQuery(GENESIS_UID, "q", 3);
-
-        // One wei below the boundary is the highest fee that must be accepted.
-        feeCtl.setFee(halfThreshold - 1);
-        vm.prank(user);
-        multiverse.createQuery(GENESIS_UID, "q", 3);
-        (,, uint256 fee,) = multiverse.queries(0);
-        assertEq(fee, halfThreshold - 1);
-    }
-
     function test_RevertWhen_InvalidUniverse() public {
         // Universe id 1 was never initialized (repToken == address(0)).
         vm.prank(user);

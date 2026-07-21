@@ -1,46 +1,27 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.35;
 
-import { Test, console } from "forge-std/Test.sol";
+import { console } from "forge-std/Test.sol";
 
 import { Multiverse } from "src/Multiverse.sol";
-import { ILituusRep } from "src/interfaces/ILituusRep.sol";
-import { IReputationToken } from "src/interfaces/IReputationToken.sol";
-import { MockERC20 } from "src/mock/MockERC20.sol";
-import { MockZoltar } from "src/mock/MockZoltar.sol";
-import { MockZoltarQuestionData } from "src/mock/MockZoltarQuestionData.sol";
-import { MockQueryFeeController } from "src/mock/MockQueryFeeController.sol";
+import { MultiverseDeployFixture } from "../unit/Multiverse.fixtures.sol";
 import { MultiverseHandler } from "./handlers/MultiverseHandler.sol";
 
 /// @notice Stateful fuzzing of createQuery and report. Random sequences of handler calls must
 ///         never violate the global invariants below. The handler never resolves, so every
 ///         query must stay UNRESOLVED throughout a run.
-contract MultiverseInvariantTest is Test {
-    // Nonzero on purpose: catches code paths that wrongly assume the genesis universe lives at id 0.
-    uint248 internal constant GENESIS_UID = 42;
-    uint256 internal constant DEFAULT_FEE = 1 ether;
+/// @dev Inherits the deployment from MultiverseDeployFixture; funds the handler (query creator)
+///      and the reporter actors here, since the amounts are invariant-specific.
+contract MultiverseInvariantTest is MultiverseDeployFixture {
     // Large REP balance for the handler and each actor so cumulative fees and doubling stakes
     // never exhaust them during a run.
     uint256 internal constant HANDLER_REP_BALANCE = 1e40;
     uint256 internal constant ACTOR_COUNT = 3;
 
-    MockERC20 internal underlying;
-    MockZoltarQuestionData internal zoltarQuestionData;
-    MockZoltar internal zoltar;
-    MockQueryFeeController internal feeCtl;
-    Multiverse internal multiverse;
-    ILituusRep internal genesisRep;
     MultiverseHandler internal handler;
 
-    function setUp() public {
-        underlying = new MockERC20("Underlying", "U");
-        zoltarQuestionData = new MockZoltarQuestionData();
-        zoltar = new MockZoltar(IReputationToken(address(underlying)), zoltarQuestionData);
-        feeCtl = new MockQueryFeeController(DEFAULT_FEE);
-        multiverse = new Multiverse(zoltar, GENESIS_UID, feeCtl);
-
-        (ILituusRep repToken,,,,,,,,,,,,,) = multiverse.universes(GENESIS_UID);
-        genesisRep = repToken;
+    function setUp() public override {
+        super.setUp();
 
         address[] memory actors = new address[](ACTOR_COUNT);
         for (uint256 i = 0; i < ACTOR_COUNT; ++i) {
@@ -51,23 +32,13 @@ contract MultiverseInvariantTest is Test {
 
         // Fund the handler (query creator) and every actor (reporters) with REP and approve the
         // multiverse to pull query fees and stakes.
-        _fundWithRep(address(handler));
+        _fundWithRep(address(handler), HANDLER_REP_BALANCE);
         for (uint256 i = 0; i < ACTOR_COUNT; ++i) {
-            _fundWithRep(actors[i]);
+            _fundWithRep(actors[i], HANDLER_REP_BALANCE);
         }
 
         // Direct the fuzzer at the handler only, keeps inputs bounded.
         targetContract(address(handler));
-    }
-
-    /// @dev Mint underlying, wrap into REP, approve from the account to the multiverse.
-    function _fundWithRep(address account) internal {
-        underlying.mint(account, HANDLER_REP_BALANCE);
-        vm.startPrank(account);
-        underlying.approve(address(genesisRep), type(uint256).max);
-        multiverse.wrap(GENESIS_UID, HANDLER_REP_BALANCE);
-        genesisRep.approve(address(multiverse), type(uint256).max);
-        vm.stopPrank();
     }
 
     /*//////////////////////////////////////////////////////////////
