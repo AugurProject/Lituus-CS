@@ -67,8 +67,8 @@ contract MultiverseProfitsTest is MultiverseDeployFixture {
     function test_GetProfits_CurrentMonthContainsFreshProfit() public {
         // Profit booked in window 37, read at the start of window 40: window 37 sits among the nine
         // completed windows of the current month, so the whole amount is current-month profit. The
-        // read is at currentWindow = 40 with every referenced window (down to currentWindow-20 = 20) past genesis, so no
-        // BOOT_PROFIT term can leak in; the previous month is exactly zero.
+        // read is at currentWindow = 40 with every referenced window (down to currentWindow-20 = 20) past genesis, so
+        // no BOOT_PROFIT term can leak in; the previous month is exactly zero.
         uint256 profit = _seedProfitAt(37, 1 hours);
 
         _warpTo(40, 0);
@@ -120,8 +120,8 @@ contract MultiverseProfitsTest is MultiverseDeployFixture {
     }
 
     function test_GetProfits_OldestWindowKeepsOnlyTail() public {
-        // Profit booked in window 20, read at currentWindow = 40 where it is the oldest window currentWindow-20: only its
-        // (1 - fraction) tail remains in the previous month and it never touches the current month. As fraction
+        // Profit booked in window 20, read at currentWindow = 40 where it is the oldest window currentWindow-20: only
+        // its (1 - fraction) tail remains in the previous month and it never touches the current month. As fraction
         // grows the contribution fades toward zero - leaving the 60-day span is gradual, not a
         // cliff.
         uint256 profit = _seedProfitAt(20, 1 hours);
@@ -178,9 +178,9 @@ contract MultiverseProfitsTest is MultiverseDeployFixture {
     function test_GetProfits_YoungUniverseUsesBootProfit() public {
         // No profit ever booked, read at the start of window 2: every window that predates genesis
         // falls back to BOOT_PROFIT. Hand-derived at fraction = 0, currentWindow = 2: the current month reads windows
-        // 2, 1, 0 as real zeros, windows currentWindow-3..currentWindow-9 as boot (7 terms), and the full boundary tail as
-        // boot (1 term) -> 8 x BOOT_PROFIT. The previous month reads windows currentWindow-11..currentWindow-19 as boot
-        // (9 terms) plus the full oldest tail (1 term) -> 10 x BOOT_PROFIT. This is the seed the
+        // 2, 1, 0 as real zeros, windows currentWindow-3..currentWindow-9 as boot (7 terms), and the full boundary tail
+        // as boot (1 term) -> 8 x BOOT_PROFIT. The previous month reads windows currentWindow-11..currentWindow-19 as
+        // boot (9 terms) plus the full oldest tail (1 term) -> 10 x BOOT_PROFIT. This is the seed the
         // hill-climb's deterministic first-month raise grows from.
         _warpTo(2, 0);
 
