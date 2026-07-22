@@ -28,7 +28,7 @@ contract MultiverseReportFuzzTest is MultiverseFuzzFixtures {
         delay = bound(delay, 0, multiverse.THREE_DAYS());
         uint256 queryId = _createQuery();
 
-        vm.warp(block.timestamp + delay);
+        vm.warp(vm.getBlockTimestamp() + delay);
         vm.prank(user);
         multiverse.report(GENESIS_UID, queryId, 1);
 
@@ -40,7 +40,7 @@ contract MultiverseReportFuzzTest is MultiverseFuzzFixtures {
         delay = bound(delay, multiverse.THREE_DAYS() + 1, 365 days);
         uint256 queryId = _createQuery();
 
-        vm.warp(block.timestamp + delay);
+        vm.warp(vm.getBlockTimestamp() + delay);
         vm.prank(user);
         vm.expectRevert(Multiverse.QueryExpired.selector);
         multiverse.report(GENESIS_UID, queryId, 1);
@@ -74,7 +74,7 @@ contract MultiverseReportFuzzTest is MultiverseFuzzFixtures {
         vm.prank(user);
         multiverse.report(GENESIS_UID, queryId, 1);
 
-        vm.warp(block.timestamp + delay);
+        vm.warp(vm.getBlockTimestamp() + delay);
         vm.prank(user);
         multiverse.report(GENESIS_UID, queryId, 2);
 
@@ -88,7 +88,7 @@ contract MultiverseReportFuzzTest is MultiverseFuzzFixtures {
         vm.prank(user);
         multiverse.report(GENESIS_UID, queryId, 1);
 
-        vm.warp(block.timestamp + delay);
+        vm.warp(vm.getBlockTimestamp() + delay);
         vm.prank(user);
         vm.expectRevert(Multiverse.AppealPeriodOver.selector);
         multiverse.report(GENESIS_UID, queryId, 2);

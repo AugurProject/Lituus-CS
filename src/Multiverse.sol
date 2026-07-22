@@ -211,6 +211,7 @@ contract Multiverse is ReentrancyGuard {
     error NotAWinningStake();
     error NotStakeOwner();
     error InvalidClaimBatch();
+    error InvalidStakeIndex();
 
     /* =============================================== CONSTRUCTOR =============================================== */
     /**
@@ -575,6 +576,7 @@ contract Multiverse is ReentrancyGuard {
         QueryResolution storage resolution = queryResolutions[universeId][queryId];
         if (resolution.outcome == UNRESOLVED) revert QueryNotResolved();
 
+        if (stakeIndex >= resolution.stakes.length) revert InvalidStakeIndex();
         Stake storage stake = resolution.stakes[stakeIndex];
         if (stake.reporter != msg.sender) revert NotStakeOwner();
 

@@ -17,7 +17,7 @@ contract MultiverseResolveFuzzTest is MultiverseFuzzFixtures {
         pastDeadline = bound(pastDeadline, 1, 365 days);
         uint256 queryId = _createQuery();
 
-        vm.warp(block.timestamp + multiverse.THREE_DAYS() + pastDeadline);
+        vm.warp(vm.getBlockTimestamp() + multiverse.THREE_DAYS() + pastDeadline);
         uint256 resolverBalanceBefore = genesisRep.balanceOf(user);
         vm.prank(user);
         multiverse.resolve(GENESIS_UID, queryId);
@@ -37,7 +37,7 @@ contract MultiverseResolveFuzzTest is MultiverseFuzzFixtures {
         delay = bound(delay, 0, multiverse.THREE_DAYS());
         uint256 queryId = _createQuery();
 
-        vm.warp(block.timestamp + delay);
+        vm.warp(vm.getBlockTimestamp() + delay);
         vm.prank(user);
         vm.expectRevert(Multiverse.QueryNotReadyToResolve.selector);
         multiverse.resolve(GENESIS_UID, queryId);
@@ -53,7 +53,7 @@ contract MultiverseResolveFuzzTest is MultiverseFuzzFixtures {
         uint256 queryId = _createQuery();
         (,, uint256 chargedFee,) = multiverse.queries(queryId);
 
-        vm.warp(block.timestamp + multiverse.THREE_DAYS() + pastDeadline);
+        vm.warp(vm.getBlockTimestamp() + multiverse.THREE_DAYS() + pastDeadline);
         uint256 resolverBalanceBefore = genesisRep.balanceOf(user);
         vm.prank(user);
         multiverse.resolve(GENESIS_UID, queryId);
@@ -85,15 +85,11 @@ contract MultiverseResolveFuzzTest is MultiverseFuzzFixtures {
         uint256 reporterBalanceBefore = genesisRep.balanceOf(reporter);
         uint256 queryId = _createQuery();
 
-        // Track time locally: with via-ir the optimizer may cache block.timestamp across vm.warp.
-        uint256 time = block.timestamp;
-        time += reportDelay;
-        vm.warp(time);
+        vm.warp(vm.getBlockTimestamp() + reportDelay);
         vm.prank(reporter);
         multiverse.report(GENESIS_UID, queryId, outcome);
 
-        time += resolveDelay;
-        vm.warp(time);
+        vm.warp(vm.getBlockTimestamp() + resolveDelay);
         vm.prank(resolver);
         multiverse.resolve(GENESIS_UID, queryId);
 
@@ -124,7 +120,7 @@ contract MultiverseResolveFuzzTest is MultiverseFuzzFixtures {
         vm.prank(user);
         multiverse.report(GENESIS_UID, queryId, 1);
 
-        vm.warp(block.timestamp + delay);
+        vm.warp(vm.getBlockTimestamp() + delay);
         vm.prank(user);
         vm.expectRevert(Multiverse.QueryNotReadyToResolve.selector);
         multiverse.resolve(GENESIS_UID, queryId);
@@ -142,14 +138,11 @@ contract MultiverseResolveFuzzTest is MultiverseFuzzFixtures {
         uint256 queryId = _createQuery();
         (,, uint256 chargedFee,) = multiverse.queries(queryId);
 
-        uint256 time = block.timestamp;
-        time += reportDelay;
-        vm.warp(time);
+        vm.warp(vm.getBlockTimestamp() + reportDelay);
         vm.prank(reporter);
         multiverse.report(GENESIS_UID, queryId, 1);
 
-        time += multiverse.ONE_DAY() + 1;
-        vm.warp(time);
+        vm.warp(vm.getBlockTimestamp() + multiverse.ONE_DAY() + 1);
         vm.prank(resolver);
         multiverse.resolve(GENESIS_UID, queryId);
 
