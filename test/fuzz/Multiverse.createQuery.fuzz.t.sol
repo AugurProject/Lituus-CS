@@ -38,21 +38,23 @@ contract MultiverseCreateQueryFuzzTest is MultiverseFuzzFixtures {
         multiverse.createQuery(GENESIS_UID, "q", n);
     }
 
-    /// @dev Property: the exact fee reported by the controller is charged and stored.
+    /// @dev Property: the charged fee is the controller fee capped at half the fork threshold, and
+    /// the stored fee, contract holdings, and payer balance always match the charged amount.
     function testFuzz_CreateQuery_VaryingFee(uint256 fee) public {
-        // Fees at or above half the fork threshold are rejected by createQuery (FeeAboveForkThreshold),
-        // matching the stake clamp in _requiredStakeAmountAndForkThreshold, so the valid range tops
-        // out just below that.
-        fee = bound(fee, 1, zoltar.getForkThreshold(GENESIS_UID) / 2 - 1);
+        // Any base fee is accepted and the final fee is clamped to at most half the fork threshold.
+        uint256 cap = zoltar.getForkThreshold(GENESIS_UID) / 2;
+        fee = bound(fee, 1, type(uint128).max);
         feeCtl.setFee(fee);
+        uint256 chargedFee = fee > cap ? cap : fee;
         uint256 userBalanceBefore = genesisRep.balanceOf(user);
 
         vm.prank(user);
         multiverse.createQuery(GENESIS_UID, "q", 3);
 
         (,, uint256 storedFee,) = multiverse.queries(0);
-        assertEq(storedFee, fee);
-        assertEq(genesisRep.balanceOf(address(multiverse)), fee);
-        assertEq(genesisRep.balanceOf(user), userBalanceBefore - fee);
+        assertEq(storedFee, chargedFee);
+        assertLe(storedFee, cap);
+        assertEq(genesisRep.balanceOf(address(multiverse)), chargedFee);
+        assertEq(genesisRep.balanceOf(user), userBalanceBefore - chargedFee);
     }
 }

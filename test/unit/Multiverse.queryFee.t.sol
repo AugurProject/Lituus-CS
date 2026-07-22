@@ -358,10 +358,10 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
                     FEE CAP (HALF THE FORK THRESHOLD)
     //////////////////////////////////////////////////////////////*/
     function test_QueryFee_ClampsFeeToHalfForkThreshold() public {
-        // Successor of the removed FeeAboveForkThreshold revert test: a base fee ABOVE the cap no
-        // longer blocks creation — the query is created and charged exactly half the fork threshold
-        // (= 1% of supply, imkharn's cap). With this suite's supply (1000e18, threshold supply/20)
-        // the cap is 25e18; the base is set to double that so the clamp is observable, not a no-op.
+        // A base fee above the cap does not block creation: the query is created and charged exactly
+        // half the fork threshold (= 1% of supply). With this suite's supply (1000e18, threshold
+        // supply/20) the cap is 25e18; the base is set to double that so the clamp is observable,
+        // not a no-op.
         uint256 cap = zoltar.getForkThreshold(GENESIS_UID) / 2;
         feeCtl.setFee(2 * cap);
 
@@ -420,12 +420,11 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
     }
 
     function test_QueryFee_CappedFeeQueryIsReportable() public {
-        // Regression pin for the fee-cap boundary (the `>` fix in the stake rule): a query whose
-        // fee was capped to exactly half the fork threshold must accept its first report as an
-        // ORDINARY stake. The required stake equals the capped fee and stays strictly below the
-        // fork threshold; under the pre-fix `>=` stake rule this exact report escalated to the
-        // full threshold and reverted with ForkingNotImplemented, making capped queries dead on
-        // arrival. Lives here rather than the report suite to keep the cap tests self-contained.
+        // A query whose fee was capped to exactly half the fork threshold must accept its first
+        // report as an ordinary stake: the required stake equals the capped fee and stays strictly
+        // below the fork threshold. Guards the boundary between the fee cap and the stake rule —
+        // a stake rule that escalates at (rather than above) half the threshold would make every
+        // capped query unreportable. Lives here to keep the cap tests self-contained.
         uint256 cap = zoltar.getForkThreshold(GENESIS_UID) / 2;
         feeCtl.setFee(2 * cap);
         assertEq(_chargedFee(), cap);
@@ -509,12 +508,10 @@ contract MultiverseQueryFeeStressTest is QueryFeeTestHelpers {
     }
 
     function test_QueryFee_Stress_DemandSpikeSaturatesAtCap() public {
-        // Inversion of the removed DemandSpikePushesLegalBaseOverForkBound revert test, after the
-        // cap replaced the revert: a legal base (cap / 2) pushed over the cap by a demand spike no
-        // longer blocks query creation. The first formerly-forbidden query is created charged
-        // exactly the cap, and the cap stays sticky while the spike volume keeps the uncapped
-        // prediction above it. High demand throttles the price at 1% of supply instead of DoS-ing
-        // the universe.
+        // A legal base (cap / 2) pushed over the cap by a demand spike does not block query
+        // creation: the first query predicted at or over the cap is created charged exactly the
+        // cap, and the cap stays sticky while the spike volume keeps the uncapped prediction above
+        // it. High demand throttles the price at 1% of supply instead of denying service.
         uint256 cap = zoltar.getForkThreshold(GENESIS_UID) / 2;
         uint256 base = cap / 2;
         feeCtl.setFee(base);
