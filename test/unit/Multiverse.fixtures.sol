@@ -52,7 +52,7 @@ abstract contract MultiverseDeployFixture is Test {
         zoltarQuestionData = new MockZoltarQuestionData();
         zoltar = new MockZoltar(IReputationToken(address(underlying)), zoltarQuestionData);
         IQueryFeeController controller = _deployFeeController();
-        multiverse = new Multiverse(zoltar, GENESIS_UID, controller);
+        multiverse = _deployMultiverse(controller);
 
         (ILituusRep repToken,,,,,,,,,,,,,) = multiverse.universes(GENESIS_UID);
         genesisRep = repToken;
@@ -70,6 +70,12 @@ abstract contract MultiverseDeployFixture is Test {
     /// @dev Post-deploy hook, runs after the Multiverse exists. Empty by default; the production
     ///      controller suite wires `setMultiverse` here.
     function _afterProtocolDeploy() internal virtual { }
+
+    /// @dev Multiverse deploy hook: the production contract by default. Suites that need a test
+    ///      harness (e.g. exposing internal views) override this.
+    function _deployMultiverse(IQueryFeeController controller) internal virtual returns (Multiverse) {
+        return new Multiverse(zoltar, GENESIS_UID, controller);
+    }
 
     /// @dev Funding tool (not invoked here): mint underlying, wrap into REP, approve the multiverse.
     function _fundWithRep(address account, uint256 amount) internal {
