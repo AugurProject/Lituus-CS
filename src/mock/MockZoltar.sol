@@ -7,7 +7,10 @@ import { IReputationToken } from "../interfaces/IReputationToken.sol";
 contract MockZoltar is IZoltar {
     uint256 constant FORK_THRESHOLD_DIVISOR = 20; // 5% of total supply atm
 
+    // mock accessors mirror the interface's lowercase getter names, so keep the non-standard casing
+    // forge-lint: disable-next-line(screaming-snake-case-immutable)
     IReputationToken public immutable repToken;
+    // forge-lint: disable-next-line(screaming-snake-case-immutable)
     IZoltarQuestionData public immutable zoltarQuestionData;
 
     constructor(IReputationToken repToken_, IZoltarQuestionData zoltarQuestionData_) {
