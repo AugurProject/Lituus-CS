@@ -23,9 +23,9 @@ contract Multiverse is ReentrancyGuard {
     // 0 - UNRESOLVED
     // 1..numberOfOutcomes - valid outcomes (a query has 2..254 of them; 1 is YES and 2 is NO for a binary query)
     // 255 - INVALID
-    uint8 public constant MAX_OUTCOMES = 254; //number of outcomes for a query (not including UNRESOLVED and INVALID)
-    uint8 public constant MIN_OUTCOMES = 2; //minimum number of valid outcomes for a query
-    uint8 public constant MAX_FORK_OUTCOMES = 2; //number of outcomes for a forking query
+    uint8 public constant MAX_OUTCOMES = 254; // number of outcomes for a query (not including UNRESOLVED and INVALID)
+    uint8 public constant MIN_OUTCOMES = 2; // minimum number of valid outcomes for a query
+    uint8 public constant MAX_FORK_OUTCOMES = 2; // number of outcomes for a forking query
     uint8 public constant UNRESOLVED = 0; // the query is not resolved yet
     uint8 public constant INVALID = 255; // an invalid outcome value used for reporting an invalid fork outcome during
     // fork resolution. It is outside the valid outcome range [1, MAX_OUTCOMES]
@@ -99,7 +99,6 @@ contract Multiverse is ReentrancyGuard {
     struct Universe {
         ILituusRep repToken;
         UniverseState universeState;
-        // TODO: populate the forkTime
         uint48 forkTime;
         // The depth of the universe in the fork tree
         // Genesis universe has depth 0, its children have depth 1, etc. Max 256.
@@ -115,7 +114,6 @@ contract Multiverse is ReentrancyGuard {
         // repointed to the final current universe (not just the immediate child), so resolving the current
         // universe is always a single hop with no chain walk.
         uint248 heir;
-        // TODO: populate the history
         // History format:
         // Genesis universe has history 0, depth 0.
         // First children have history 0b00 and 0b01, depth 1,
@@ -314,11 +312,11 @@ contract Multiverse is ReentrancyGuard {
 
         // TODO: Here we need to actually check if question contains the same numberOfOutcomes needed.
 
-        // Get the base fee amount from the query fee controller
+        // get the base fee amount from the query fee controller
         uint256 baseFee = QUERY_FEE_CONTROLLER.getQueryFee(currentUniverseId);
         // Create a global query record
 
-        // Calculate the fee depending on previous volume and update the volume.
+        // calculate the fee depending on previous volume and update the volume
         uint256 fee = _calculateFeeAndApplyVolume(currentUniverseId, baseFee);
         if (fee == 0) revert ZeroFee();
         // The first report's stake equals the query fee, and any stake that exceeds half the fork
@@ -327,7 +325,7 @@ contract Multiverse is ReentrancyGuard {
         // first report an ordinary stake; the fork level can then only be reached by escalating.
         uint256 forkThreshold = ZOLTAR.getForkThreshold(currentUniverseId) / 2;
         if (fee >= forkThreshold) fee = forkThreshold;
-        // Transfer the query fee amount of REP token
+        // transfer the query fee amount of REP token
         // TODO: permit? permit2?
         currentUniverse.repToken.safeTransferFrom(msg.sender, address(this), fee);
 
@@ -342,7 +340,6 @@ contract Multiverse is ReentrancyGuard {
         QueryResolution storage resolution = queryResolutions[currentUniverseId][queryCount];
         resolution.queryCreateTime = uint48(block.timestamp);
 
-        // Emit an event
         emit QueryCreated(msg.sender, queryCount, currentUniverseId, question, numberOfOutcomes);
 
         queryCount++;
@@ -390,7 +387,7 @@ contract Multiverse is ReentrancyGuard {
 
         uint48 queryCreateTime = _getAndUpdateQueryCreateTime(currentUniverseId, queryId);
 
-        // Check that the reporting window for the query is not over yet
+        // check that the reporting window for the query is not over yet
         if (numberOfStakes == 0 && queryCreateTime + THREE_DAYS < block.timestamp) revert QueryExpired();
 
         // Check that the last outcome is not the same as the current outcome, and the appeal period hasn't expired.
@@ -402,13 +399,13 @@ contract Multiverse is ReentrancyGuard {
 
         (uint256 requiredStakeAmount, uint256 forkThreshold) =
             _requiredStakeAmountAndForkThreshold(currentUniverseId, queryId);
-        // A zero stake would allow free reports and an escalation ladder stuck at 0.
+        // a zero stake would allow free reports and an escalation ladder stuck at 0.
         if (requiredStakeAmount == 0) revert ZeroStakeAmount();
         // TODO: If the bond before a fork bond is placed so that the next appeal would cause a fork,
         // and its not possible to fork because the parent has still not resolved their fork,
         // then the bond placing is reverted and the query is frozen until the parent universe resolves the fork.
 
-        // Transfer the stake
+        // transfer the stake
         currentUniverse.repToken.safeTransferFrom(msg.sender, address(this), requiredStakeAmount);
 
         if (requiredStakeAmount >= forkThreshold) {
@@ -435,7 +432,6 @@ contract Multiverse is ReentrancyGuard {
         newStake.reportedOutcome = outcome;
         newStake.amount = requiredStakeAmount;
 
-        // Emit an event
         emit QueryReported(msg.sender, currentUniverseId, queryId, outcome, requiredStakeAmount);
     }
 
@@ -473,7 +469,7 @@ contract Multiverse is ReentrancyGuard {
             // resolved in an ancestor is inherited by this lineage (via getOutcome) and must not be
             // resolved again. The stakes branch below is already covered by report()'s first-stake check.
             if (_findAncestorResolution(currentUniverseId, queryId) != UNRESOLVED) revert QueryAlreadyResolved();
-            // If the report period has passed and the query was not reported on then resolve the query as INVALID
+            // if the report period has passed and the query was not reported on then resolve the query as INVALID
             resolution.outcome = INVALID;
             _recordResolvedUniverse(queryId, currentUniverseId, currentUniverse.isCanonical);
 
@@ -496,19 +492,18 @@ contract Multiverse is ReentrancyGuard {
                 _recordResolvedUniverse(queryId, currentUniverseId, currentUniverse.isCanonical);
                 emit QueryResolved(msg.sender, currentUniverseId, queryId, outcome);
             } else {
-                // Appeal period is not over yet, cannot resolve
+                // appeal period is not over yet, cannot resolve
                 revert QueryNotReadyToResolve();
             }
         } else {
-            // Otherwise, the query cannot be resolved yet
+            // otherwise, the query cannot be resolved yet
             revert QueryNotReadyToResolve();
         }
 
-        // TODO: check Zoltar forking state
         if (currentUniverse.universeState == UniverseState.Active) {
-            // Check if Zoltar universe is forking
+            // check if Zoltar universe is forking
             if (ZOLTAR.universes(currentUniverseId).forkTime != 0) {
-                // If Zoltar is forking, then we should mirror the fork in this universe.
+                // if Zoltar is forking, then we should mirror the fork in this universe
                 _mirrorZoltarFork(currentUniverseId);
             }
         }
@@ -654,7 +649,7 @@ contract Multiverse is ReentrancyGuard {
                 sixtyDayVolume = sum;
             } else {
                 for (uint256 i = lastWindow; i < currentThreeDayWindow;) {
-                    // Completed window enters.
+                    // сompleted window enters
                     sixtyDayVolume += stats.threeDayInfo[i].threeDayVolume; // completed real window enters
                     if (i >= 20) {
                         // Real window leaves; bootstrap never subtracted (no accounting for bootstrap).
@@ -665,16 +660,20 @@ contract Multiverse is ReentrancyGuard {
                     }
                 }
             }
+            // running query count over the window range, far below the uint128 max
+            // forge-lint: disable-next-line(unsafe-typecast)
             stats.sixtyDayVolume = uint128(sixtyDayVolume);
+            // 3-day window index since genesis, far below the uint128 max
+            // forge-lint: disable-next-line(unsafe-typecast)
             stats.lastWindowId = uint128(currentThreeDayWindow);
         }
 
-        // Fraction of the current window elapsed, in [0, SCALE).
+        // fraction of the current window elapsed, in [0, SCALE)
         uint256 proportionOfCurrentWindow = ((block.timestamp - GENESIS_TIMESTAMP) % THREE_DAYS) * SCALE / THREE_DAYS;
 
         uint256 currentVolume = stats.threeDayInfo[currentThreeDayWindow].threeDayVolume;
 
-        // Previous window (w-1): real volume, or bootstrap if it predates genesis. Check done here, before the read.
+        // previous window (w-1): real volume, or bootstrap if it predates genesis. Check done here, before the read
         uint256 previousVolume =
             currentThreeDayWindow >= 1 ? stats.threeDayInfo[currentThreeDayWindow - 1].threeDayVolume : BOOT_VOLUME;
 
@@ -686,19 +685,21 @@ contract Multiverse is ReentrancyGuard {
         // w < 20) contributes only its (1 - f) tail, since f of it has already slid out of the 60-day span.
         uint256 lastSixtyDayVolume = currentVolume + stats.sixtyDayVolume;
         if (currentThreeDayWindow >= 20) {
-            // Oldest window (w-20) is real: subtract the f-tail that rolled out.
+            // oldest window (w-20) is real: subtract the f-tail that rolled out
             uint256 oldestVolume = stats.threeDayInfo[currentThreeDayWindow - 20].threeDayVolume;
             lastSixtyDayVolume -= proportionOfCurrentWindow * oldestVolume / SCALE;
         } else {
-            // Missing pre-genesis windows are bootstrap. The (20 - w - 1) newer ones enter whole; the single
-            // oldest (w-20) enters only its (1 - f) tail — same trimming the real branch applies.
+            // missing pre-genesis windows are bootstrap. The (20 - w - 1) newer ones enter whole; the single
+            // oldest (w-20) enters only its (1 - f) tail — same trimming the real branch applies
             lastSixtyDayVolume += (20 - currentThreeDayWindow - 1) * BOOT_VOLUME + (SCALE - proportionOfCurrentWindow)
                 * BOOT_VOLUME / SCALE;
         }
 
         fee = baseFee * _calculateCurveModifier(lastSixtyDayVolume, lastThreeDayVolume) / SCALE;
 
-        // Count this query for future fees.
+        // count this query for future fees
+        // a per-window query count, far below the uint128 max
+        // forge-lint: disable-next-line(unsafe-typecast)
         stats.threeDayInfo[currentThreeDayWindow].threeDayVolume = uint128(currentVolume + 1);
     }
 
@@ -730,7 +731,7 @@ contract Multiverse is ReentrancyGuard {
         uint256 ratio = lastSixtyDayVolume == 0 ? SCALE : 20 * lastThreeDayVolume * SCALE / lastSixtyDayVolume;
 
         if (ratio >= SCALE) {
-            // Above average: gentle linear rise, slope 0.2.
+            // above average: gentle linear rise, slope 0.2
             modifier_ = (4 * SCALE) / 5 + ratio / 5;
         } else {
             // Below average: steep drop.
@@ -763,7 +764,7 @@ contract Multiverse is ReentrancyGuard {
     function _getProfits(uint248 universeId) internal view returns (uint256 currentProfit, uint256 lastProfit) {
         UniverseStatistics storage stats = universeStatistics[universeId];
         uint256 currentThreeDayWindow = _getCurrentThreeDayWindow();
-        // Fraction of the current window elapsed, in [0, SCALE).
+        // fraction of the current window elapsed, in [0, SCALE)
         uint256 proportionOfCurrentWindow = ((block.timestamp - GENESIS_TIMESTAMP) % THREE_DAYS) * SCALE / THREE_DAYS;
 
         // Current month: current window's partial profit + the 9 completed windows behind it.
@@ -793,7 +794,7 @@ contract Multiverse is ReentrancyGuard {
             }
         }
 
-        // Oldest window c-20 contributes only its (1 - f) tail; the rest has rolled out of the 60-day span.
+        // oldest window c-20 contributes only its (1 - f) tail; the rest has rolled out of the 60-day span
         uint256 oldestProfit =
             currentThreeDayWindow >= 20 ? stats.threeDayInfo[currentThreeDayWindow - 20].threeDayProfit : BOOT_PROFIT;
         lastProfit += (SCALE - proportionOfCurrentWindow) * oldestProfit / SCALE;
@@ -849,7 +850,10 @@ contract Multiverse is ReentrancyGuard {
 
         QueryResolution storage resolution = queryResolutions[universeId][queryId];
         // Store the escalation totals so claim() can compute each winner's payout without looping again.
+        // Both are REP amounts bounded by max supply (100M * 1e18), within uint96.
+        // forge-lint: disable-next-line(unsafe-typecast)
         resolution.totalDistributable = uint96(totalLoserStakes - loserBurn);
+        // forge-lint: disable-next-line(unsafe-typecast)
         resolution.winnerStaked = uint96(winnerOutcomeStaked);
 
         emit ReporterRewardPaid(reporter, universeId, queryId, reporterPay);
@@ -861,7 +865,7 @@ contract Multiverse is ReentrancyGuard {
             emit StakeClaimed(reporter, universeId, queryId, 0, totalStaked);
             repToken.safeTransfer(reporter, reporterPay + totalStaked);
         }
-        // In the case of more than one stakes, then even the reporter that gets paid, needs to claim.
+        // with more than one stake, even the rewarded reporter must claim their bond separately
         else {
             repToken.safeTransfer(reporter, reporterPay);
         }
@@ -889,6 +893,8 @@ contract Multiverse is ReentrancyGuard {
         uint256 current3DayWindow = _getCurrentThreeDayWindow();
         ThreeDayInfo storage threeDayInfo = universeStatistics[universeId].threeDayInfo[current3DayWindow];
 
+        // profit is a REP amount bounded by max supply (100M * 1e18), within uint128
+        // forge-lint: disable-next-line(unsafe-typecast)
         threeDayInfo.threeDayProfit += uint128(profit);
     }
 
@@ -1170,6 +1176,8 @@ contract Multiverse is ReentrancyGuard {
         _spawnChildUniverse(universeId, queryId, outcomeId, 1);
         // TODO: Split the REP token supply in the child universes via Zoltar
         universe.universeState = UniverseState.Migration;
+        // queryId indexes queries by count, within uint128
+        // forge-lint: disable-next-line(unsafe-typecast)
         universe.forkQuery = uint128(queryId);
         universe.isLituusFork = true;
         universe.forkOutcome = outcomeId;
@@ -1265,7 +1273,6 @@ contract Multiverse is ReentrancyGuard {
         query.fee = 0;
         query.question = questionData.title;
 
-        // Emit an event
         emit QueryCreated(msg.sender, queryId, universeId, questionData.title, 2);
 
         queryCount++;
@@ -1277,6 +1284,8 @@ contract Multiverse is ReentrancyGuard {
         _spawnChildUniverse(universeId, queryId, 2, 1);
         // Set outcomes in child universes and update their states to Forming
         universe.universeState = UniverseState.Migration;
+        // queryId indexes queries by count, within uint128
+        // forge-lint: disable-next-line(unsafe-typecast)
         universe.forkQuery = uint128(queryId);
         universe.forkOutcome = 2;
     }
@@ -1347,10 +1356,17 @@ contract Multiverse is ReentrancyGuard {
      * @notice Builds the question text for creating a fork in Zoltar.
      * @dev Placeholder — returns the original question unchanged; Zoltar formatting is TODO.
      * @param queryId The query being forked on.
-     * @param outcomeId The branch outcome that creates a fork.
      * @return The question string for the Zoltar query.
      */
-    function _createForkQuestionString(uint256 queryId, uint8 outcomeId) internal view returns (string memory) {
+    // outcomeId is reserved: the Zoltar fork question will name the winning branch once formatting is done.
+    function _createForkQuestionString(
+        uint256 queryId,
+        uint8 /* outcomeId */
+    )
+        internal
+        view
+        returns (string memory)
+    {
         // TODO: Placeholder for now
         Query storage query = queries[queryId];
         return query.question;

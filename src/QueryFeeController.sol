@@ -49,6 +49,8 @@ contract QueryFeeController is IQueryFeeController {
     event BaseQueryFeeUpdated(uint248 indexed universeId, uint256 oldFee, uint256 newFee, uint48 timestamp);
 
     /* ================================================ MODIFIERS ================================================ */
+    // the check is a single guard; keeping it inline for better readability
+    // forge-lint: disable-next-item(unwrapped-modifier-logic)
     modifier onlyMultiverse() {
         if (msg.sender != multiverse) revert OnlyMultiverse();
         _;
@@ -64,6 +66,8 @@ contract QueryFeeController is IQueryFeeController {
         DEPLOYER = msg.sender;
 
         FeeState storage feeState = feeStates[genesisUniverseId];
+        // INITIAL_BASE_FEE is within REP total supply, within uint128
+        // forge-lint: disable-next-line(unsafe-typecast)
         feeState.baseFee = uint128(INITIAL_BASE_FEE);
         feeState.timeFeeLastChanged = uint48(block.timestamp);
     }
@@ -117,6 +121,8 @@ contract QueryFeeController is IQueryFeeController {
         // Fixed symmetric step: x1.1 to raise, /1.1 to lower.
         uint256 oldFee = uint256(feeState.baseFee);
         uint256 newFee = increased ? oldFee * FEE_RATE / SCALE : oldFee * SCALE / FEE_RATE;
+        // newFee is in REP tokens, staying within uint128
+        // forge-lint: disable-next-line(unsafe-typecast)
         feeState.baseFee = uint128(newFee);
         feeState.baseFeeIncreased = increased;
         feeState.timeFeeLastChanged = uint48(block.timestamp);

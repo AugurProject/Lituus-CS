@@ -31,6 +31,10 @@ verbosity = 3
 fuzz      = { runs = 100_000 }
 invariant = { runs = 5_000, depth = 100, fail_on_revert = true }
 
+# Skip linting for the tests. The boundaries for the test values are set deliberately.
+[lint]
+ignore = ["test/**/*.sol"]
+
 [fmt]
 line_length            = 120
 tab_width              = 4
