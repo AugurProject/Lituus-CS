@@ -18,18 +18,18 @@ ignored_warnings_from = ["lib"] # ignoring warnings from external packages
 allow_internal_expect_revert = true
 
 fuzz      = { runs = 256 }
-invariant = { runs = 256, depth = 15, fail_on_revert = false, call_override = false }
+invariant = { runs = 256, depth = 15, fail_on_revert = true, call_override = false }
 
 # Used in CI, heavier testing, fail fast
 [profile.ci]
 fuzz      = { runs = 10_000 }
-invariant = { runs = 1_000, depth = 50, fail_on_revert = false }
+invariant = { runs = 1_000, depth = 50, fail_on_revert = true }
 verbosity = 3
 
 # Run locally before a release, exhaustive
 [profile.deep]
 fuzz      = { runs = 100_000 }
-invariant = { runs = 5_000, depth = 100, fail_on_revert = false }
+invariant = { runs = 5_000, depth = 100, fail_on_revert = true }
 
 [fmt]
 line_length            = 120

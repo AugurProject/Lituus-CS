@@ -541,6 +541,33 @@ contract MultiverseResolveTest is MultiverseFixtures {
         assertEq(genesisRep.totalSupply(), supplyBefore);
     }
 
+    function test_Resolve_NearThresholdLadder() public {
+        // A ladder that stopped one step from the fork level (its last stake is exactly half the
+        // fork threshold; the next report would be the fork trigger) is still an ordinary
+        // escalation once the appeal window passes: the fork threshold was never met, so the
+        // query resolves to the last outcome and winners settle through claim() as usual.
+        (uint256 queryId, uint256 forkThreshold) = _createNearThresholdLadder();
+        _warpPastAppealWindow(queryId);
+
+        uint8 outcome = _resolve(challenger, queryId);
+        assertEq(outcome, OUTCOME_A);
+
+        // Hand-computed literals: fixture supply = 3000e18 (three actors x 1000e18), so the
+        // threshold t = 3000e18 / 20 = 150e18 and the ladder is t/8 (user, A) = 18.75e18,
+        // t/4 (challenger, B) = 37.5e18, t/2 (bystander, A) = 75e18. Losers = 37.5e18,
+        // burn = 37.5e18 / 5 = 7.5e18, distributable = 30e18; winnerStaked = 93.75e18.
+        assertEq(forkThreshold, 150 ether);
+        (,, uint96 totalDistributable, uint96 winnerStaked) = multiverse.queryResolutions(GENESIS_UID, queryId);
+        assertEq(winnerStaked, 93.75 ether);
+        assertEq(totalDistributable, 30 ether);
+
+        // Both winning stakes settle normally:
+        // payout(stake 0) = 18.75e18 + 18.75e18 * 30e18 / 93.75e18 = 24.75e18
+        // payout(stake 2) = 75e18 + 75e18 * 30e18 / 93.75e18 = 99e18
+        assertEq(_claim(user, queryId, 0), 24.75 ether);
+        assertEq(_claim(bystander, queryId, 2), 99 ether);
+    }
+
     /*//////////////////////////////////////////////////////////////
                 RESOLVE - TIMING BOUNDARIES & MISC
     //////////////////////////////////////////////////////////////*/

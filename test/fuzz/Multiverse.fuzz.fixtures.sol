@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.35;
 
+import { Multiverse } from "src/Multiverse.sol";
 import { MultiverseDeployFixture } from "../unit/Multiverse.fixtures.sol";
 
 /// @notice Shared fixtures for the Multiverse fuzz test suites: the deploy layer plus the fuzz
@@ -26,5 +27,18 @@ abstract contract MultiverseFuzzFixtures is MultiverseDeployFixture {
         queryId = multiverse.queryCount();
         vm.prank(user);
         multiverse.createQuery(GENESIS_UID, "q", 3);
+    }
+
+    /// @dev Builds an escalation ladder of `rounds` same-block stakes on a fresh query: outcomes
+    ///      alternate 1/2 and reporters alternate user/reporter, so ownership and winning stakes
+    ///      vary with parity (mirrors testFuzz_Report_EscalationDoubles's loop). Same-block
+    ///      escalation is legal since consecutive outcomes differ.
+    /// @return queryId The id of the reported query.
+    function _buildLadder(uint256 rounds) internal returns (uint256 queryId) {
+        queryId = _createQuery();
+        for (uint256 i = 0; i < rounds; i++) {
+            vm.prank(i % 2 == 0 ? user : reporter);
+            multiverse.report(GENESIS_UID, queryId, i % 2 == 0 ? 1 : 2);
+        }
     }
 }

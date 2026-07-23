@@ -18,7 +18,7 @@ contract MultiverseReportTest is MultiverseFixtures {
         Multiverse.Stake[] memory stakes = multiverse.getStakes(GENESIS_UID, queryId);
         assertEq(stakes.length, 1);
         assertEq(stakes[0].reporter, user);
-        assertEq(stakes[0].time, uint48(block.timestamp));
+        assertEq(stakes[0].time, uint48(vm.getBlockTimestamp()));
         assertEq(stakes[0].reportedOutcome, OUTCOME_A);
         // The first stake equals the query fee.
         assertEq(stakes[0].amount, DEFAULT_FEE);
@@ -372,13 +372,9 @@ contract MultiverseReportTest is MultiverseFixtures {
         uint8[5] memory outcomes = [OUTCOME_A, OUTCOME_B, OUTCOME_A, OUTCOME_B, OUTCOME_A];
         uint256[5] memory gaps = [uint256(2 hours), 23 hours, 6 hours, 20 hours, 12 hours];
         uint48[5] memory stakeTimes;
-        // Track time in a local variable: with via-ir the optimizer may cache `block.timestamp`
-        // across `vm.warp`, so re-reading it after a warp is unreliable.
-        uint256 time = block.timestamp;
         for (uint256 i = 0; i < 5; i++) {
-            time += gaps[i];
-            vm.warp(time);
-            stakeTimes[i] = uint48(time);
+            vm.warp(vm.getBlockTimestamp() + gaps[i]);
+            stakeTimes[i] = uint48(vm.getBlockTimestamp());
             _report(reporters[i], queryId, outcomes[i]);
         }
 
@@ -403,17 +399,12 @@ contract MultiverseReportTest is MultiverseFixtures {
         uint256 queryId1 = _createDefaultQuery();
 
         // Interleaved escalations: each query's ladder and appeal clock advance independently.
-        // Time is tracked in a local variable: with via-ir the optimizer may cache
-        // `block.timestamp` across `vm.warp`, so re-reading it after a warp is unreliable.
-        uint256 time = block.timestamp;
         _report(user, queryId0, OUTCOME_A);
         _report(bystander, queryId1, OUTCOME_B);
-        time += 6 hours;
-        vm.warp(time);
+        vm.warp(vm.getBlockTimestamp() + 6 hours);
         _report(challenger, queryId0, OUTCOME_B);
         _report(user, queryId1, OUTCOME_A);
-        time += 6 hours;
-        vm.warp(time);
+        vm.warp(vm.getBlockTimestamp() + 6 hours);
         _report(bystander, queryId0, OUTCOME_A);
 
         // Each query's ladder doubles from its own stored fee (the second query's fee is higher
@@ -574,6 +565,25 @@ contract MultiverseReportTest is MultiverseFixtures {
         vm.expectRevert();
         multiverse.report(GENESIS_UID, queryId, OUTCOME_A);
         vm.stopPrank();
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    REPORT - FORK-THRESHOLD BOUNDARY
+    //////////////////////////////////////////////////////////////*/
+    function test_Report_ExactHalfThresholdStakeIsOrdinary() public {
+        // The stake rule clamps only stakes strictly ABOVE half the threshold: a stake of exactly
+        // half must land as an ordinary stake (the report-side pin of the `>` boundary; the
+        // capped-fee suite pins the same boundary through the view only), and its doubling is
+        // exactly the full threshold — the ladder is now one step from the fork level.
+        (uint256 queryId, uint256 forkThreshold) = _createNearThresholdLadder();
+
+        Multiverse.Stake[] memory stakes = multiverse.getStakes(GENESIS_UID, queryId);
+        assertEq(stakes.length, 3);
+        assertEq(stakes[2].amount, forkThreshold / 2);
+
+        (uint256 requiredStake, uint256 threshold) = multiverse.getNextRequiredStake(GENESIS_UID, queryId);
+        assertEq(requiredStake, forkThreshold);
+        assertEq(threshold, forkThreshold);
     }
 
     /*//////////////////////////////////////////////////////////////

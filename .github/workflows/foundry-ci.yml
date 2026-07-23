@@ -2,7 +2,7 @@ name: foundry-ci
 
 on:
   pull_request:
-    branches: [ main ]
+    branches: [ main, dev ]
 
 jobs:
   foundry-ci:

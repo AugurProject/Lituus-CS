@@ -30,7 +30,7 @@ contract QueryFeeControllerTest is Test {
 
     /// @dev Steps the clock past the monthly gate and pushes profits as the multiverse.
     function _changeBaseFeeAfterAMonth(uint256 currentProfit, uint256 lastProfit) internal {
-        vm.warp(block.timestamp + controller.THIRTY_DAYS() + 1);
+        vm.warp(vm.getBlockTimestamp() + controller.THIRTY_DAYS() + 1);
         vm.prank(multiverse);
         controller.changeBaseFee(GENESIS_UID, currentProfit, lastProfit);
     }

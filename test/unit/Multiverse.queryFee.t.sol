@@ -448,7 +448,6 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
     function test_QueryFee_BootProfitDerivedFromControllerInitialFee() public view {
         assertEq(multiverse.BOOT_PROFIT(), 2 * feeCtl.INITIAL_BASE_FEE());
     }
-
 }
 
 /// @notice Stress suite for the fee algorithm's limits, on a pinned economy.
@@ -603,7 +602,7 @@ contract MultiverseUpdateBaseFeeTest is QueryFeeTestHelpers {
         vm.warp(START_TIME + controller.THIRTY_DAYS() + 1);
         multiverse.updateBaseFee(GENESIS_UID);
 
-        vm.warp(block.timestamp + controller.THIRTY_DAYS() + 1);
+        vm.warp(vm.getBlockTimestamp() + controller.THIRTY_DAYS() + 1);
         multiverse.updateBaseFee(GENESIS_UID);
 
         assertEq(controller.getQueryFee(GENESIS_UID), initial);
