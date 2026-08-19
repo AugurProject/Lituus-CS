@@ -56,18 +56,22 @@ contract MultiverseInvariantTest is MultiverseDeployFixture {
     }
 
     /// @dev The REP held by the multiverse equals every fee charged plus every stake placed,
-    ///      minus everything settlement paid out (resolver/reporter rewards and claims): REP is
-    ///      conserved through the whole lifecycle.
+    ///      minus everything settlement paid out (resolver/reporter rewards and claims) and minus
+    ///      the loser burns destroyed at resolve: REP is conserved through the whole lifecycle.
     function invariant_RepBalanceMatchesFeesAndStakes() public view {
         assertEq(
             genesisRep.balanceOf(address(multiverse)),
             handler.ghostTotalFees() + handler.ghostTotalStaked() - handler.ghostTotalPaidOut()
+                - handler.ghostTotalBurned()
         );
     }
 
-    /// @dev Settlement only ever pays out of prior deposits.
+    /// @dev Settlement only ever pays out of prior deposits, burn included.
     function invariant_PayoutsNeverExceedDeposits() public view {
-        assertLe(handler.ghostTotalPaidOut(), handler.ghostTotalFees() + handler.ghostTotalStaked());
+        assertLe(
+            handler.ghostTotalPaidOut() + handler.ghostTotalBurned(),
+            handler.ghostTotalFees() + handler.ghostTotalStaked()
+        );
     }
 
     /// @dev Every created query has a valid outcome count and origin universe.
@@ -237,5 +241,6 @@ contract MultiverseInvariantTest is MultiverseDeployFixture {
         console.log("totalFees      :", handler.ghostTotalFees());
         console.log("totalStaked    :", handler.ghostTotalStaked());
         console.log("totalPaidOut   :", handler.ghostTotalPaidOut());
+        console.log("totalBurned    :", handler.ghostTotalBurned());
     }
 }

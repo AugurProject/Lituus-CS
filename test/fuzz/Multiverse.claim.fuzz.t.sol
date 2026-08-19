@@ -18,9 +18,10 @@ contract MultiverseClaimFuzzTest is MultiverseFuzzFixtures {
 
     /// @dev Property: for any ladder, every winning stake claims at least its stake back, the
     /// winners together drain exactly winnerStaked + totalDistributable (up to one wei of
-    /// rounding dust per winner), and the contract retains exactly the fee plus the loser burn
-    /// (plus that dust) — REP is conserved through settlement. The fee is fully retained because
-    /// the first reporter's ramp is exactly zero (same-block report).
+    /// rounding dust per winner), and the whole profit — the loser burn plus the full fee, since
+    /// the first reporter's ramp is exactly zero on a same-block report — is destroyed from the
+    /// supply at resolve. The query settles to a zero residual (up to that dust): REP is conserved
+    /// through settlement.
     function testFuzz_Claim_Conservation(uint256 rounds, uint256 fee) public {
         rounds = bound(rounds, MIN_ROUNDS, MAX_ROUNDS);
         fee = bound(fee, 1, MAX_LADDER_FEE);
@@ -71,12 +72,12 @@ contract MultiverseClaimFuzzTest is MultiverseFuzzFixtures {
         assertLe(sumPayouts, uint256(winnerStaked) + uint256(totalDistributable));
         assertGe(sumPayouts + winnersCount, uint256(winnerStaked) + uint256(totalDistributable));
 
-        // Conservation: deposits were fee + totalStaked, the ramp paid the first reporter zero
-        // (same-block report), so the residual is the fee + the loser burn + the claim dust.
+        // Conservation: deposits were fee + totalStaked, and resolve destroyed the whole profit
+        // (the full fee, as the same-block ramp paid the reporter zero, plus losers / 5), so the
+        // residual is only the claim dust.
         uint256 residual = genesisRep.balanceOf(address(multiverse));
-        assertEq(residual, fee + totalStaked - sumPayouts);
-        assertGe(residual, fee + losers / 5);
-        assertLe(residual, fee + losers / 5 + winnersCount);
+        assertEq(residual, totalStaked - sumPayouts - losers / 5);
+        assertLe(residual, winnersCount);
     }
 
     /// @dev Property: claiming any winning stake a second time always reverts StakeAlreadyClaimed,

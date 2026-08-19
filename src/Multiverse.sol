@@ -202,6 +202,7 @@ contract Multiverse is ReentrancyGuard {
     error QueryTooLong();
     error ZeroFee();
     error ZeroStakeAmount();
+    error AmbiguousAmount();
     error QueryNotInherited();
     error ForkingNotImplemented();
     error QueryNotResolved();
@@ -233,7 +234,7 @@ contract Multiverse is ReentrancyGuard {
         // token symbol will use universe.history as a suffix. Genesis universe will have symbol "REP0"
         // TODO: Discuss the format of the suffix if the forks are for binary queries.
         ILituusRep repToken =
-            new LituusRep(address(this), address(initialZoltarRepToken), "Lituus Reputation Token", "REP0");
+            new LituusRep(address(this), address(initialZoltarRepToken), "Lituus Reputation Token", "REP0", SCALE);
 
         // Lituus universe ids mirror Zoltar universe ids (children already use Zoltar's child ids via
         // getChildUniverseId), so the genesis must be keyed by its Zoltar id.
@@ -259,25 +260,66 @@ contract Multiverse is ReentrancyGuard {
 
     /* ============================================= WRAP FUNCTIONS ============================================== */
     /**
-     * @notice Wraps a universe's underlying Zoltar REP into its Lituus REP for the caller.
+     * @notice Wraps a universe's underlying Zoltar REP into its Lituus REP (wREP) for the caller.
+     * @dev wREP is a share token over the universe's REP vault (1:1 at genesis; the rate only
+     *      rises as losing stakes are burned - see ILituusRep for the accounting model). Exactly
+     *      one of the two amounts must be nonzero: with `assetsToProvide` the caller fixes the
+     *      underlying spent and the shares received round down, with `sharesToReceive` the caller
+     *      fixes the shares received and the underlying pulled rounds up. Both roundings favor
+     *      the vault.
      * @param universeId The universe whose REP token to wrap into.
-     * @param amount The amount of underlying REP to wrap.
+     * @param assetsToProvide The exact amount of underlying REP to spend (0 to fix shares instead).
+     * @param sharesToReceive The exact amount of wREP shares to receive (0 to fix assets instead).
+     * @return assets The amount of underlying REP pulled from the caller.
+     * @return shares The amount of wREP shares minted to the caller.
      */
-    function wrap(uint248 universeId, uint256 amount) external {
+    function wrap(uint248 universeId, uint256 assetsToProvide, uint256 sharesToReceive)
+        external
+        returns (uint256 assets, uint256 shares)
+    {
+        if ((assetsToProvide == 0) == (sharesToReceive == 0)) revert AmbiguousAmount();
+
         // TODO: check universe status
         // TODO: maybe check if some fork is upcoming (some escalation game is close to fork threshold)
-        // TODO: add return value so as to be easily accountable if called from contract
-        universes[universeId].repToken.wrap(msg.sender, amount);
+        ILituusRep repToken = universes[universeId].repToken;
+        if (assetsToProvide > 0) {
+            assets = assetsToProvide;
+            shares = repToken.wrap(msg.sender, assetsToProvide);
+        } else {
+            shares = sharesToReceive;
+            assets = repToken.wrapShares(msg.sender, sharesToReceive);
+        }
     }
 
     /**
-     * @notice Unwraps a universe's Lituus REP back into the underlying Zoltar REP for the caller.
+     * @notice Unwraps a universe's Lituus REP (wREP) back into the underlying Zoltar REP for the caller.
+     * @dev The underlying is valued at the vault's stored assets-per-share rate, so it carries the
+     *      appreciation accrued from burned stakes. Exactly one of the two amounts must be
+     *      nonzero: with `sharesToProvide` the caller fixes the shares burned and the underlying
+     *      received rounds down, with `assetsToReceive` the caller fixes the underlying received
+     *      and the shares burned round up. Both roundings favor the vault. Reverts while
+     *      unwrapping is paused on the vault.
      * @param universeId The universe whose REP token to unwrap from.
-     * @param amount The amount of Lituus REP to unwrap.
+     * @param sharesToProvide The exact amount of wREP shares to unwrap (0 to fix assets instead).
+     * @param assetsToReceive The exact amount of underlying REP to receive (0 to fix shares instead).
+     * @return shares The amount of wREP shares burned from the caller.
+     * @return assets The amount of underlying Zoltar REP released to the caller.
      */
-    function unwrap(uint248 universeId, uint256 amount) external {
+    function unwrap(uint248 universeId, uint256 sharesToProvide, uint256 assetsToReceive)
+        external
+        returns (uint256 shares, uint256 assets)
+    {
+        if ((sharesToProvide == 0) == (assetsToReceive == 0)) revert AmbiguousAmount();
+
         // TODO: check universe status
-        universes[universeId].repToken.unwrap(msg.sender, amount);
+        ILituusRep repToken = universes[universeId].repToken;
+        if (sharesToProvide > 0) {
+            shares = sharesToProvide;
+            assets = repToken.unwrap(msg.sender, sharesToProvide);
+        } else {
+            assets = assetsToReceive;
+            shares = repToken.unwrapAssets(msg.sender, assetsToReceive);
+        }
     }
 
     /* ============================================= QUERY FUNCTIONS ============================================= */
@@ -480,6 +522,11 @@ contract Multiverse is ReentrancyGuard {
             uint256 resolverPay = _timeBasedFeeShare(queryFee, block.timestamp - (queryCreateTime + THREE_DAYS));
             emit ResolverRewardPaid(msg.sender, currentUniverseId, queryId, resolverPay);
             currentUniverse.repToken.safeTransfer(msg.sender, resolverPay);
+            // The unpaid fee remainder is the query's profit: recorded for the fee controller and
+            // burned as wREP, the same as on the stakes path.
+            if (queryFee - resolverPay > 0) {
+                currentUniverse.repToken.burnShares(queryFee - resolverPay);
+            }
             _applyProfit(currentUniverseId, queryFee - resolverPay);
 
             emit QueryResolved(msg.sender, currentUniverseId, queryId, INVALID);
@@ -869,8 +916,15 @@ contract Multiverse is ReentrancyGuard {
         else {
             repToken.safeTransfer(reporter, reporterPay);
         }
-        // TODO-CHECK IF LITUUS HERE OR UNWRAP AND BURN REP.
-        //        repToken.burn(profit);
+        // Burn the whole recorded profit as wREP - the losers' share of the pot plus the unpaid
+        // fee remainder: destroying shares while the vault's asset ledger is untouched raises the
+        // assets-per-share rate, so the burn accrues to every wREP holder ("value to wREP without
+        // value to REP"). The underlying Zoltar REP is never burned here. _applyProfit records the
+        // same amount for the fee controller; recording is accounting, the tokens themselves are
+        // destroyed.
+        if (profit > 0) {
+            repToken.burnShares(profit);
+        }
 
         _applyProfit(universeId, profit);
 
@@ -1208,8 +1262,15 @@ contract Multiverse is ReentrancyGuard {
         IReputationToken childUniverseZoltarRepToken = ZOLTAR.getRepToken(childUniverseId);
         // Deploy a Lituus REP token that wraps the Zoltar REP token
         // TODO: Discuss the format of the suffix if the forks are for binary queries.
-        ILituusRep childUniverseRepToken =
-            new LituusRep(address(this), address(childUniverseZoltarRepToken), "Lituus Reputation Token", "REP0.0");
+        // The child vault starts at the parent's current rate so the appreciation accrued from
+        // burns carries into the child universe instead of resetting to 1:1.
+        ILituusRep childUniverseRepToken = new LituusRep(
+            address(this),
+            address(childUniverseZoltarRepToken),
+            "Lituus Reputation Token",
+            "REP0.0",
+            parentUniverse.repToken.rate()
+        );
         Universe storage childUniverse = universes[childUniverseId];
         childUniverse.repToken = childUniverseRepToken;
         childUniverse.universeState = UniverseState.Forming;

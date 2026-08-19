@@ -50,6 +50,7 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
     uint256 public ghostTotalFees;
     uint256 public ghostTotalStaked;
     uint256 public ghostTotalPaidOut;
+    uint256 public ghostTotalBurned;
     uint256 public ghostReportsPlaced;
     uint256 public ghostResolvesPerformed;
     uint256 public ghostClaimsPerformed;
@@ -165,10 +166,12 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
     ///         (nothing created yet, already resolved, or the relevant window — reporting for an
     ///         unreported query, appeal for a reported one — has not passed yet).
     /// @dev    Payout amounts are observed, not recomputed, but they are checked against
-    ///         formula-independent bounds: the outflow can never exceed the query fee (the reward
-    ///         ramp caps at the whole fee) plus the auto-settled bond, and only the expected
-    ///         recipient — the first reporter of the winning outcome on the stakes path, the
-    ///         pranked resolver on the INVALID path — may gain REP.
+    ///         formula-independent bounds: resolve burns the whole profit (the loser burn plus
+    ///         the unpaid fee remainder), so the supply drop plus the transfer outflow must equal
+    ///         exactly the fee, plus the losing stakes / BURN_DIVIDER, plus the auto-settled
+    ///         bond — whatever the reward ramp paid. Only the expected recipient — the first
+    ///         reporter of the winning outcome on the stakes path, the pranked resolver on the
+    ///         INVALID path — may gain REP.
     function resolveQuery(uint256 querySeed, uint256 actorSeed) external {
         if (ghostQueriesCreated == 0) return;
         uint256 queryId = bound(querySeed, 0, ghostQueriesCreated - 1);
@@ -198,16 +201,32 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
         }
 
         uint256 multiverseBalanceBefore = REP.balanceOf(address(MULTIVERSE));
+        uint256 supplyBefore = REP.totalSupply();
         uint256[] memory actorBalancesBefore = _actorBalances();
 
         vm.prank(resolver);
         MULTIVERSE.resolve(GENESIS_UID, queryId);
 
-        // The outflow is at most the whole query fee (the reward ramp caps there), plus the
-        // refunded bond when the single-stake auto-settlement fires.
-        uint256 paidOut = multiverseBalanceBefore - REP.balanceOf(address(MULTIVERSE));
-        uint256 maxOutflow = ghostQueryFee[queryId] + (stakeCount == 1 ? ghostStakeAmount[queryId][0] : 0);
-        require(paidOut <= maxOutflow, "resolveQuery: outflow exceeds fee + auto-settled bond");
+        // resolve() burns the whole profit from the multiverse balance, so the balance drop
+        // splits into destroyed shares (the supply drop) and transfers to recipients. The reward
+        // ramp only moves value between the two streams: whatever the fee did not pay out was
+        // burned, so their sum is pinned exactly, independently of the ramp.
+        uint256 burned = supplyBefore - REP.totalSupply();
+        uint256 expectedLosers;
+        for (uint256 i = 0; i < stakeCount; ++i) {
+            if (ghostStakeOutcome[queryId][i] != winnerOutcome) {
+                expectedLosers += ghostStakeAmount[queryId][i];
+            }
+        }
+        ghostTotalBurned += burned;
+
+        uint256 paidOut = multiverseBalanceBefore - REP.balanceOf(address(MULTIVERSE)) - burned;
+        uint256 autoSettledBond = stakeCount == 1 ? ghostStakeAmount[queryId][0] : 0;
+        require(
+            burned + paidOut
+                == ghostQueryFee[queryId] + expectedLosers / MULTIVERSE.BURN_DIVIDER() + autoSettledBond,
+            "resolveQuery: burn + outflow mismatch"
+        );
 
         // Only the expected recipient may gain REP; everyone else's balance must be untouched.
         for (uint256 i = 0; i < actors.length; ++i) {
