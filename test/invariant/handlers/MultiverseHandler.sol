@@ -223,8 +223,7 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
         uint256 paidOut = multiverseBalanceBefore - REP.balanceOf(address(MULTIVERSE)) - burned;
         uint256 autoSettledBond = stakeCount == 1 ? ghostStakeAmount[queryId][0] : 0;
         require(
-            burned + paidOut
-                == ghostQueryFee[queryId] + expectedLosers / MULTIVERSE.BURN_DIVIDER() + autoSettledBond,
+            burned + paidOut == ghostQueryFee[queryId] + expectedLosers / MULTIVERSE.BURN_DIVIDER() + autoSettledBond,
             "resolveQuery: burn + outflow mismatch"
         );
 

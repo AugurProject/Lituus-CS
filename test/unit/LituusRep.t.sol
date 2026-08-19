@@ -85,7 +85,8 @@ contract LituusRepTest is Test {
     ///      and a zero rate is rejected: the child-universe spawning path can never mint at 1:1 by
     ///      accident.
     function test_Constructor_InitialRateIsRespected() public {
-        LituusRep child = new LituusRep(address(this), address(underlying), "Lituus Reputation Token", "wREP", 1.25 ether);
+        LituusRep child =
+            new LituusRep(address(this), address(underlying), "Lituus Reputation Token", "wREP", 1.25 ether);
         assertEq(child.rate(), 1.25 ether);
 
         vm.prank(alice);
