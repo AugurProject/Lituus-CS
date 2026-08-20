@@ -43,6 +43,9 @@ abstract contract MultiverseDeployFixture is Test {
     address internal user = makeAddr("user");
     address internal bystander = makeAddr("bystander");
     address internal challenger = makeAddr("challenger");
+    // Stub address for the query tokenizer: the Multiverse requires it nonzero, but these suites do
+    // not test the tokenizer (they use it only to satisfy the constructor).
+    address internal queryTokenizerStub = makeAddr("queryTokenizer");
 
     /// @dev Deploys the protocol at START_TIME. Funds nothing.
     function setUp() public virtual {
@@ -54,7 +57,7 @@ abstract contract MultiverseDeployFixture is Test {
         IQueryFeeController controller = _deployFeeController();
         multiverse = _deployMultiverse(controller);
 
-        (ILituusRep repToken,,,,,,,,,,,,,) = multiverse.universes(GENESIS_UID);
+        (ILituusRep repToken,,,,,,,,,,,,) = multiverse.universes(GENESIS_UID);
         genesisRep = repToken;
 
         _afterProtocolDeploy();
@@ -74,7 +77,7 @@ abstract contract MultiverseDeployFixture is Test {
     /// @dev Multiverse deploy hook: the production contract by default. Suites that need a test
     ///      harness (e.g. exposing internal views) override this.
     function _deployMultiverse(IQueryFeeController controller) internal virtual returns (Multiverse) {
-        return new Multiverse(zoltar, GENESIS_UID, controller);
+        return new Multiverse(zoltar, GENESIS_UID, controller, queryTokenizerStub);
     }
 
     /// @dev Funding tool (not invoked here): mint underlying, wrap into REP, approve the multiverse.
