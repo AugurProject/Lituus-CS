@@ -81,7 +81,7 @@ contract LituusRep is ERC20, Ownable, ReentrancyGuard, ILituusRep {
     /// @inheritdoc ILituusRep
     function wrapShares(address sender, uint256 shares) external onlyOwner nonReentrant returns (uint256 assets) {
         if (shares == 0) revert ZeroShares();
-        assets = _convertToAssetsUp(shares);
+        assets = convertToAssetsUp(shares);
 
         UNDERLYING_TOKEN.safeTransferFrom(sender, address(this), assets);
         totalAssets += assets;
@@ -109,7 +109,7 @@ contract LituusRep is ERC20, Ownable, ReentrancyGuard, ILituusRep {
     function unwrapAssets(address sender, uint256 assets) external onlyOwner nonReentrant returns (uint256 shares) {
         if (unwrapPaused) revert UnwrapIsPaused();
         if (assets == 0) revert ZeroAssets();
-        shares = _convertToSharesUp(assets);
+        shares = convertToSharesUp(assets);
 
         _burn(sender, shares);
         totalAssets -= assets;
@@ -157,17 +157,13 @@ contract LituusRep is ERC20, Ownable, ReentrancyGuard, ILituusRep {
         return shares * rate / SCALE;
     }
 
-    /* ============================================= INTERNAL FUNCTIONS ========================================== */
-
-    /// @dev Converts an underlying amount to shares at the stored rate, rounded up. Used when the
-    /// caller fixes the underlying to receive, so the shares taken in exchange favor the vault.
-    function _convertToSharesUp(uint256 assets) internal view returns (uint256 shares) {
+    /// @inheritdoc ILituusRep
+    function convertToSharesUp(uint256 assets) public view returns (uint256 shares) {
         return (assets * SCALE + rate - 1) / rate;
     }
 
-    /// @dev Converts a share amount to underlying at the stored rate, rounded up. Used when the
-    /// caller fixes the shares to receive, so the underlying taken in exchange favors the vault.
-    function _convertToAssetsUp(uint256 shares) internal view returns (uint256 assets) {
+    /// @inheritdoc ILituusRep
+    function convertToAssetsUp(uint256 shares) public view returns (uint256 assets) {
         return (shares * rate + SCALE - 1) / SCALE;
     }
 }

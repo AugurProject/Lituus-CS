@@ -64,7 +64,7 @@ interface ILituusRep is IERC20 {
     /// @dev Burns `shares` from `sender`, debits the internal asset ledger by
     ///      `shares * rate / SCALE` rounded DOWN, and transfers that underlying to `sender`.
     ///      Reverts with ZeroAssets if the rounded underlying amount is zero, so shares cannot be
-    ///      burned for nothing, and with UnwrapPaused while unwrapping is paused. The rate is
+    ///      burned for nothing, and with UnwrapIsPaused while unwrapping is paused. The rate is
     ///      unchanged. Only the owner may call.
     /// @param sender The account whose shares are burned and who receives the underlying.
     /// @param shares The exact amount of shares to unwrap.
@@ -74,7 +74,7 @@ interface ILituusRep is IERC20 {
     /// @notice Unwraps `sender`'s shares into an exact amount of underlying REP.
     /// @dev Transfers exactly `assets` of underlying to `sender` and burns
     ///      `assets * SCALE / rate` shares rounded UP. Reverts with ZeroAssets on a zero
-    ///      underlying amount and with UnwrapPaused while unwrapping is paused. The rate is
+    ///      underlying amount and with UnwrapIsPaused while unwrapping is paused. The rate is
     ///      unchanged. Only the owner may call.
     /// @param sender The account whose shares are burned and who receives the underlying.
     /// @param assets The exact amount of underlying REP to receive.
@@ -103,10 +103,22 @@ interface ILituusRep is IERC20 {
     /* =============================================== VIEW FUNCTIONS ============================================ */
 
     /// @notice Converts an underlying amount to shares at the stored rate, rounded down.
+    /// @dev The amount of shares a wrap of `assets` mints.
     function convertToShares(uint256 assets) external view returns (uint256 shares);
 
     /// @notice Converts a share amount to underlying at the stored rate, rounded down.
+    /// @dev The amount of underlying an unwrap of `shares` releases.
     function convertToAssets(uint256 shares) external view returns (uint256 assets);
+
+    /// @notice Converts an underlying amount to shares at the stored rate, rounded up.
+    /// @dev The amount of shares an unwrapAssets of `assets` burns: what a caller fixing the
+    ///      underlying to receive must hold. At most one wei above convertToShares.
+    function convertToSharesUp(uint256 assets) external view returns (uint256 shares);
+
+    /// @notice Converts a share amount to underlying at the stored rate, rounded up.
+    /// @dev The amount of underlying a wrapShares of `shares` pulls: what a caller fixing the
+    ///      shares to receive must hold and approve. At most one wei above convertToAssets.
+    function convertToAssetsUp(uint256 shares) external view returns (uint256 assets);
 
     /// @notice The stored exchange rate: underlying assets per share, 1e18-scaled.
     /// @dev Genesis universes start at 1:1; a child universe's vault starts at its parent's rate
@@ -115,7 +127,7 @@ interface ILituusRep is IERC20 {
 
     /// @notice The underlying REP tracked by the internal ledger.
     /// @dev Moves only on wraps and unwraps. Direct underlying transfers to the vault are not
-    ///      reflected here and are unrecoverable.
+    /// reflected here and are unrecoverable.
     function totalAssets() external view returns (uint256);
 
     /// @notice Whether unwrapping is paused.

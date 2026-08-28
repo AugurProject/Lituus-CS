@@ -6,9 +6,10 @@ import { Test } from "forge-std/Test.sol";
 import { LituusRep } from "../../src/LituusRep.sol";
 import { MockERC20 } from "../../src/mock/MockERC20.sol";
 
-/// @notice Basic sanity checks of the LituusRep vault mechanics, exercised directly with the test
-///         contract as the owner: the genesis 1:1 round trip, the burn-driven rate movement with
-///         its effect on every conversion direction, and the unwrap pause switch.
+/// @notice Sanity and property checks of the LituusRep vault mechanics, exercised directly with
+///         the test contract as the owner: round trips in every declaration mode, the burn-driven
+///         rate movement, rounding directions, ledger inertia, dust socialization, the pause
+///         switch, and fuzzed rate/solvency invariants.
 contract LituusRepTest is Test {
     MockERC20 internal underlying;
     LituusRep internal vault;
@@ -27,6 +28,8 @@ contract LituusRepTest is Test {
         vm.prank(bob);
         underlying.approve(address(vault), type(uint256).max);
     }
+
+    /* ================================================ UNIT TESTS =============================================== */
 
     /// @dev At the genesis 1:1 rate every conversion is the identity: wrapping and unwrapping in
     ///      either declaration mode moves exactly the stated amounts, and the ledger follows.
@@ -240,6 +243,25 @@ contract LituusRepTest is Test {
 
         vm.expectRevert(LituusRep.ZeroAssets.selector);
         vault.unwrapAssets(alice, 0);
+    }
+
+    /// @dev The exposed ceiling views mirror the floor views by at most one wei and match what
+    ///      the exact-output functions actually pull and burn.
+    function test_ConvertUpViews_MirrorFloorViews() public {
+        vault.wrap(alice, 100 ether);
+        vm.prank(alice);
+        vault.transfer(address(this), 30 ether);
+        vault.burnShares(30 ether); // rate = 100/70
+
+        // Exact division: up equals down.
+        assertEq(vault.convertToAssets(7 ether), vault.convertToAssetsUp(7 ether));
+
+        // Non-exact: up is exactly one wei above down, and matches the mutating paths.
+        assertEq(vault.convertToShares(10), 7);
+        assertEq(vault.convertToSharesUp(10), 8);
+        uint256 expected = vault.convertToSharesUp(1 ether);
+        assertEq(expected, 0.7 ether + 1);
+        assertEq(vault.unwrapAssets(alice, 1 ether), expected);
     }
 
     /* =============================================== FUZZ HELPERS ============================================== */

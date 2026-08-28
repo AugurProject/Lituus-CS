@@ -202,7 +202,7 @@ contract Multiverse is ReentrancyGuard {
     error QueryTooLong();
     error ZeroFee();
     error ZeroStakeAmount();
-    error AmbiguousAmount();
+    error ExactlyOneAmountRequired();
     error QueryNotInherited();
     error ForkingNotImplemented();
     error QueryNotResolved();
@@ -277,7 +277,9 @@ contract Multiverse is ReentrancyGuard {
         external
         returns (uint256 assets, uint256 shares)
     {
-        if ((assetsToProvide == 0) == (sharesToReceive == 0)) revert AmbiguousAmount();
+        if ((assetsToProvide == 0 && sharesToReceive == 0) || (assetsToProvide != 0 && sharesToReceive != 0)) {
+            revert ExactlyOneAmountRequired();
+        }
 
         // TODO: check universe status
         // TODO: maybe check if some fork is upcoming (some escalation game is close to fork threshold)
@@ -309,7 +311,9 @@ contract Multiverse is ReentrancyGuard {
         external
         returns (uint256 shares, uint256 assets)
     {
-        if ((sharesToProvide == 0) == (assetsToReceive == 0)) revert AmbiguousAmount();
+        if ((sharesToProvide == 0 && assetsToReceive == 0) || (sharesToProvide != 0 && assetsToReceive != 0)) {
+            revert ExactlyOneAmountRequired();
+        }
 
         // TODO: check universe status
         ILituusRep repToken = universes[universeId].repToken;
@@ -520,14 +524,15 @@ contract Multiverse is ReentrancyGuard {
             // whole with no deadline.
             uint256 queryFee = queries[queryId].fee;
             uint256 resolverPay = _timeBasedFeeShare(queryFee, block.timestamp - (queryCreateTime + THREE_DAYS));
+            uint256 profit = queryFee - resolverPay;
             emit ResolverRewardPaid(msg.sender, currentUniverseId, queryId, resolverPay);
             currentUniverse.repToken.safeTransfer(msg.sender, resolverPay);
             // The unpaid fee remainder is the query's profit: recorded for the fee controller and
             // burned as wREP, the same as on the stakes path.
-            if (queryFee - resolverPay > 0) {
-                currentUniverse.repToken.burnShares(queryFee - resolverPay);
+            if (profit > 0) {
+                currentUniverse.repToken.burnShares(profit);
             }
-            _applyProfit(currentUniverseId, queryFee - resolverPay);
+            _applyProfit(currentUniverseId, profit);
 
             emit QueryResolved(msg.sender, currentUniverseId, queryId, INVALID);
         } else if (resolution.stakes.length > 0) {
@@ -696,7 +701,7 @@ contract Multiverse is ReentrancyGuard {
                 sixtyDayVolume = sum;
             } else {
                 for (uint256 i = lastWindow; i < currentThreeDayWindow;) {
-                    // сompleted window enters
+                    // completed window enters
                     sixtyDayVolume += stats.threeDayInfo[i].threeDayVolume; // completed real window enters
                     if (i >= 20) {
                         // Real window leaves; bootstrap never subtracted (no accounting for bootstrap).
