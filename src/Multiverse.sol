@@ -921,12 +921,10 @@ contract Multiverse is ReentrancyGuard {
         else {
             repToken.safeTransfer(reporter, reporterPay);
         }
-        // Burn the whole recorded profit as wREP - the losers' share of the pot plus the unpaid
-        // fee remainder: destroying shares while the vault's asset ledger is untouched raises the
-        // assets-per-share rate, so the burn accrues to every wREP holder ("value to wREP without
-        // value to REP"). The underlying Zoltar REP is never burned here. _applyProfit records the
-        // same amount for the fee controller; recording is accounting, the tokens themselves are
-        // destroyed.
+        // Burn the recorded profit as wREP: the burned fifth of the losing stakes plus the unpaid
+        // fee remainder. Destroying shares while the asset ledger is untouched raises the
+        // assets-per-share rate, so the value accrues to wREP holders; the underlying Zoltar REP
+        // is never burned here. _applyProfit records the same amount for the fee controller.
         if (profit > 0) {
             repToken.burnShares(profit);
         }
