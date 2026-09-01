@@ -186,8 +186,8 @@ contract QueryTokenizerTest is QueryTokenizerFixtures {
         vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, user, 0, oneQuery));
         tokenizer.redeem(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
 
-        // The new holder redeems the transferred query token and is  the query's
-        // creator (asserted inside _redeemToken): the redeem follows the ERC20, not the minter.
+// The new holder redeems the transferred query token and is the query's
+// creator (asserted inside _redeemToken): the redeem follows the ERC20, not the minter.
         (uint256 price,) = _redeemToken(bystander);
         assertEq(price, 1.1 ether);
     }

@@ -275,9 +275,11 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * @notice The Lituus REP token for a universe (the ERC20 the QueryTokenizer pools and pays fees in).
      * @param universeId The universe to read.
      */
-    function repTokenOf(uint248 universeId) external view returns (ILituusRep) {
-        return universes[universeId].repToken;
-    }
+function repTokenOf(uint248 universeId) external view returns (ILituusRep) {
+    UniverseState universeState = universes[universeId].universeState;
+    if (universeState == UniverseState.NotExisting) revert InvalidUniverse();
+    return universes[universeId].repToken;
+}
 
     /**
      * @notice Everything the QueryTokenizer needs to price and pay for a mint, in one call: the
