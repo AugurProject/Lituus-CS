@@ -189,7 +189,7 @@ contract MultiverseCreateQueryTest is MultiverseFixtures {
         underlying.mint(noAllowance, USER_REP_BALANCE);
         vm.startPrank(noAllowance);
         underlying.approve(address(genesisRep), type(uint256).max);
-        multiverse.wrap(GENESIS_UID, USER_REP_BALANCE);
+        multiverse.wrap(GENESIS_UID, USER_REP_BALANCE, 0);
         vm.expectRevert();
         multiverse.createQuery(GENESIS_UID, "q", 3);
         vm.stopPrank();

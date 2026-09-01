@@ -98,11 +98,12 @@ contract MultiverseClaimTest is MultiverseFixtures {
         _claim(user, queryId, 0);
         _claim(bystander, queryId, 2);
 
-        // After every winner has claimed, the query's residual in the contract is exactly the
-        // profit computed at resolution: loserBurn + (fee - reporterPay) = 0.4e18 + 0.75e18.
-        // 6.6 ether was paid out to the winners (5 ether winnerStaked + 1.6 ether totalDistributable).
+        // The whole profit (0.4e18 loser burn + 0.75e18 fee remainder) was destroyed at resolve,
+        // so after every winner has claimed the query leaves nothing behind: the contract paid
+        // 6.6 ether to the winners (5 ether winnerStaked + 1.6 ether totalDistributable) and holds
+        // zero residual.
         assertEq(genesisRep.balanceOf(address(multiverse)), multiverseBalanceBefore - 6.6 ether);
-        assertEq(genesisRep.balanceOf(address(multiverse)), 1.15 ether);
+        assertEq(genesisRep.balanceOf(address(multiverse)), 0);
     }
 
     /*//////////////////////////////////////////////////////////////

@@ -30,8 +30,9 @@ contract MultiverseResolveTest is MultiverseFixtures {
         // the payment should be half of the query fee (half of the time passed)
         // fee = 1 ether, elapsed past the deadline = 36 hours (129600 s), THREE_DAYS = 3 days (259200 s)
         // resolverPay = fee * elapsed / THREE_DAYS = 1e18 * 129600 / 259200 = 0.5e18
+        // The other half of the fee is the query's profit, burned at resolve.
         assertEq(genesisRep.balanceOf(user), userBalanceBefore + 0.5 ether);
-        assertEq(genesisRep.balanceOf(address(multiverse)), multiverseBalanceBefore - 0.5 ether);
+        assertEq(genesisRep.balanceOf(address(multiverse)), multiverseBalanceBefore - 1 ether);
     }
 
     function test_Resolve_Invalid_EmitsEvents() public {
@@ -143,10 +144,10 @@ contract MultiverseResolveTest is MultiverseFixtures {
         vm.warp(START_TIME + 3 days + 36 hours);
         _resolve(bystander, queryId);
 
-        // The contract held only the 1 ether of query fee; it pays the 0.5 ether of resolver share and
-        // keeps the unburned remainder (burn is still TODO in the contract). Nothing is minted or burned.
-        assertEq(genesisRep.balanceOf(address(multiverse)), 0.5 ether);
-        assertEq(genesisRep.totalSupply(), supplyBefore);
+        // The contract held only the 1 ether of query fee; it pays the 0.5 ether of resolver share
+        // and burns the 0.5 ether remainder as the query's profit, leaving nothing behind.
+        assertEq(genesisRep.balanceOf(address(multiverse)), 0);
+        assertEq(genesisRep.totalSupply(), supplyBefore - 0.5 ether);
     }
 
     function test_Resolve_Invalid_BlocksLaterReport() public {
@@ -321,9 +322,11 @@ contract MultiverseResolveTest is MultiverseFixtures {
         // Losers staked 1 ether, BURN_DIVIDER = 5 (20% burn): 1e18 - 1e18 / 5 = 0.8e18
         assertEq(totalDistributable, 0.8 ether);
 
-        // Multi-stake: only the fee reward leaves the contract; stakes await claim().
+        // Multi-stake: the fee reward leaves the contract and the whole profit is destroyed:
+        // 0.2 ether of loser burn (1 ether of losing stakes / BURN_DIVIDER) plus the 0.75 ether
+        // fee remainder. The stakes await claim().
         assertEq(genesisRep.balanceOf(bystander), bystanderBalanceBefore + 0.25 ether);
-        assertEq(genesisRep.balanceOf(address(multiverse)), multiverseBalanceBefore - 0.25 ether);
+        assertEq(genesisRep.balanceOf(address(multiverse)), multiverseBalanceBefore - 1.2 ether);
 
         uint256 bystanderBalanceBeforeClaim = genesisRep.balanceOf(bystander);
         uint256 multiverseBalanceBeforeClaim = genesisRep.balanceOf(address(multiverse));
@@ -365,9 +368,11 @@ contract MultiverseResolveTest is MultiverseFixtures {
         // Losers staked 2 ether, BURN_DIVIDER = 5: 2e18 - 2e18 / 5 = 1.6e18
         assertEq(totalDistributable, 1.6 ether);
 
-        // Multi-stake: only the reporter reward leaves the contract at resolve.
+        // Multi-stake: the reporter reward leaves the contract and the whole profit is destroyed
+        // at resolve: 0.4 ether of loser burn (2 ether of losing stakes / BURN_DIVIDER) plus the
+        // 0.75 ether fee remainder.
         assertEq(genesisRep.balanceOf(user), userBalanceBeforeResolve + 0.25 ether);
-        assertEq(genesisRep.balanceOf(address(multiverse)), multiverseBalanceBeforeResolve - 0.25 ether);
+        assertEq(genesisRep.balanceOf(address(multiverse)), multiverseBalanceBeforeResolve - 1.4 ether);
 
         uint256 userBalanceBeforeClaim = genesisRep.balanceOf(user);
         uint256 multiverseBalanceBeforeUserClaim = genesisRep.balanceOf(address(multiverse));
@@ -535,10 +540,11 @@ contract MultiverseResolveTest is MultiverseFixtures {
 
         _resolve(challenger, queryId);
 
-        // Only the 0.25 ether reporter reward left the contract (1e18 * 64800 / 259200); stakes and the unburned
-        // profit remain held until claim() (burn is still TODO in the contract).
-        assertEq(genesisRep.balanceOf(address(multiverse)), 3.75 ether);
-        assertEq(genesisRep.totalSupply(), supplyBefore);
+        // The 0.25 ether reporter reward left the contract (1e18 * 64800 / 259200) and the whole
+        // profit was destroyed: 0.2 ether of loser burn (1 ether of losing stakes / BURN_DIVIDER)
+        // plus the 0.75 ether fee remainder. Only the stakes stay held until claim().
+        assertEq(genesisRep.balanceOf(address(multiverse)), 2.8 ether);
+        assertEq(genesisRep.totalSupply(), supplyBefore - 0.95 ether);
     }
 
     function test_Resolve_NearThresholdLadder() public {

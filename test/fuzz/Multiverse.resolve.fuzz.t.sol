@@ -98,13 +98,13 @@ contract MultiverseResolveFuzzTest is MultiverseFuzzFixtures {
         assertEq(multiverse.getOutcome(GENESIS_UID, queryId), outcome);
 
         // The creator's fee is spent for good; the reporter's bond (== fee) came back with the
-        // reward ramping over the reporting window; the resolver earns nothing here; the multiverse
-        // keeps the unrewarded fee remainder (burn of profit is still TODO in the contract).
+        // reward ramping over the reporting window; the resolver earns nothing here; the unrewarded
+        // fee remainder is the query's profit, burned at resolve, so the multiverse keeps nothing.
         uint256 expectedReward = DEFAULT_FEE * reportDelay / multiverse.THREE_DAYS();
         assertEq(genesisRep.balanceOf(user), creatorBalanceBefore - DEFAULT_FEE);
         assertEq(genesisRep.balanceOf(reporter), reporterBalanceBefore + expectedReward);
         assertEq(genesisRep.balanceOf(resolver), 0);
-        assertEq(genesisRep.balanceOf(address(multiverse)), DEFAULT_FEE - expectedReward);
+        assertEq(genesisRep.balanceOf(address(multiverse)), 0);
 
         // The sole stake is settled at resolution (amount zeroed), nothing left to claim.
         Multiverse.Stake[] memory stakes = multiverse.getStakes(GENESIS_UID, queryId);
@@ -147,13 +147,12 @@ contract MultiverseResolveFuzzTest is MultiverseFuzzFixtures {
         multiverse.resolve(GENESIS_UID, queryId);
 
         // The creator paid the fee, the reporter netted the ramped reward (bond refunded), and the
-        // resolver earned nothing on this path. Whatever the reward didn't hand out stays in the
-        // multiverse (burn of profit is still TODO in the contract), so it keeps exactly
-        // fee - reward.
+        // resolver earned nothing on this path. Whatever the reward didn't hand out is the query's
+        // profit, burned at resolve, so the multiverse keeps nothing.
         uint256 expectedReward = chargedFee * reportDelay / multiverse.THREE_DAYS();
         assertEq(genesisRep.balanceOf(user), creatorBalanceBefore - chargedFee);
         assertEq(genesisRep.balanceOf(reporter), reporterBalanceBefore + expectedReward);
         assertEq(genesisRep.balanceOf(resolver), 0);
-        assertEq(genesisRep.balanceOf(address(multiverse)), chargedFee - expectedReward);
+        assertEq(genesisRep.balanceOf(address(multiverse)), 0);
     }
 }

@@ -86,7 +86,7 @@ abstract contract MultiverseDeployFixture is Test {
         vm.startPrank(account);
         underlying.approve(address(genesisRep), type(uint256).max);
         genesisRep.approve(address(multiverse), type(uint256).max);
-        multiverse.wrap(GENESIS_UID, amount);
+        multiverse.wrap(GENESIS_UID, amount, 0);
         vm.stopPrank();
     }
 
