@@ -10,11 +10,12 @@ import { ILituusRep } from "./interfaces/ILituusRep.sol";
 import { LituusRep } from "./LituusRep.sol";
 import { IReputationToken } from "./interfaces/IReputationToken.sol";
 import { IQueryFeeController } from "./interfaces/IQueryFeeController.sol";
+import { IMultiverse } from "./interfaces/IMultiverse.sol";
 import { LibHistory } from "./libraries/LibHistory.sol";
 
 // TODO: check zoltar forks
 
-contract Multiverse is ReentrancyGuard {
+contract Multiverse is ReentrancyGuard, IMultiverse {
     using SafeERC20 for IERC20;
     using SafeERC20 for ILituusRep;
 
@@ -279,25 +280,51 @@ contract Multiverse is ReentrancyGuard {
     }
 
     /**
-     * @notice The current query fee for a universe (base fee * demand modifier), computed read-only so
-     *         the QueryTokenizer can price a mint. This is `createQuery`'s pricing formula for this
-     *         universe, but uncapped: it does NOT record volume and does NOT apply the
-     *         `forkThreshold/2` cap (the tokenizer's mintPrice applies its own).
-     * @dev Does NOT forward to the heir: query tokens are universe-specific, so once
-     *      a universe forks, minting (like redeeming) freezes on it and migration is the only path to a
-     *      child. Reverts for a nonexistent universe or one that is no longer Active/Forming, which also
-     *      blocks minting during a fork window.
+     * @notice Everything the QueryTokenizer needs to price and pay for a mint, in one call: the
+     *         uncapped query fee, the fee cap, and the universe's wREP token.
+     * @dev The fee is `createQuery`'s pricing formula (base fee * demand modifier) computed read-only:
+     *      it does NOT record volume and is NOT capped — the tokenizer's mintPrice applies the
+     *      returned cap itself. Does NOT forward to the heir: query tokens are universe-specific, so
+     *      once a universe forks, minting (like redeeming) freezes on it and migration is the only
+     *      path to a child. Reverts for a nonexistent universe or one that is no longer
+     *      Active/Forming, which also blocks minting during a fork window.
      * @param universeId The universe to price.
-     * @return fee The current query fee in REP.
+     * @return uncappedFee The current query fee (base fee * demand modifier, uncapped) in wREP.
+     * @return queryFeeCap The cap on query fees (half the fork threshold) in wREP.
+     * @return repToken The universe's Lituus REP (wREP) token.
      */
-    function previewQueryFeeUncapped(uint248 universeId) external view returns (uint256 fee) {
+    function getMintPricing(uint248 universeId)
+        external
+        view
+        returns (uint256 uncappedFee, uint256 queryFeeCap, ILituusRep repToken)
+    {
         UniverseState universeState = universes[universeId].universeState;
         if (universeState == UniverseState.NotExisting) revert InvalidUniverse();
         if ((universeState != UniverseState.Active) && (universeState != UniverseState.Forming)) {
             revert InvalidUniverseState();
         }
-        uint256 baseFee = QUERY_FEE_CONTROLLER.getQueryFee(universeId);
-        return _previewFee(universeId, baseFee);
+        uncappedFee = _previewFee(universeId, QUERY_FEE_CONTROLLER.getQueryFee(universeId));
+        repToken = universes[universeId].repToken;
+        queryFeeCap = _queryFeeCap(repToken, universeId);
+    }
+
+    /**
+     * @dev The cap on query fees in a universe, in wREP: half its fork threshold. The first report's
+     *      stake equals the query fee, so the cap keeps an opening report below fork level. Applied
+     *      by `createQuery` and (via `getMintPricing`) by the QueryTokenizer's mintPrice. Takes an
+     *      already-loaded repToken to avoid a duplicate storage read.
+     */
+    function _queryFeeCap(ILituusRep repToken, uint248 universeId) internal view returns (uint256) {
+        return _forkThreshold(repToken, universeId) / 2;
+    }
+
+    /**
+     * @dev The fork threshold for a universe in wREP shares: converts the raw Zoltar fork threshold
+     *      (denominated in underlying REP) into wREP shares using the universe's REP vault rate.
+     *      Takes an already-loaded repToken to avoid a duplicate storage read.
+     */
+    function _forkThreshold(ILituusRep repToken, uint248 universeId) internal view returns (uint256) {
+        return repToken.convertToShares(ZOLTAR.getForkThreshold(universeId));
     }
 
     /* ============================================= WRAP FUNCTIONS ============================================== */
@@ -409,8 +436,8 @@ contract Multiverse is ReentrancyGuard {
         if (fee == 0) revert ZeroFee();
         // The first report's stake equals the query fee, clamped down to half the fork threshold by
         // _requiredStakeAmountAndForkThreshold.
-        uint256 forkThreshold = ZOLTAR.getForkThreshold(currentUniverseId) / 2;
-        if (fee >= forkThreshold) fee = forkThreshold;
+        uint256 queryFeeCap = _queryFeeCap(currentUniverse.repToken, currentUniverseId);
+        if (fee >= queryFeeCap) fee = queryFeeCap;
         // transfer the query fee amount of REP token
         // TODO: permit? permit2?
         currentUniverse.repToken.safeTransferFrom(msg.sender, address(this), fee);
@@ -427,7 +454,7 @@ contract Multiverse is ReentrancyGuard {
      *      immediately before this call (push model — no allowance needed), so no `safeTransferFrom`
      *      happens here. From the oracle's viewpoint the query is otherwise identical to a direct
      *      submission: it still counts as demand volume (the redemption is a real query) and
-     *      its fee is distributed/burned normally at resolution. No `forkThreshold/2` cap is applied, so
+     *      its fee is distributed/burned normally at resolution. The `queryFeeCap` is NOT applied, so
      *      the full pool price reaches the oracle.
      *
      *      Does NOT forward to the heir: the QueryTokenizer's pool and the pushed
@@ -549,7 +576,7 @@ contract Multiverse is ReentrancyGuard {
         }
 
         (uint256 requiredStakeAmount, uint256 forkThreshold) =
-            _requiredStakeAmountAndForkThreshold(currentUniverseId, queryId);
+            _requiredStakeAmountAndForkThreshold(currentUniverseId, queryId, currentUniverse.repToken);
         // a zero stake would allow free reports and an escalation ladder stuck at 0.
         if (requiredStakeAmount == 0) revert ZeroStakeAmount();
         // TODO: If the bond before a fork bond is placed so that the next appeal would cause a fork,
@@ -920,8 +947,8 @@ contract Multiverse is ReentrancyGuard {
      *      via the shared `_rolledSixtyDayVolume`. When the cache is fresh — which every recorded query,
      *      redemptions included, keeps it (see `_applyVolume`) — this is a single cached read with no loop;
      *      only a genuinely idle span (no query at all since `lastWindowId`) pays the catch-up, exactly as
-     *      the mutating path would. Returns the UNCAPPED fee: `previewQueryFeeUncapped` exposes it as-is
-     *      and the QueryTokenizer's mintPrice applies its own `forkThreshold/2` cap.
+     *      the mutating path would. Returns the UNCAPPED fee: `getMintPricing` exposes it as-is
+     *      and the QueryTokenizer's mintPrice applies the `queryFeeCap`.
      */
     function _previewFee(uint248 universeId, uint256 baseFee) internal view returns (uint256) {
         UniverseStatistics storage stats = universeStatistics[universeId];
@@ -1308,7 +1335,7 @@ contract Multiverse is ReentrancyGuard {
     {
         if (queries[queryId].numberOfOutcomes == 0) revert InvalidQuery();
         (uint248 currentUniverseId,) = _getCurrentUniverse(universeId);
-        return _requiredStakeAmountAndForkThreshold(currentUniverseId, queryId);
+        return _requiredStakeAmountAndForkThreshold(currentUniverseId, queryId, universes[currentUniverseId].repToken);
     }
 
     /* ========================================= HISTORY FUNCTIONS =========================================== */
@@ -1353,6 +1380,7 @@ contract Multiverse is ReentrancyGuard {
         }
     }
 
+    // TODO: the fork threshold logic will be rewritten together with the new escalation game algorithm
     /**
      * @notice Computes the stake required for the report on a query and the universe's fork threshold.
      * @dev The next stake is the query fee for the first report and double the previous stake for each
@@ -1364,15 +1392,17 @@ contract Multiverse is ReentrancyGuard {
      *      untouched — its own doubling lands exactly on the threshold.
      * @param universeId The (current) universe the query lives in.
      * @param queryId The query being reported on.
+     * @param repToken The universe's wREP token, already loaded by the caller.
      * @return requiredStakeAmount The stake the reporter must post.
      * @return forkThreshold The stake level at which posting triggers a fork.
      */
-    function _requiredStakeAmountAndForkThreshold(uint248 universeId, uint256 queryId)
+    function _requiredStakeAmountAndForkThreshold(uint248 universeId, uint256 queryId, ILituusRep repToken)
         internal
         view
         returns (uint256 requiredStakeAmount, uint256 forkThreshold)
     {
-        forkThreshold = ZOLTAR.getForkThreshold(universeId);
+        forkThreshold = _forkThreshold(repToken, universeId);
+        uint256 halfForkThreshold = forkThreshold / 2;
 
         Stake[] storage stakes = queryResolutions[universeId][queryId].stakes;
         uint256 numberOfStakes = stakes.length;
@@ -1382,7 +1412,6 @@ contract Multiverse is ReentrancyGuard {
         uint256 nextStakeAmount;
         if (numberOfStakes == 0) {
             uint256 fee = queries[queryId].fee;
-            uint256 halfForkThreshold = forkThreshold / 2;
             // Clamp the first stake down so the opening report is never itself a fork trigger.
             nextStakeAmount = fee > halfForkThreshold ? halfForkThreshold : fee;
         } else {
@@ -1392,7 +1421,7 @@ contract Multiverse is ReentrancyGuard {
 
         // Once the next stake exceeds half the fork threshold, clamp it to the full threshold so the
         // escalation ends exactly at the fork level instead of overshooting it on the next doubling.
-        bool reachesForkLevel = nextStakeAmount > forkThreshold / 2;
+        bool reachesForkLevel = nextStakeAmount > halfForkThreshold;
         requiredStakeAmount = reachesForkLevel ? forkThreshold : nextStakeAmount;
     }
 

@@ -2,10 +2,11 @@
 pragma solidity ^0.8.35;
 
 import { Multiverse } from "src/Multiverse.sol";
+import { ILituusRep } from "src/interfaces/ILituusRep.sol";
 import { QueryTokenizerFixtures } from "./QueryTokenizer.fixtures.sol";
 
 /// @notice The Multiverse surface the QueryTokenizer depends on: createQueryFromTokenizer and
-///         previewQueryFeeUncapped.
+///         getMintPricing.
 contract MultiverseTokenizerTest is QueryTokenizerFixtures {
     /*//////////////////////////////////////////////////////////////
                       CREATE QUERY FROM TOKENIZER
@@ -115,12 +116,12 @@ contract MultiverseTokenizerTest is QueryTokenizerFixtures {
     }
 
     function test_CreateQueryFromTokenizer_CountsDemandVolume() public {
-        uint256 previewBefore = multiverse.previewQueryFeeUncapped(GENESIS_UID);
+        uint256 previewBefore = _previewUncappedFee();
 
         vm.prank(address(tokenizer));
         multiverse.createQueryFromTokenizer(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES, 1 ether, user);
 
-        assertGt(multiverse.previewQueryFeeUncapped(GENESIS_UID), previewBefore);
+        assertGt(_previewUncappedFee(), previewBefore);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -138,11 +139,11 @@ contract MultiverseTokenizerTest is QueryTokenizerFixtures {
     }
 
     /*//////////////////////////////////////////////////////////////
-                       PREVIEW QUERY FEE UNCAPPED
+                          GET MINT PRICING
     //////////////////////////////////////////////////////////////*/
-    function test_PreviewQueryFeeUncapped_MatchesChargedFee() public {
+    function test_GetMintPricing_FeeMatchesChargedFee() public {
         // Same block, below the cap: the preview equals exactly what createQuery then charges.
-        uint256 preview = multiverse.previewQueryFeeUncapped(GENESIS_UID);
+        uint256 preview = _previewUncappedFee();
 
         vm.prank(user);
         multiverse.createQuery(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
@@ -154,7 +155,7 @@ contract MultiverseTokenizerTest is QueryTokenizerFixtures {
         // in memory (only the mutating path persists it) and interpolate the partial window —
         // parity must survive a stale cache.
         vm.warp(vm.getBlockTimestamp() + 2 * multiverse.THREE_DAYS() + 1 days);
-        preview = multiverse.previewQueryFeeUncapped(GENESIS_UID);
+        preview = _previewUncappedFee();
         vm.prank(user);
         multiverse.createQuery(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
         (,, chargedFee,) = multiverse.queries(1);
@@ -162,33 +163,37 @@ contract MultiverseTokenizerTest is QueryTokenizerFixtures {
 
         // Idle past 20 windows: the cache roll switches to the full recompute branch.
         vm.warp(vm.getBlockTimestamp() + 21 * multiverse.THREE_DAYS() + 36 hours);
-        preview = multiverse.previewQueryFeeUncapped(GENESIS_UID);
+        preview = _previewUncappedFee();
         vm.prank(user);
         multiverse.createQuery(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
         (,, chargedFee,) = multiverse.queries(2);
         assertEq(chargedFee, preview);
     }
 
-    function test_PreviewQueryFeeUncapped_IsUncapped() public {
+    function test_GetMintPricing_FeeIsUncappedAndCapIsHalfThreshold() public {
         feeCtl.setFee(100 ether);
 
-        // Clean state: demand modifier is exactly 1.0, so the uncapped preview is the raw fee,
-        // above the cap direct queries would apply.
-        assertEq(multiverse.previewQueryFeeUncapped(GENESIS_UID), 100 ether);
-        assertGt(multiverse.previewQueryFeeUncapped(GENESIS_UID), HALF_FORK_THRESHOLD);
+        // Clean state: demand modifier is exactly 1.0, so the uncapped fee is the raw base fee,
+        // above the cap direct queries would apply; the returned cap is half the fork threshold
+        // and the repToken is the universe's wREP.
+        (uint256 uncappedFee, uint256 queryFeeCap, ILituusRep repToken) = multiverse.getMintPricing(GENESIS_UID);
+        assertEq(uncappedFee, 100 ether);
+        assertGt(uncappedFee, HALF_FORK_THRESHOLD);
+        assertEq(queryFeeCap, HALF_FORK_THRESHOLD);
+        assertEq(address(repToken), address(genesisRep));
     }
 
-    function test_PreviewQueryFeeUncapped_HasNoSideEffects() public view {
-        uint256 first = multiverse.previewQueryFeeUncapped(GENESIS_UID);
-        uint256 second = multiverse.previewQueryFeeUncapped(GENESIS_UID);
-        uint256 third = multiverse.previewQueryFeeUncapped(GENESIS_UID);
+    function test_GetMintPricing_HasNoSideEffects() public view {
+        uint256 first = _previewUncappedFee();
+        uint256 second = _previewUncappedFee();
+        uint256 third = _previewUncappedFee();
 
         assertEq(first, second);
         assertEq(second, third);
     }
 
-    function test_RevertWhen_PreviewQueryFeeUncapped_UniverseNotExisting() public {
+    function test_RevertWhen_GetMintPricing_UniverseNotExisting() public {
         vm.expectRevert(Multiverse.InvalidUniverse.selector);
-        multiverse.previewQueryFeeUncapped(GENESIS_UID + 1);
+        multiverse.getMintPricing(GENESIS_UID + 1);
     }
 }

@@ -15,7 +15,7 @@ import { IMultiverse } from "src/interfaces/IMultiverse.sol";
 ///      constructor; each then gets its Multiverse back-reference wired via a one-time, deployer-only
 ///      setter (QueryFeeController.setMultiverse / QueryTokenizer.setMultiverse). Requires an
 ///      already-deployed Zoltar: the Multiverse constructor reads its question-data and REP token
-///      addresses, and the tokenizer reads its fork threshold to cap the mint price.
+///      addresses (the tokenizer reads everything, the mint-price cap included, off the Multiverse).
 ///      Env vars: PRIVATE_KEY, ZOLTAR_ADDRESS, GENESIS_UNIVERSE_ID (the Zoltar universe id
 ///      treated as the Lituus genesis).
 contract Deploy is Script {
@@ -30,7 +30,7 @@ contract Deploy is Script {
 
         vm.startBroadcast(deployerKey);
         queryFeeController = new QueryFeeController(genesisUniverseId);
-        queryTokenizer = new QueryTokenizer(zoltar);
+        queryTokenizer = new QueryTokenizer();
         multiverse = new Multiverse(
             zoltar, genesisUniverseId, IQueryFeeController(address(queryFeeController)), address(queryTokenizer)
         );

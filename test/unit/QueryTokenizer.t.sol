@@ -15,7 +15,6 @@ contract QueryTokenizerTest is QueryTokenizerFixtures {
                         CONSTRUCTOR / SET MULTIVERSE
     //////////////////////////////////////////////////////////////*/
     function test_Constructor_Wiring() public view {
-        assertEq(address(tokenizer.ZOLTAR()), address(zoltar));
         assertEq(address(tokenizer.multiverse()), address(multiverse));
         assertEq(tokenizer.ONE_QUERY(), 1e18);
         assertEq(tokenizer.PREMIUM_NUMERATOR(), 11);
@@ -23,7 +22,7 @@ contract QueryTokenizerTest is QueryTokenizerFixtures {
     }
 
     function test_RevertWhen_SetMultiverse_NotDeployer() public {
-        QueryTokenizer fresh = new QueryTokenizer(zoltar);
+        QueryTokenizer fresh = new QueryTokenizer();
 
         vm.prank(user);
         vm.expectRevert(QueryTokenizer.CannotSet.selector);
@@ -38,7 +37,7 @@ contract QueryTokenizerTest is QueryTokenizerFixtures {
     }
 
     function test_SetMultiverse_SetsOnce() public {
-        QueryTokenizer fresh = new QueryTokenizer(zoltar);
+        QueryTokenizer fresh = new QueryTokenizer();
         assertEq(address(fresh.multiverse()), address(0));
 
         fresh.setMultiverse(IMultiverse(address(multiverse)));
@@ -52,7 +51,7 @@ contract QueryTokenizerTest is QueryTokenizerFixtures {
     function test_MintPrice_IsPreviewFeePlusPremium() public view {
         // Clean state at START_TIME: the demand modifier is exactly 1.0, so the preview equals the
         // controller fee and the mint price is exactly fee × 11/10.
-        uint256 preview = multiverse.previewQueryFeeUncapped(GENESIS_UID);
+        uint256 preview = _previewUncappedFee();
         assertEq(preview, DEFAULT_FEE);
         assertEq(tokenizer.mintPrice(GENESIS_UID), DEFAULT_FEE * 11 / 10);
     }
@@ -62,14 +61,14 @@ contract QueryTokenizerTest is QueryTokenizerFixtures {
         _createDefaultQuery();
         _createDefaultQuery();
 
-        uint256 preview = multiverse.previewQueryFeeUncapped(GENESIS_UID);
+        uint256 preview = _previewUncappedFee();
         assertGt(preview, DEFAULT_FEE);
         assertEq(tokenizer.mintPrice(GENESIS_UID), preview * 11 / 10);
     }
 
     function test_MintPrice_CapBindsAtHalfForkThreshold() public {
         // Pin the fixture constant to the live derivation once, here.
-        assertEq(zoltar.getForkThreshold(GENESIS_UID) / 2, HALF_FORK_THRESHOLD);
+        assertEq(_queryFeeCapWrep(), HALF_FORK_THRESHOLD);
 
         // fee 100 → preview 100 → premium price 110 > 75 → capped.
         feeCtl.setFee(100 ether);
@@ -287,12 +286,12 @@ contract QueryTokenizerTest is QueryTokenizerFixtures {
     function test_Redeem_CountsDemandVolume() public {
         _mintTokens(user, 1);
 
-        uint256 previewBefore = multiverse.previewQueryFeeUncapped(GENESIS_UID);
+        uint256 previewBefore = _previewUncappedFee();
 
         _redeemToken(user);
 
         // The redemption registered as demand: the same-block preview strictly rises.
-        assertGt(multiverse.previewQueryFeeUncapped(GENESIS_UID), previewBefore);
+        assertGt(_previewUncappedFee(), previewBefore);
     }
 
     function test_RevertWhen_Redeem_OracleRejectsQuery_PrepaidRightSurvives() public {
@@ -320,11 +319,11 @@ contract QueryTokenizerTest is QueryTokenizerFixtures {
         uint256 snapshot = vm.snapshotState();
         vm.prank(user);
         multiverse.createQuery(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
-        uint256 previewAfterDirect = multiverse.previewQueryFeeUncapped(GENESIS_UID);
+        uint256 previewAfterDirect = _previewUncappedFee();
         vm.revertToState(snapshot);
 
         _redeemToken(user);
-        assertEq(multiverse.previewQueryFeeUncapped(GENESIS_UID), previewAfterDirect);
+        assertEq(_previewUncappedFee(), previewAfterDirect);
     }
 
     /*//////////////////////////////////////////////////////////////

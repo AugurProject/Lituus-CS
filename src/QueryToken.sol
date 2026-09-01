@@ -18,10 +18,12 @@ import { IQueryToken } from "./interfaces/IQueryToken.sol";
 contract QueryToken is ERC20, Ownable, IQueryToken {
     constructor(address owner, string memory name, string memory symbol) ERC20(name, symbol) Ownable(owner) { }
 
+    /// @inheritdoc IQueryToken
     function mint(address to, uint256 amount) external onlyOwner {
         _mint(to, amount);
     }
 
+    /// @inheritdoc IQueryToken
     function burn(address from, uint256 amount) external onlyOwner {
         _burn(from, amount);
     }

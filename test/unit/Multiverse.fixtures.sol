@@ -47,6 +47,23 @@ abstract contract MultiverseDeployFixture is Test {
     // not test the tokenizer (they use it only to satisfy the constructor).
     address internal queryTokenizerStub = makeAddr("queryTokenizer");
 
+    /// @dev The genesis universe's fork threshold in wREP shares, derived independently of the
+    ///      Multiverse's own conversion (straight through Zoltar + the vault).
+    function _forkThresholdWrep() internal view returns (uint256) {
+        return genesisRep.convertToShares(zoltar.getForkThreshold(GENESIS_UID));
+    }
+
+    /// @dev The genesis universe's query fee cap: half the wREP fork threshold.
+    function _queryFeeCapWrep() internal view returns (uint256) {
+        return _forkThresholdWrep() / 2;
+    }
+
+    /// @dev The genesis universe's uncapped demand-inclusive query fee, read off the production
+    ///      mint-pricing bundle.
+    function _previewUncappedFee() internal view returns (uint256 fee) {
+        (fee,,) = multiverse.getMintPricing(GENESIS_UID);
+    }
+
     /// @dev Deploys the protocol at START_TIME. Funds nothing.
     function setUp() public virtual {
         vm.warp(START_TIME);
@@ -253,7 +270,7 @@ abstract contract MultiverseFixtures is MultiverseDeployFixture {
     /// @return queryId The id of the reported query.
     /// @return forkThreshold The universe's fork threshold at build time.
     function _createNearThresholdLadder() internal returns (uint256 queryId, uint256 forkThreshold) {
-        forkThreshold = zoltar.getForkThreshold(GENESIS_UID);
+        forkThreshold = _forkThresholdWrep();
         // The fixture supply keeps forkThreshold divisible by 8, so the doubling lands exactly
         // on half the threshold with no rounding drift.
         uint256 fee = forkThreshold / 8;

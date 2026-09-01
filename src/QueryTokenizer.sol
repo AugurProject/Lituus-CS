@@ -8,7 +8,6 @@ import { IMultiverse } from "./interfaces/IMultiverse.sol";
 import { IQueryToken } from "./interfaces/IQueryToken.sol";
 import { IQueryTokenizer } from "./interfaces/IQueryTokenizer.sol";
 import { ILituusRep } from "./interfaces/ILituusRep.sol";
-import { IZoltar } from "./interfaces/IZoltar.sol";
 import { QueryToken } from "./QueryToken.sol";
 
 /**
@@ -47,8 +46,6 @@ contract QueryTokenizer is ReentrancyGuard, IQueryTokenizer {
     uint256 public constant PREMIUM_NUMERATOR = 11;
     uint256 public constant PREMIUM_DENOMINATOR = 10;
 
-    // The underlying Zoltar oracle (source of the fork threshold for the mint price cap).
-    IZoltar public immutable ZOLTAR;
     // The deployer, allowed to set the Multiverse address once after it is deployed.
     address private immutable DEPLOYER;
 
@@ -76,10 +73,8 @@ contract QueryTokenizer is ReentrancyGuard, IQueryTokenizer {
     event Redeemed(address indexed redeemer, uint248 indexed universeId, uint256 price);
 
     /* =========================================== CONSTRUCTOR/SETTER ============================================ */
-    /// @param zoltar The underlying Zoltar oracle (used for the fork-threshold cap on the mint price).
-    constructor(IZoltar zoltar) {
+    constructor() {
         DEPLOYER = msg.sender;
-        ZOLTAR = zoltar;
     }
 
     /**
@@ -101,24 +96,20 @@ contract QueryTokenizer is ReentrancyGuard, IQueryTokenizer {
      * @return The mint price per whole query, in Lituus REP.
      */
     function mintPrice(uint248 universeId) public view returns (uint256) {
-        return _mintPrice(multiverse, universeId);
+        (uint256 price,) = _mintPrice(multiverse, universeId);
+        return price;
     }
 
-    /// @dev `mintPrice` body taking the Multiverse as a parameter to reduce storage reads.
-    function _mintPrice(IMultiverse multiverse_, uint248 universeId) internal view returns (uint256) {
-        uint256 price = multiverse_.previewQueryFeeUncapped(universeId) * PREMIUM_NUMERATOR / PREMIUM_DENOMINATOR;
-        // TODO: the fork threshold will be converted to Lituus REP later
-        uint256 cap = ZOLTAR.getForkThreshold(universeId) / 2;
-        return price > cap ? cap : price;
+    /// @dev `mintPrice` body taking the Multiverse as a parameter to reduce storage reads. Also returns
+    ///      the universe's Lituus REP so `mint` prices and pays with a single Multiverse call.
+    function _mintPrice(IMultiverse multiverse_, uint248 universeId) internal view returns (uint256, ILituusRep) {
+        (uint256 uncappedFee, uint256 cap, ILituusRep repToken) = multiverse_.getMintPricing(universeId);
+        uint256 price = uncappedFee * PREMIUM_NUMERATOR / PREMIUM_DENOMINATOR;
+        return (price > cap ? cap : price, repToken);
     }
 
     /* ============================================= CORE ACTIONS =============================================== */
-    /**
-     * @notice Mints `amount` whole Query Tokens for the caller, depositing `mintPrice × amount` REP.
-     * @dev Caller must approve this contract for the universe's Lituus REP.
-     * @param universeId The universe to mint tokens for.
-     * @param amount Number of whole query rights to mint.
-     */
+    /// @inheritdoc IQueryTokenizer
     function mint(uint248 universeId, uint256 amount) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
         IMultiverse multiverse_ = multiverse;
@@ -126,9 +117,10 @@ contract QueryTokenizer is ReentrancyGuard, IQueryTokenizer {
         // Price first: _mintPrice reverts for a nonexistent or non-current universe, so no QueryToken
         // is ever deployed for an invalid universe. A zero cost is rejected — free tokens would dilute
         // the pool average for every existing holder.
-        uint256 cost = _mintPrice(multiverse_, universeId) * amount;
+        (uint256 price, ILituusRep repToken) = _mintPrice(multiverse_, universeId);
+        uint256 cost = price * amount;
         if (cost == 0) revert ZeroCost();
-        multiverse_.repTokenOf(universeId).safeTransferFrom(msg.sender, address(this), cost);
+        repToken.safeTransferFrom(msg.sender, address(this), cost);
         pooledRep[universeId] += cost;
 
         IQueryToken queryToken = _getOrDeployToken(universeId);
@@ -136,16 +128,7 @@ contract QueryTokenizer is ReentrancyGuard, IQueryTokenizer {
         emit Minted(msg.sender, universeId, amount, cost);
     }
 
-    /**
-     * @notice Redeems one whole Query Token: destroys it and creates a normal Query in the oracle on the
-     *         caller's behalf, paying the pool's per-token average as the fee.
-     * @dev Removing exactly the average leaves the average unchanged for remaining holders. The fee is
-     *      recorded whole, uncapped — if it exceeds half the fork threshold, the oracle clamps the first
-     *      report's stake instead of the fee.
-     * @param universeId The universe to redeem in.
-     * @param question The question text for the created query.
-     * @param numberOfOutcomes The number of reportable outcomes.
-     */
+    /// @inheritdoc IQueryTokenizer
     function redeem(uint248 universeId, string calldata question, uint8 numberOfOutcomes) external nonReentrant {
         IQueryToken queryToken = token[universeId];
         if (address(queryToken) == address(0)) revert QueryTokenNotExisting();
@@ -170,18 +153,7 @@ contract QueryTokenizer is ReentrancyGuard, IQueryTokenizer {
     }
 
     /* ============================================ FORK MIGRATION =============================================== */
-    /**
-     * @notice Migrates `amount` whole Query Tokens from a forking parent universe to a chosen child.
-     *         NOT IMPLEMENTED YET — reverts.
-     * @dev Intended semantics (pending the core fork workstream): during the fork window the holder picks
-     *      a child universe; the parent tokens burn, the matching pool share of Lituus REP migrates via
-     *      the Multiverse (which custodies the sibling-universe REP), the migrated amount counts as a vote
-     *      for the chosen universe, and equivalent child Query Tokens are minted to the holder. Unmigrated
-     *      tokens are destroyed along with their share of the pool once the window closes.
-     * @param parentUniverseId The forking (parent) universe.
-     * @param childUniverseId The child universe to migrate into.
-     * @param amount Number of whole query rights to migrate.
-     */
+    /// @inheritdoc IQueryTokenizer
     function migrate(uint248 parentUniverseId, uint248 childUniverseId, uint256 amount) external nonReentrant {
         // Statement-expressions silence the unused-parameter warnings; the named parameters document
         // the intended future interface.
@@ -195,6 +167,7 @@ contract QueryTokenizer is ReentrancyGuard, IQueryTokenizer {
     function _getOrDeployToken(uint248 universeId) internal returns (IQueryToken queryToken) {
         queryToken = token[universeId];
         if (address(queryToken) == address(0)) {
+            // TODO: token naming (same pattern as Lituus REP)
             queryToken = IQueryToken(address(new QueryToken(address(this), "Lituus Query Token", "QT")));
             token[universeId] = queryToken;
             emit QueryTokenDeployed(universeId, address(queryToken));

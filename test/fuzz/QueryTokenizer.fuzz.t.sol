@@ -16,11 +16,11 @@ contract QueryTokenizerFuzzTest is QueryTokenizerFixtures {
         feeCtl.setFee(fee);
 
         // Clean state: the demand modifier is exactly 1.0, so the uncapped preview is the raw fee.
-        uint256 preview = multiverse.previewQueryFeeUncapped(GENESIS_UID);
+        uint256 preview = _previewUncappedFee();
         assertEq(preview, fee);
 
         // `expected` never exceeds the cap by construction
-        uint256 cap = zoltar.getForkThreshold(GENESIS_UID) / 2;
+        uint256 cap = _queryFeeCapWrep();
         uint256 uncappedPrice = preview * 11 / 10;
         uint256 expected = uncappedPrice > cap ? cap : uncappedPrice;
 
