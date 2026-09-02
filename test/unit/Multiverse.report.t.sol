@@ -594,7 +594,7 @@ contract MultiverseReportTest is MultiverseFixtures {
 
         (uint256 requiredStake, uint256 forkThreshold) = multiverse.getNextRequiredStake(GENESIS_UID, queryId);
         assertEq(requiredStake, DEFAULT_FEE);
-        assertEq(forkThreshold, zoltar.getForkThreshold(GENESIS_UID));
+        assertEq(forkThreshold, _forkThresholdWrep());
     }
 
     function test_GetNextRequiredStake_SecondStakeDoubles() public {
@@ -620,7 +620,7 @@ contract MultiverseReportTest is MultiverseFixtures {
     }
 
     function test_GetNextRequiredStake_ClampsToThreshold() public {
-        uint256 forkThreshold = zoltar.getForkThreshold(GENESIS_UID);
+        uint256 forkThreshold = _forkThresholdWrep();
         // Pick a fee below half the threshold (accepted by createQuery, not clamped as a first
         // stake) whose doubling reaches half the threshold.
         uint256 fee = forkThreshold / 3;

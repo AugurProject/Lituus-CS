@@ -43,6 +43,26 @@ abstract contract MultiverseDeployFixture is Test {
     address internal user = makeAddr("user");
     address internal bystander = makeAddr("bystander");
     address internal challenger = makeAddr("challenger");
+    // Stub address for the query tokenizer: the Multiverse requires it nonzero, but these suites do
+    // not test the tokenizer (they use it only to satisfy the constructor).
+    address internal queryTokenizerStub = makeAddr("queryTokenizer");
+
+    /// @dev The genesis universe's fork threshold in wREP shares, derived independently of the
+    ///      Multiverse's own conversion (straight through Zoltar + the vault).
+    function _forkThresholdWrep() internal view returns (uint256) {
+        return genesisRep.convertToShares(zoltar.getForkThreshold(GENESIS_UID));
+    }
+
+    /// @dev The genesis universe's query fee cap: half the wREP fork threshold.
+    function _queryFeeCapWrep() internal view returns (uint256) {
+        return _forkThresholdWrep() / 2;
+    }
+
+    /// @dev The genesis universe's uncapped demand-inclusive query fee, read off the production
+    ///      mint-pricing bundle.
+    function _previewUncappedFee() internal view returns (uint256 fee) {
+        (fee,,) = multiverse.getMintPricing(GENESIS_UID);
+    }
 
     /// @dev Deploys the protocol at START_TIME. Funds nothing.
     function setUp() public virtual {
@@ -54,7 +74,7 @@ abstract contract MultiverseDeployFixture is Test {
         IQueryFeeController controller = _deployFeeController();
         multiverse = _deployMultiverse(controller);
 
-        (ILituusRep repToken,,,,,,,,,,,,,) = multiverse.universes(GENESIS_UID);
+        (ILituusRep repToken,,,,,,,,,,,,) = multiverse.universes(GENESIS_UID);
         genesisRep = repToken;
 
         _afterProtocolDeploy();
@@ -74,7 +94,7 @@ abstract contract MultiverseDeployFixture is Test {
     /// @dev Multiverse deploy hook: the production contract by default. Suites that need a test
     ///      harness (e.g. exposing internal views) override this.
     function _deployMultiverse(IQueryFeeController controller) internal virtual returns (Multiverse) {
-        return new Multiverse(zoltar, GENESIS_UID, controller);
+        return new Multiverse(zoltar, GENESIS_UID, controller, queryTokenizerStub);
     }
 
     /// @dev Funding tool (not invoked here): mint underlying, wrap into REP, approve the multiverse.
@@ -250,7 +270,7 @@ abstract contract MultiverseFixtures is MultiverseDeployFixture {
     /// @return queryId The id of the reported query.
     /// @return forkThreshold The universe's fork threshold at build time.
     function _createNearThresholdLadder() internal returns (uint256 queryId, uint256 forkThreshold) {
-        forkThreshold = zoltar.getForkThreshold(GENESIS_UID);
+        forkThreshold = _forkThresholdWrep();
         // The fixture supply keeps forkThreshold divisible by 8, so the doubling lands exactly
         // on half the threshold with no rounding drift.
         uint256 fee = forkThreshold / 8;

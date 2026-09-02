@@ -8,9 +8,12 @@ import { MultiverseDeployFixture } from "./Multiverse.fixtures.sol";
 
 /// @notice Test harness exposing the internal profit view as an external function.
 contract MultiverseHarness is Multiverse {
-    constructor(IZoltar zoltar, uint248 genesisUniverseId, IQueryFeeController queryFeeController)
-        Multiverse(zoltar, genesisUniverseId, queryFeeController)
-    { }
+    constructor(
+        IZoltar zoltar,
+        uint248 genesisUniverseId,
+        IQueryFeeController queryFeeController,
+        address queryTokenizer
+    ) Multiverse(zoltar, genesisUniverseId, queryFeeController, queryTokenizer) { }
 
     function exposed_getProfits(uint248 universeId) external view returns (uint256, uint256) {
         return _getProfits(universeId);
@@ -28,7 +31,7 @@ contract MultiverseProfitsTest is MultiverseDeployFixture {
     MultiverseHarness internal harness;
 
     function _deployMultiverse(IQueryFeeController controller) internal override returns (Multiverse) {
-        harness = new MultiverseHarness(zoltar, GENESIS_UID, controller);
+        harness = new MultiverseHarness(zoltar, GENESIS_UID, controller, queryTokenizerStub);
         return Multiverse(address(harness));
     }
 

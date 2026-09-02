@@ -10,11 +10,12 @@ import { ILituusRep } from "./interfaces/ILituusRep.sol";
 import { LituusRep } from "./LituusRep.sol";
 import { IReputationToken } from "./interfaces/IReputationToken.sol";
 import { IQueryFeeController } from "./interfaces/IQueryFeeController.sol";
+import { IMultiverse } from "./interfaces/IMultiverse.sol";
 import { LibHistory } from "./libraries/LibHistory.sol";
 
 // TODO: check zoltar forks
 
-contract Multiverse is ReentrancyGuard {
+contract Multiverse is ReentrancyGuard, IMultiverse {
     using SafeERC20 for IERC20;
     using SafeERC20 for ILituusRep;
 
@@ -51,6 +52,9 @@ contract Multiverse is ReentrancyGuard {
     // The ZoltarQuestionData contract is immutable in Zoltar so it can be cached here.
     IZoltarQuestionData public immutable ZOLTAR_QUESTION_DATA;
     IQueryFeeController public immutable QUERY_FEE_CONTROLLER;
+    // The QueryTokenizer allowed to create queries at a tokenizer-supplied price.
+    // One immutable contract serves every universe.
+    address public immutable QUERY_TOKENIZER;
 
     /* ================================================== ENUMS ================================================== */
     enum UniverseState {
@@ -123,7 +127,6 @@ contract Multiverse is ReentrancyGuard {
         // (<= 100M * 1e18), both comfortably within uint128.
         uint128 forkQuery;
         uint128 supplyBeforeFork;
-        address queryTokenizer;
         uint8 forkOutcome;
         bool isLituusFork; // If it's not Lituus fork then no payouts are necessary
     }
@@ -211,6 +214,7 @@ contract Multiverse is ReentrancyGuard {
     error NotStakeOwner();
     error InvalidClaimBatch();
     error InvalidStakeIndex();
+    error OnlyQueryTokenizer();
 
     /* =============================================== CONSTRUCTOR =============================================== */
     /**
@@ -219,8 +223,17 @@ contract Multiverse is ReentrancyGuard {
      * @param _initialZoltarUniverseId The Zoltar universe id treated as the Lituus genesis. It is also
      * the genesis universe's id here: Lituus universe ids mirror Zoltar universe ids.
      * @param _queryFeeController The controller owning each universe's monthly base fee.
+     * @param _queryTokenizer The QueryTokenizer allowed to create queries at a tokenizer-supplied price
+     * (one immutable contract for all universes).
      */
-    constructor(IZoltar _zoltar, uint248 _initialZoltarUniverseId, IQueryFeeController _queryFeeController) {
+    constructor(
+        IZoltar _zoltar,
+        uint248 _initialZoltarUniverseId,
+        IQueryFeeController _queryFeeController,
+        address _queryTokenizer
+    ) {
+        QUERY_TOKENIZER = _queryTokenizer;
+        if (QUERY_TOKENIZER == address(0)) revert ZeroAddress();
         ZOLTAR = _zoltar;
         if (address(ZOLTAR) == address(0)) revert ZeroAddress();
         ZOLTAR_QUESTION_DATA = ZOLTAR.zoltarQuestionData();
@@ -252,10 +265,68 @@ contract Multiverse is ReentrancyGuard {
         genesisUniverse.forkQuery = 0;
         // TODO: fill in the correct supply
         genesisUniverse.supplyBeforeFork = uint128(ZOLTAR.getUniverseTheoreticalSupply(_initialZoltarUniverseId));
-        genesisUniverse.queryTokenizer = address(0);
 
         GENESIS_TIMESTAMP = block.timestamp;
         BOOT_PROFIT = 2 * QUERY_FEE_CONTROLLER.INITIAL_BASE_FEE();
+    }
+
+    /* ======================================= QUERY TOKENIZER FUNCTIONS ========================================= */
+    /**
+     * @notice The Lituus REP token for a universe (the ERC20 the QueryTokenizer pools and pays fees in).
+     * @param universeId The universe to read.
+     */
+    function repTokenOf(uint248 universeId) external view returns (ILituusRep) {
+        UniverseState universeState = universes[universeId].universeState;
+        if (universeState == UniverseState.NotExisting) revert InvalidUniverse();
+        return universes[universeId].repToken;
+    }
+
+    /**
+     * @notice Everything the QueryTokenizer needs to price and pay for a mint, in one call: the
+     *         uncapped query fee, the fee cap, and the universe's wREP token.
+     * @dev The fee is `createQuery`'s pricing formula (base fee * demand modifier) computed read-only:
+     *      it does NOT record volume and is NOT capped — the tokenizer's mintPrice applies the
+     *      returned cap itself. Does NOT forward to the heir: query tokens are universe-specific, so
+     *      once a universe forks, minting (like redeeming) freezes on it and migration is the only
+     *      path to a child. Reverts for a nonexistent universe or one that is no longer
+     *      Active/Forming, which also blocks minting during a fork window.
+     * @param universeId The universe to price.
+     * @return uncappedFee The current query fee (base fee * demand modifier, uncapped) in wREP.
+     * @return queryFeeCap The cap on query fees (half the fork threshold) in wREP.
+     * @return repToken The universe's Lituus REP (wREP) token.
+     */
+    function getMintPricing(uint248 universeId)
+        external
+        view
+        returns (uint256 uncappedFee, uint256 queryFeeCap, ILituusRep repToken)
+    {
+        UniverseState universeState = universes[universeId].universeState;
+        if (universeState == UniverseState.NotExisting) revert InvalidUniverse();
+        if ((universeState != UniverseState.Active) && (universeState != UniverseState.Forming)) {
+            revert InvalidUniverseState();
+        }
+        uncappedFee = _previewFee(universeId, QUERY_FEE_CONTROLLER.getQueryFee(universeId));
+        repToken = universes[universeId].repToken;
+        queryFeeCap = _queryFeeCap(repToken, universeId);
+    }
+
+    /**
+     * @dev The cap on query fees in a universe, in wREP: half its fork threshold. The first report's
+     *      stake equals the query fee, so the cap keeps an opening report below fork level. Applied
+     *      by `createQuery` and (via `getMintPricing`) by the QueryTokenizer's mintPrice. Takes an
+     *      already-loaded repToken to avoid a duplicate storage read.
+     */
+    function _queryFeeCap(ILituusRep repToken, uint248 universeId) internal view returns (uint256) {
+        return _forkThreshold(repToken, universeId) / 2;
+    }
+
+    /**
+     * @dev The fork threshold for a universe in wREP shares: converts the raw Zoltar fork threshold
+     *      (denominated in underlying REP) into wREP shares using the universe's REP vault rate.
+     *      Takes an already-loaded repToken to avoid a duplicate storage read.
+     */
+    function _forkThreshold(ILituusRep repToken, uint248 universeId) internal view returns (uint256) {
+        return repToken.convertToShares(ZOLTAR.getForkThreshold(universeId));
     }
 
     /* ============================================= WRAP FUNCTIONS ============================================== */
@@ -331,11 +402,11 @@ contract Multiverse is ReentrancyGuard {
      * @notice Creates a query in a universe, charging the dynamic fee and recording it as demand volume.
      * @dev Fee = controller base fee times the short-term demand modifier (see _calculateFeeAndApplyVolume).
      *      The query is counted in the current 3-day volume bucket only after its own fee is computed.
-     *      The fee must be nonzero and is capped at half the universe's fork threshold — the fee doubles
-     *      as the first report's stake, and any stake exceeding half the threshold is clamped up to the
-     *      full threshold (a fork-level stake), so an uncapped fee above half would make the very first
-     *      report the fork trigger. At the cap, the first report is an ordinary stake and the fork level
-     *      can only be reached by escalating (the second report).
+     *      The fee must be nonzero and is capped at half the universe's fork threshold — the first
+     *      report's stake equals the query fee, and the report path clamps any first stake down to half
+     *      the threshold.
+     *      At the cap, the first report is an ordinary stake and the fork level can only be reached by
+     *      escalating (the second report lands on the threshold).
      * @param universeId The universe to create the query in (forwarded to the heir if it has forked).
      * @param question The question text alongside the possible answers (to be checked).
      * @param numberOfOutcomes The number of reportable outcomes (UNRESOLVED and INVALID are always available
@@ -365,16 +436,79 @@ contract Multiverse is ReentrancyGuard {
         // calculate the fee depending on previous volume and update the volume
         uint256 fee = _calculateFeeAndApplyVolume(currentUniverseId, baseFee);
         if (fee == 0) revert ZeroFee();
-        // The first report's stake equals the query fee, and any stake that exceeds half the fork
-        // threshold is clamped up to the full threshold (a fork-level stake) — the same rule
-        // _requiredStakeAmountAndForkThreshold applies. Capping the fee at exactly half keeps the
-        // first report an ordinary stake; the fork level can then only be reached by escalating.
-        uint256 forkThreshold = ZOLTAR.getForkThreshold(currentUniverseId) / 2;
-        if (fee >= forkThreshold) fee = forkThreshold;
+        // The first report's stake equals the query fee, clamped down to half the fork threshold by
+        // _requiredStakeAmountAndForkThreshold.
+        uint256 queryFeeCap = _queryFeeCap(currentUniverse.repToken, currentUniverseId);
+        if (fee >= queryFeeCap) fee = queryFeeCap;
         // transfer the query fee amount of REP token
         // TODO: permit? permit2?
         currentUniverse.repToken.safeTransferFrom(msg.sender, address(this), fee);
 
+        _recordQuery(msg.sender, currentUniverseId, question, numberOfOutcomes, fee);
+    }
+
+    /**
+     * @notice Creates a query on behalf of the Query Tokenizer protocol, paying a tokenizer-supplied price
+     *         instead of the live dynamic fee.
+     * @dev Enables Query Tokenizer: the authorized, immutable
+     *      QueryTokenizer may pay a *different* price (the pool's per-token average) than `createQuery`
+     *      would charge. The QueryTokenizer transfers `fee` of the universe's REP to this contract
+     *      immediately before this call (push model — no allowance needed), so no `safeTransferFrom`
+     *      happens here. From the oracle's viewpoint the query is otherwise identical to a direct
+     *      submission: it still counts as demand volume (the redemption is a real query) and
+     *      its fee is distributed/burned normally at resolution. The `queryFeeCap` is NOT applied, so
+     *      the full pool price reaches the oracle.
+     *
+     *      Does NOT forward to the heir: the QueryTokenizer's pool and the pushed
+     *      fee are denominated in the current universe's REP, so forwarding would mix up the REP tokens,
+     *      bypassing migration. Once the universe forks, redemption freezes here and
+     *      migration is the only path to a child.
+     * @param universeId The universe to create the query in (must be Active/Forming itself; never forwarded).
+     * @param question The question text alongside the possible answers.
+     * @param numberOfOutcomes The number of reportable outcomes.
+     * @param fee The price the QueryTokenizer pays (the redeemed token's pooled average), already sent here.
+     * @param creator The redeemer the query is created on behalf of.
+     */
+    function createQueryFromTokenizer(
+        uint248 universeId,
+        string calldata question,
+        uint8 numberOfOutcomes,
+        uint256 fee,
+        address creator
+    ) external nonReentrant {
+        if (msg.sender != QUERY_TOKENIZER) revert OnlyQueryTokenizer();
+        UniverseState universeState = universes[universeId].universeState;
+        if (universeState == UniverseState.NotExisting) revert InvalidUniverse();
+        if ((universeState != UniverseState.Active) && (universeState != UniverseState.Forming)) {
+            revert InvalidUniverseState();
+        }
+
+        if (numberOfOutcomes < MIN_OUTCOMES) revert InvalidNumberOfOutcomes();
+        if (numberOfOutcomes > MAX_OUTCOMES) revert InvalidNumberOfOutcomes();
+        if (bytes(question).length > MAX_QUERY_LENGTH) revert QueryTooLong();
+        if (fee == 0) revert ZeroFee();
+
+        // Count the redemption as demand volume like a direct query. The charged fee is the
+        // tokenizer-supplied `fee`, so only the volume increment is needed.
+        _applyVolume(universeId);
+
+        // The QueryTokenizer already transferred `fee` of this universe's REP to this contract.
+        _recordQuery(creator, universeId, question, numberOfOutcomes, fee);
+    }
+
+    /**
+     * @notice Writes the global query record and per-universe resolution, emits QueryCreated, bumps the
+     *         query counter. Shared by `createQuery` and `createQueryFromTokenizer`.
+     * @dev `creator` is emitted as QueryCreated's creator: the caller for direct queries, the redeemer
+     *      for tokenizer queries — the tokenizer contract itself is never the attributed creator.
+     */
+    function _recordQuery(
+        address creator,
+        uint248 currentUniverseId,
+        string calldata question,
+        uint8 numberOfOutcomes,
+        uint256 fee
+    ) internal {
         Query storage query = queries[queryCount];
         query.numberOfOutcomes = numberOfOutcomes;
         query.originUniverse = currentUniverseId;
@@ -386,7 +520,7 @@ contract Multiverse is ReentrancyGuard {
         QueryResolution storage resolution = queryResolutions[currentUniverseId][queryCount];
         resolution.queryCreateTime = uint48(block.timestamp);
 
-        emit QueryCreated(msg.sender, queryCount, currentUniverseId, question, numberOfOutcomes);
+        emit QueryCreated(creator, queryCount, currentUniverseId, question, numberOfOutcomes);
 
         queryCount++;
     }
@@ -444,7 +578,7 @@ contract Multiverse is ReentrancyGuard {
         }
 
         (uint256 requiredStakeAmount, uint256 forkThreshold) =
-            _requiredStakeAmountAndForkThreshold(currentUniverseId, queryId);
+            _requiredStakeAmountAndForkThreshold(currentUniverseId, queryId, currentUniverse.repToken);
         // a zero stake would allow free reports and an escalation ladder stuck at 0.
         if (requiredStakeAmount == 0) revert ZeroStakeAmount();
         // TODO: If the bond before a fork bond is placed so that the next appeal would cause a fork,
@@ -680,45 +814,9 @@ contract Multiverse is ReentrancyGuard {
     function _calculateFeeAndApplyVolume(uint248 universeId, uint256 baseFee) internal returns (uint256 fee) {
         UniverseStatistics storage stats = universeStatistics[universeId];
         uint256 currentThreeDayWindow = _getCurrentThreeDayWindow();
-        uint256 lastWindow = stats.lastWindowId;
 
-        // Roll the running sum forward. Storage holds REAL volume only — bootstrap is never stored,
-        // so nothing bootstrap-related is added or subtracted here.
-        if (currentThreeDayWindow > lastWindow) {
-            uint256 sixtyDayVolume = stats.sixtyDayVolume;
-            if (currentThreeDayWindow - lastWindow >= 20) {
-                // Idle >= 60 days: every real window in range rolled out; recompute from real storage only.
-                uint256 sum;
-                for (uint256 i = 1; i <= 20;) {
-                    // real window only; a window c-i predating genesis contributes 0 (bootstrap is not stored)
-                    if (currentThreeDayWindow >= i) {
-                        sum += stats.threeDayInfo[currentThreeDayWindow - i].threeDayVolume;
-                    }
-                    unchecked {
-                        i += 1;
-                    }
-                }
-                sixtyDayVolume = sum;
-            } else {
-                for (uint256 i = lastWindow; i < currentThreeDayWindow;) {
-                    // completed window enters
-                    sixtyDayVolume += stats.threeDayInfo[i].threeDayVolume; // completed real window enters
-                    if (i >= 20) {
-                        // Real window leaves; bootstrap never subtracted (no accounting for bootstrap).
-                        sixtyDayVolume -= stats.threeDayInfo[i - 20].threeDayVolume;
-                    }
-                    unchecked {
-                        i += 1;
-                    }
-                }
-            }
-            // running query count over the window range, far below the uint128 max
-            // forge-lint: disable-next-line(unsafe-typecast)
-            stats.sixtyDayVolume = uint128(sixtyDayVolume);
-            // 3-day window index since genesis, far below the uint128 max
-            // forge-lint: disable-next-line(unsafe-typecast)
-            stats.lastWindowId = uint128(currentThreeDayWindow);
-        }
+        // Advance the incremental 60-day cache to the current window before reading it below.
+        _rollVolumeWindow(stats, currentThreeDayWindow);
 
         // fraction of the current window elapsed, in [0, SCALE)
         uint256 proportionOfCurrentWindow = ((block.timestamp - GENESIS_TIMESTAMP) % THREE_DAYS) * SCALE / THREE_DAYS;
@@ -749,10 +847,144 @@ contract Multiverse is ReentrancyGuard {
 
         fee = baseFee * _calculateCurveModifier(lastSixtyDayVolume, lastThreeDayVolume) / SCALE;
 
-        // count this query for future fees
-        // a per-window query count, far below the uint128 max
+        // count this query in the current demand-volume bucket for future fees; the cache is already
+        // rolled above, so increment directly rather than re-rolling via _applyVolume. Nothing has
+        // written the bucket since `currentVolume` was read, so reuse it instead of re-reading.
         // forge-lint: disable-next-line(unsafe-typecast)
         stats.threeDayInfo[currentThreeDayWindow].threeDayVolume = uint128(currentVolume + 1);
+    }
+
+    /**
+     * @notice Rolls the 60-day cache forward, then records one query in the current 3-day demand-volume
+     *         bucket, without computing any fee.
+     * @dev The lightweight half of `_calculateFeeAndApplyVolume`. `createQueryFromTokenizer` uses it to
+     *      count a redemption as demand. Rolls the cache first (like the organic `createQuery` path) so a
+     *      token-only stretch — redemptions recording volume with no organic query in between — never lets
+     *      the cache go stale.
+     * @param universeId The universe whose current volume bucket to increment.
+     */
+    function _applyVolume(uint248 universeId) internal {
+        UniverseStatistics storage stats = universeStatistics[universeId];
+        uint256 currentThreeDayWindow = _getCurrentThreeDayWindow();
+        _rollVolumeWindow(stats, currentThreeDayWindow);
+        // a per-window query count, far below the uint128 max
+        // forge-lint: disable-next-line(unsafe-typecast)
+        stats.threeDayInfo[currentThreeDayWindow].threeDayVolume =
+            uint128(stats.threeDayInfo[currentThreeDayWindow].threeDayVolume + 1);
+    }
+
+    /**
+     * @notice Advances the incremental 60-day volume cache (`sixtyDayVolume` + `lastWindowId`) to the
+     *         current window, persisting the result.
+     * @dev The single writer of the cache, shared by every query-recording path (organic and tokenizer),
+     *      so the cache stays fresh no matter which path last recorded volume. A no-op when the current
+     *      window already equals `lastWindowId` — at most one real roll happens per universe per window.
+     * @param stats The universe's statistics storage.
+     * @param currentThreeDayWindow The current 3-day window index.
+     */
+    function _rollVolumeWindow(UniverseStatistics storage stats, uint256 currentThreeDayWindow) internal {
+        uint256 lastWindow = stats.lastWindowId;
+        if (currentThreeDayWindow <= lastWindow) return;
+
+        uint256 sixtyDayVolume = _rolledSixtyDayVolume(stats, currentThreeDayWindow, lastWindow, stats.sixtyDayVolume);
+        // running query count over the window range, far below the uint128 max
+        // forge-lint: disable-next-line(unsafe-typecast)
+        stats.sixtyDayVolume = uint128(sixtyDayVolume);
+        // 3-day window index since genesis, far below the uint128 max
+        // forge-lint: disable-next-line(unsafe-typecast)
+        stats.lastWindowId = uint128(currentThreeDayWindow);
+    }
+
+    /**
+     * @notice Rolls a cached 60-day volume from `lastWindow` up to `currentThreeDayWindow`, read-only.
+     * @dev Storage holds REAL volume only — bootstrap is never stored, so nothing bootstrap-related is
+     *      added or subtracted here. Shared by the mutating `_rollVolumeWindow` (which persists the result)
+     *      and the `view` `_previewFee` (which cannot persist), keeping the window math in exactly one place.
+     * @param stats The universe's statistics storage.
+     * @param currentThreeDayWindow The window to roll the cache up to.
+     * @param lastWindow The window the cache is currently anchored at.
+     * @param cachedSixtyDayVolume The cached sum as of `lastWindow`.
+     * @return sixtyDayVolume The 60-day running sum as of `currentThreeDayWindow`.
+     */
+    function _rolledSixtyDayVolume(
+        UniverseStatistics storage stats,
+        uint256 currentThreeDayWindow,
+        uint256 lastWindow,
+        uint256 cachedSixtyDayVolume
+    ) internal view returns (uint256 sixtyDayVolume) {
+        sixtyDayVolume = cachedSixtyDayVolume;
+        if (currentThreeDayWindow <= lastWindow) return sixtyDayVolume;
+
+        if (currentThreeDayWindow - lastWindow >= 20) {
+            // Idle >= 60 days: every real window in range rolled out; recompute from real storage only.
+            uint256 sum;
+            for (uint256 i = 1; i <= 20;) {
+                // real window only; a window c-i predating genesis contributes 0 (bootstrap is not stored)
+                if (currentThreeDayWindow >= i) {
+                    sum += stats.threeDayInfo[currentThreeDayWindow - i].threeDayVolume;
+                }
+                unchecked {
+                    i += 1;
+                }
+            }
+            sixtyDayVolume = sum;
+        } else {
+            for (uint256 i = lastWindow; i < currentThreeDayWindow;) {
+                sixtyDayVolume += stats.threeDayInfo[i].threeDayVolume; // completed real window enters
+                if (i >= 20) {
+                    // Real window leaves; bootstrap never subtracted (no accounting for bootstrap).
+                    sixtyDayVolume -= stats.threeDayInfo[i - 20].threeDayVolume;
+                }
+                unchecked {
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    /**
+     * @notice Read-only twin of `_calculateFeeAndApplyVolume`'s fee computation: `baseFee × demandModifier`,
+     *         WITHOUT rolling the volume cache forward or recording the query.
+     * @dev A `view` cannot persist the incremental `sixtyDayVolume` cache, so it advances a copy in memory
+     *      via the shared `_rolledSixtyDayVolume`. When the cache is fresh — which every recorded query,
+     *      redemptions included, keeps it (see `_applyVolume`) — this is a single cached read with no loop;
+     *      only a genuinely idle span (no query at all since `lastWindowId`) pays the catch-up, exactly as
+     *      the mutating path would. Returns the UNCAPPED fee: `getMintPricing` exposes it as-is
+     *      and the QueryTokenizer's mintPrice applies the `queryFeeCap`.
+     */
+    function _previewFee(uint248 universeId, uint256 baseFee) internal view returns (uint256) {
+        UniverseStatistics storage stats = universeStatistics[universeId];
+        uint256 currentThreeDayWindow = _getCurrentThreeDayWindow();
+
+        // Advance the maintained 60-day cache in memory (a view cannot persist it). Fresh cache - no loop.
+        uint256 sixtyDayVolume =
+            _rolledSixtyDayVolume(stats, currentThreeDayWindow, stats.lastWindowId, stats.sixtyDayVolume);
+
+        uint256 proportionOfCurrentWindow = ((block.timestamp - GENESIS_TIMESTAMP) % THREE_DAYS) * SCALE / THREE_DAYS;
+        uint256 currentVolume = stats.threeDayInfo[currentThreeDayWindow].threeDayVolume;
+        // previous window (w-1): real volume, or bootstrap if it predates genesis. Check done here, before the read
+        uint256 previousVolume =
+            currentThreeDayWindow >= 1 ? stats.threeDayInfo[currentThreeDayWindow - 1].threeDayVolume : BOOT_VOLUME;
+
+        // recent 3-day (local): current partial + tail of the previous window
+        uint256 lastThreeDayVolume = currentVolume + (SCALE - proportionOfCurrentWindow) * previousVolume / SCALE;
+
+        // 60-day (local): current + real running sum, then trim the oldest window's rolled-out tail.
+        // Bootstrap stays local only. In both branches the oldest window (real for w >= 20, bootstrap for
+        // w < 20) contributes only its (1 - f) tail, since f of it has already slid out of the 60-day span.
+        uint256 lastSixtyDayVolume = currentVolume + sixtyDayVolume;
+        if (currentThreeDayWindow >= 20) {
+            // oldest window (w-20) is real: subtract the f-tail that rolled out
+            uint256 oldestVolume = stats.threeDayInfo[currentThreeDayWindow - 20].threeDayVolume;
+            lastSixtyDayVolume -= proportionOfCurrentWindow * oldestVolume / SCALE;
+        } else {
+            // missing pre-genesis windows are bootstrap. The (20 - w - 1) newer ones enter whole; the single
+            // oldest (w-20) enters only its (1 - f) tail — same trimming the real branch applies
+            lastSixtyDayVolume += (20 - currentThreeDayWindow - 1) * BOOT_VOLUME + (SCALE - proportionOfCurrentWindow)
+                * BOOT_VOLUME / SCALE;
+        }
+
+        return baseFee * _calculateCurveModifier(lastSixtyDayVolume, lastThreeDayVolume) / SCALE;
     }
 
     /**
@@ -769,8 +1001,8 @@ contract Multiverse is ReentrancyGuard {
      *      built iteratively (each step re-divided by SCALE) because (1 - ratio)^6 in SCALE fixed-point
      *      would overflow a direct exponentiation.
      *
-     *      TODO: the below-average branch bottoms out near ~1% of the base fee; since the fee doubles as
-     *      TODO: the reporting bond, a floor may be needed (needs testing).
+     *      TODO: the below-average branch bottoms out near ~1% of the base fee; since the fee is also
+     *      TODO: the first report's bond, a floor may be needed (needs testing).
      * @param lastSixtyDayVolume The reconstructed 60-day rolling volume (denominator).
      * @param lastThreeDayVolume The reconstructed 3-day rolling volume (numerator).
      * @return modifier_ The SCALE-scaled multiplier to apply to the base fee.
@@ -941,8 +1173,8 @@ contract Multiverse is ReentrancyGuard {
      * @dev The bucket is keyed by the 3-day window index derived from the global genesis anchor
      *      (`(block.timestamp - GENESIS_TIMESTAMP) / THREE_DAYS`). The sparse mapping avoids any
      *      age-dependent array padding and lets a fork copy a fixed window of buckets regardless of
-     *      universe age. Both the windowed bucket and the running total are updated for revenue and
-     *      profit.
+     *      universe age. Only the windowed profit bucket is updated; `_getProfits` reconstructs the
+     *      rolling monthly totals from the buckets on demand.
      * @param universeId The id of the universe to credit.
      * @param profit The profit realized by the resolved query (the REP to be burned).
      */
@@ -1091,6 +1323,8 @@ contract Multiverse is ReentrancyGuard {
      * @dev Rejects a nonexistent query or universe. Forwards to the heir exactly like report()
      *      does, so `requiredStakeAmount` is the amount report() would pull from the caller. A
      *      required stake at or above `forkThreshold` means the next report triggers the fork path.
+     *      The FIRST stake is clamped down to half the fork threshold when the query fee exceeds it,
+     *      so an opening report is never itself fork-level (see _requiredStakeAmountAndForkThreshold).
      * @param universeId The universe to report in (forwarded to the heir if it has forked).
      * @param queryId The query to report on.
      * @return requiredStakeAmount The stake the next reporter must post.
@@ -1103,7 +1337,7 @@ contract Multiverse is ReentrancyGuard {
     {
         if (queries[queryId].numberOfOutcomes == 0) revert InvalidQuery();
         (uint248 currentUniverseId,) = _getCurrentUniverse(universeId);
-        return _requiredStakeAmountAndForkThreshold(currentUniverseId, queryId);
+        return _requiredStakeAmountAndForkThreshold(currentUniverseId, queryId, universes[currentUniverseId].repToken);
     }
 
     /* ========================================= HISTORY FUNCTIONS =========================================== */
@@ -1148,31 +1382,40 @@ contract Multiverse is ReentrancyGuard {
         }
     }
 
+    // TODO: the fork threshold logic will be rewritten together with the new escalation game algorithm
     /**
      * @notice Computes the stake required for the report on a query and the universe's fork threshold.
      * @dev The next stake is the query fee for the first report and double the previous stake for each
-     *      subsequent report. Either way, once it exceeds half the fork threshold it is clamped up to the
-     *      full fork threshold (a fork-level stake); a stake of exactly half is left untouched — its own
-     *      doubling lands exactly on the threshold.
+     *      subsequent report. The first stake is clamped down to half the fork threshold when the fee
+     *      exceeds it (a tokenizer redemption records the pool average verbatim, and the threshold can
+     *      shrink between creation and reporting), so an opening report is never itself fork-level.
+     *      Escalation stakes are instead clamped up: once a doubling exceeds half the fork threshold
+     *      it becomes the full fork threshold (a fork-level stake); a stake of exactly half is left
+     *      untouched — its own doubling lands exactly on the threshold.
      * @param universeId The (current) universe the query lives in.
      * @param queryId The query being reported on.
+     * @param repToken The universe's wREP token, already loaded by the caller.
      * @return requiredStakeAmount The stake the reporter must post.
      * @return forkThreshold The stake level at which posting triggers a fork.
      */
-    function _requiredStakeAmountAndForkThreshold(uint248 universeId, uint256 queryId)
+    function _requiredStakeAmountAndForkThreshold(uint248 universeId, uint256 queryId, ILituusRep repToken)
         internal
         view
         returns (uint256 requiredStakeAmount, uint256 forkThreshold)
     {
-        forkThreshold = ZOLTAR.getForkThreshold(universeId);
+        forkThreshold = _forkThreshold(repToken, universeId);
+        uint256 halfForkThreshold = forkThreshold / 2;
 
         Stake[] storage stakes = queryResolutions[universeId][queryId].stakes;
         uint256 numberOfStakes = stakes.length;
 
-        // The first report's stake is the query fee; each escalation doubles the previous stake.
+        // The first report's stake is the query fee (clamped below); each escalation doubles the
+        // previous stake.
         uint256 nextStakeAmount;
         if (numberOfStakes == 0) {
-            nextStakeAmount = queries[queryId].fee;
+            uint256 fee = queries[queryId].fee;
+            // Clamp the first stake down so the opening report is never itself a fork trigger.
+            nextStakeAmount = fee > halfForkThreshold ? halfForkThreshold : fee;
         } else {
             uint256 lastStakeAmount = stakes[numberOfStakes - 1].amount;
             nextStakeAmount = lastStakeAmount * 2;
@@ -1180,7 +1423,7 @@ contract Multiverse is ReentrancyGuard {
 
         // Once the next stake exceeds half the fork threshold, clamp it to the full threshold so the
         // escalation ends exactly at the fork level instead of overshooting it on the next doubling.
-        bool reachesForkLevel = nextStakeAmount > forkThreshold / 2;
+        bool reachesForkLevel = nextStakeAmount > halfForkThreshold;
         requiredStakeAmount = reachesForkLevel ? forkThreshold : nextStakeAmount;
     }
 

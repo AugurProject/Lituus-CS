@@ -42,7 +42,7 @@ contract MultiverseCreateQueryFuzzTest is MultiverseFuzzFixtures {
     /// the stored fee, contract holdings, and payer balance always match the charged amount.
     function testFuzz_CreateQuery_VaryingFee(uint256 fee) public {
         // Any base fee is accepted and the final fee is clamped to at most half the fork threshold.
-        uint256 cap = zoltar.getForkThreshold(GENESIS_UID) / 2;
+        uint256 cap = _queryFeeCapWrep();
         fee = bound(fee, 1, type(uint128).max);
         feeCtl.setFee(fee);
         uint256 chargedFee = fee > cap ? cap : fee;

@@ -92,7 +92,7 @@ contract MultiverseInvariantTest is MultiverseDeployFixture {
     ///      be zero exactly when the stake has settled.
     function invariant_LadderDeterministic() public view {
         uint256 count = multiverse.queryCount();
-        uint256 forkThreshold = zoltar.getForkThreshold(GENESIS_UID);
+        uint256 forkThreshold = _forkThresholdWrep();
         for (uint256 i = 0; i < count; ++i) {
             Multiverse.Stake[] memory stakes = multiverse.getStakes(GENESIS_UID, i);
             (,, uint256 fee,) = multiverse.queries(i);

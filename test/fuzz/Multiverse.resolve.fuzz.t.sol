@@ -46,8 +46,8 @@ contract MultiverseResolveFuzzTest is MultiverseFuzzFixtures {
     /// @dev Property: the resolver reward scales with the query fee across the whole valid fee
     /// range, using the same ramp share for a fixed moment past the deadline.
     function testFuzz_Resolve_Invalid_RewardScalesWithFee(uint256 fee, uint256 pastDeadline) public {
-        // The fee doubles as the first bond, so createQuery accepts fees below half the fork threshold.
-        fee = bound(fee, 1, zoltar.getForkThreshold(GENESIS_UID) / 2 - 1);
+        // The first bond equals the fee, so createQuery accepts fees below half the fork threshold.
+        fee = bound(fee, 1, _queryFeeCapWrep() - 1);
         pastDeadline = bound(pastDeadline, 1, multiverse.THREE_DAYS());
         feeCtl.setFee(fee);
         uint256 queryId = _createQuery();
@@ -130,7 +130,7 @@ contract MultiverseResolveFuzzTest is MultiverseFuzzFixtures {
     /// query fee across the whole valid fee range, with each phase driven by a distinct actor:
     /// `user` creates, `reporter` reports, `resolver` resolves.
     function testFuzz_Resolve_SingleStake_FeeScales(uint256 fee, uint256 reportDelay) public {
-        fee = bound(fee, 1, zoltar.getForkThreshold(GENESIS_UID) / 2 - 1);
+        fee = bound(fee, 1, _queryFeeCapWrep() - 1);
         reportDelay = bound(reportDelay, 0, multiverse.THREE_DAYS());
         feeCtl.setFee(fee);
         uint256 creatorBalanceBefore = genesisRep.balanceOf(user);

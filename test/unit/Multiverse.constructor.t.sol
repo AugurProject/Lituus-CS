@@ -11,29 +11,35 @@ import { MultiverseFixtures } from "./Multiverse.fixtures.sol";
 contract MultiverseConstructorTest is MultiverseFixtures {
     function test_RevertWhen_ZoltarIsZero() public {
         vm.expectRevert(Multiverse.ZeroAddress.selector);
-        new Multiverse(IZoltar(address(0)), GENESIS_UID, feeCtl);
+        new Multiverse(IZoltar(address(0)), GENESIS_UID, feeCtl, queryTokenizerStub);
     }
 
     function test_RevertWhen_QueryFeeControllerIsZero() public {
         vm.expectRevert(Multiverse.ZeroAddress.selector);
-        new Multiverse(zoltar, GENESIS_UID, IQueryFeeController(address(0)));
+        new Multiverse(zoltar, GENESIS_UID, IQueryFeeController(address(0)), queryTokenizerStub);
+    }
+
+    function test_RevertWhen_QueryTokenizerIsZero() public {
+        vm.expectRevert(Multiverse.ZeroAddress.selector);
+        new Multiverse(zoltar, GENESIS_UID, feeCtl, address(0));
     }
 
     function test_Constructor_SetsImmutables() public {
         uint256 deployTime = START_TIME + 5 days;
         vm.warp(deployTime);
-        Multiverse newMultiverse = new Multiverse(zoltar, GENESIS_UID, feeCtl);
+        Multiverse newMultiverse = new Multiverse(zoltar, GENESIS_UID, feeCtl, queryTokenizerStub);
 
         assertEq(address(newMultiverse.ZOLTAR()), address(zoltar));
         assertEq(address(newMultiverse.QUERY_FEE_CONTROLLER()), address(feeCtl));
         assertEq(newMultiverse.GENESIS_TIMESTAMP(), deployTime);
+        assertEq(address(newMultiverse.QUERY_TOKENIZER()), address(queryTokenizerStub));
     }
 
     function test_Constructor_InitializesGenesisUniverse() public {
         // supplyBeforeFork is captured at deploy time from the theoretical supply. Deploy a
         // new instance so the captured value equals the current live reading.
         uint256 expectedSupply = zoltar.getUniverseTheoreticalSupply(GENESIS_UID);
-        Multiverse newMultiverse = new Multiverse(zoltar, GENESIS_UID, feeCtl);
+        Multiverse newMultiverse = new Multiverse(zoltar, GENESIS_UID, feeCtl, queryTokenizerStub);
 
         (
             ILituusRep repToken,
@@ -47,7 +53,6 @@ contract MultiverseConstructorTest is MultiverseFixtures {
             bytes32 history,
             uint256 forkQuery,
             uint256 supplyBeforeFork,
-            address queryTokenizer,
             uint8 forkOutcome,
             bool isLituusFork
         ) = newMultiverse.universes(GENESIS_UID);
@@ -63,7 +68,6 @@ contract MultiverseConstructorTest is MultiverseFixtures {
         assertEq(history, bytes32(0));
         assertEq(forkQuery, 0);
         assertEq(supplyBeforeFork, expectedSupply);
-        assertEq(queryTokenizer, address(0));
         assertEq(forkOutcome, 0);
         assertFalse(isLituusFork);
     }
