@@ -74,7 +74,7 @@ abstract contract MultiverseDeployFixture is Test {
         IQueryFeeController controller = _deployFeeController();
         multiverse = _deployMultiverse(controller);
 
-        (ILituusRep repToken,,,,,,,,,,,,) = multiverse.universes(GENESIS_UID);
+        (ILituusRep repToken,,,,,,,,,) = multiverse.universes(GENESIS_UID);
         genesisRep = repToken;
 
         _afterProtocolDeploy();

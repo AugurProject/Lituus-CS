@@ -11,7 +11,6 @@ import { LituusRep } from "./LituusRep.sol";
 import { IReputationToken } from "./interfaces/IReputationToken.sol";
 import { IQueryFeeController } from "./interfaces/IQueryFeeController.sol";
 import { IMultiverse } from "./interfaces/IMultiverse.sol";
-import { LibHistory } from "./libraries/LibHistory.sol";
 
 // TODO: check zoltar forks
 
@@ -81,7 +80,6 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         uint248 originUniverse;
         uint256 fee;
         string question;
-        uint248[] resolvedUniverses;
     }
 
     struct QueryResolution {
@@ -104,9 +102,6 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         ILituusRep repToken;
         UniverseState universeState;
         uint48 forkTime;
-        // The depth of the universe in the fork tree
-        // Genesis universe has depth 0, its children have depth 1, etc. Max 256.
-        uint16 forkDepth;
         // Whether this universe lies on the canonical timeline (the genesis -> favoriteChild -> ... chain).
         // Genesis is canonical; on a fork, only the designated favoriteChild inherits the parent's flag.
         bool isCanonical;
@@ -114,15 +109,6 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         // The child on the canonical timeline. On a fork, one child is designated the favoriteChild and
         // inherits the parent's canonical flag; the other branches stay non-canonical.
         uint248 favoriteChild;
-        // The current universe for this lineage. On fork finalization every ancestor's heir is
-        // repointed to the final current universe (not just the immediate child), so resolving the current
-        // universe is always a single hop with no chain walk.
-        uint248 heir;
-        // History format:
-        // Genesis universe has history 0, depth 0.
-        // First children have history 0b00 and 0b01, depth 1,
-        // second children of the second child 0b010 and 0b011, depth 2, etc.
-        bytes32 history;
         // Packed together into one slot. forkQuery is a query id; supplyBeforeFork is a REP amount
         // (<= 100M * 1e18), both comfortably within uint128.
         uint128 forkQuery;
@@ -154,6 +140,11 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     mapping(uint248 universeId => mapping(uint256 queryId => QueryResolution)) public queryResolutions;
 
     uint256 public queryCount;
+
+    // The current universe at the end of the canonical timeline (genesis -> favoriteChild -> ...).
+    // Starts at the genesis and is repointed on fork finalization. Query creation on any canonical
+    // universe forwards here; non-canonical universes never forward.
+    uint248 public canonicalHeir;
 
     /* ================================================= EVENTS ================================================== */
     event QueryCreated(
@@ -244,7 +235,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         // get the REP token address from the initial universe in Zoltar
         IReputationToken initialZoltarRepToken = ZOLTAR.getRepToken(_initialZoltarUniverseId);
         // deploy a Lituus REP token that wraps the Zoltar REP token
-        // token symbol will use universe.history as a suffix. Genesis universe will have symbol "REP0"
+        // token symbol will use a per-universe suffix. Genesis universe will have symbol "REP0"
         // TODO: Discuss the format of the suffix if the forks are for binary queries.
         ILituusRep repToken =
             new LituusRep(address(this), address(initialZoltarRepToken), "Lituus Reputation Token", "REP0", SCALE);
@@ -257,11 +248,11 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         genesisUniverse.repToken = repToken;
         genesisUniverse.universeState = UniverseState.Active;
         genesisUniverse.forkTime = uint48(block.timestamp);
-        genesisUniverse.heir = 0;
-        // Genesis is the root of the fork tree: an empty inheritance path, and the root of the canonical timeline.
-        genesisUniverse.history = 0;
-        genesisUniverse.forkDepth = 0;
+        // Genesis is the root of the fork tree and of the canonical timeline. Its parent stays 0: every
+        // parent-chain walk terminates at id 0, which is the genesis itself when its Zoltar id is 0.
         genesisUniverse.isCanonical = true;
+        // The canonical timeline starts (and currently ends) at the genesis.
+        canonicalHeir = _initialZoltarUniverseId;
         genesisUniverse.forkQuery = 0;
         // TODO: fill in the correct supply
         genesisUniverse.supplyBeforeFork = uint128(ZOLTAR.getUniverseTheoreticalSupply(_initialZoltarUniverseId));
@@ -407,7 +398,8 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      *      the threshold.
      *      At the cap, the first report is an ordinary stake and the fork level can only be reached by
      *      escalating (the second report lands on the threshold).
-     * @param universeId The universe to create the query in (forwarded to the heir if it has forked).
+     * @param universeId The universe to create the query in (a canonical universe that has forked is
+     * forwarded to the canonicalHeir; non-canonical universes are never forwarded).
      * @param question The question text alongside the possible answers (to be checked).
      * @param numberOfOutcomes The number of reportable outcomes (UNRESOLVED and INVALID are always available
      * separately).
@@ -459,7 +451,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      *      its fee is distributed/burned normally at resolution. The `queryFeeCap` is NOT applied, so
      *      the full pool price reaches the oracle.
      *
-     *      Does NOT forward to the heir: the QueryTokenizer's pool and the pushed
+     *      Does NOT forward to the heir (unlike createQuery): the QueryTokenizer's pool and the pushed
      *      fee are denominated in the current universe's REP, so forwarding would mix up the REP tokens,
      *      bypassing migration. Once the universe forks, redemption freezes here and
      *      migration is the only path to a child.
@@ -477,11 +469,8 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         address creator
     ) external nonReentrant {
         if (msg.sender != QUERY_TOKENIZER) revert OnlyQueryTokenizer();
-        UniverseState universeState = universes[universeId].universeState;
-        if (universeState == UniverseState.NotExisting) revert InvalidUniverse();
-        if ((universeState != UniverseState.Active) && (universeState != UniverseState.Forming)) {
-            revert InvalidUniverseState();
-        }
+        // TODO: add forwarding
+        _checkUniverseState(universeId);
 
         if (numberOfOutcomes < MIN_OUTCOMES) revert InvalidNumberOfOutcomes();
         if (numberOfOutcomes > MAX_OUTCOMES) revert InvalidNumberOfOutcomes();
@@ -527,7 +516,8 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
 
     /**
      * @notice Reports an outcome on a query, posting the required escalation stake.
-     * @dev Forwards to the heir if the universe has forked. Rejects reports on queries already resolved
+     * @dev Acts on the universe as given — no heir forwarding; the universe must exist and be Active or
+     *      Forming. Rejects reports on queries already resolved
      *      here or in an ancestor lineage. A query created in another universe is reportable here only
      *      if it was inherited through a fork, i.e. this universe descends from the query's origin.
      *      The first report must fall within THREE_DAYS of the query
@@ -540,24 +530,19 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      */
     function report(uint248 universeId, uint256 queryId, uint8 outcome) external nonReentrant {
         // Check all conditions (universe exists, query exists, outcome is valid, report is within time, etc.)
-        (uint248 currentUniverseId, Universe storage currentUniverse) = _getCurrentUniverse(universeId);
-        // Reports can only be placed in an operating or still-forming universe; any later state
-        // should already have been forwarded to the heir.
-        UniverseState universeState = currentUniverse.universeState;
-        if ((universeState != UniverseState.Active) && (universeState != UniverseState.Forming)) {
-            revert InvalidUniverseState();
-        }
+        // Reports can only be placed in an existing, operating or still-forming universe.
+        Universe storage universe = _checkUniverseState(universeId);
 
         Query storage query = queries[queryId];
         if (query.numberOfOutcomes == 0) revert InvalidQuery();
 
-        QueryResolution storage resolution = queryResolutions[currentUniverseId][queryId];
+        QueryResolution storage resolution = queryResolutions[universeId][queryId];
         if (resolution.outcome != UNRESOLVED) revert QueryAlreadyResolved();
         uint256 numberOfStakes = resolution.stakes.length;
         // A query resolved in an ancestor universe is inherited by this lineage (via getOutcome), so it
         // cannot be reported on again here. The ancestor set is fixed per lineage, so this only needs to
         // be checked on the first report; later stakes in the same escalation are already covered.
-        if (numberOfStakes == 0 && _findAncestorResolution(currentUniverseId, queryId) != UNRESOLVED) {
+        if (numberOfStakes == 0 && _findAncestorResolution(universeId, queryId) != UNRESOLVED) {
             revert QueryAlreadyResolved();
         }
 
@@ -565,7 +550,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         if (outcome == UNRESOLVED) revert InvalidOutcome();
         if ((outcome > query.numberOfOutcomes) && (outcome != INVALID)) revert InvalidOutcome();
 
-        uint48 queryCreateTime = _getAndUpdateQueryCreateTime(currentUniverseId, queryId);
+        uint48 queryCreateTime = _getAndUpdateQueryCreateTime(universeId, queryId);
 
         // check that the reporting window for the query is not over yet
         if (numberOfStakes == 0 && queryCreateTime + THREE_DAYS < block.timestamp) revert QueryExpired();
@@ -578,7 +563,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         }
 
         (uint256 requiredStakeAmount, uint256 forkThreshold) =
-            _requiredStakeAmountAndForkThreshold(currentUniverseId, queryId, currentUniverse.repToken);
+            _requiredStakeAmountAndForkThreshold(universeId, queryId, universe.repToken);
         // a zero stake would allow free reports and an escalation ladder stuck at 0.
         if (requiredStakeAmount == 0) revert ZeroStakeAmount();
         // TODO: If the bond before a fork bond is placed so that the next appeal would cause a fork,
@@ -586,7 +571,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         // then the bond placing is reverted and the query is frozen until the parent universe resolves the fork.
 
         // transfer the stake
-        currentUniverse.repToken.safeTransferFrom(msg.sender, address(this), requiredStakeAmount);
+        universe.repToken.safeTransferFrom(msg.sender, address(this), requiredStakeAmount);
 
         if (requiredStakeAmount >= forkThreshold) {
             // TODO: fork logic in a separate call
@@ -612,12 +597,13 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         newStake.reportedOutcome = outcome;
         newStake.amount = requiredStakeAmount;
 
-        emit QueryReported(msg.sender, currentUniverseId, queryId, outcome, requiredStakeAmount);
+        emit QueryReported(msg.sender, universeId, queryId, outcome, requiredStakeAmount);
     }
 
     /**
      * @notice Resolves a query whose reporting or appeal window has elapsed, recording its outcome.
-     * @dev Forwards to the heir if the universe has forked. Two cases:
+     * @dev Acts on the universe as given — no heir forwarding; the universe must exist and be Active or
+     *      Forming. Two cases:
      *      (1) no report ever landed and the THREE_DAYS reporting window passed ->
      *      resolves INVALID (after the ancestor-inheritance check report() never ran).
      *      (2) stakes exist and the last one's ONE_DAY appeal window passed
@@ -628,30 +614,24 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * @param queryId The query to resolve.
      */
     function resolve(uint248 universeId, uint256 queryId) external nonReentrant {
-        (uint248 currentUniverseId, Universe storage currentUniverse) = _getCurrentUniverse(universeId);
-        // Queries can only be resolved in an operating or still-forming universe; any later state
-        // should already have been forwarded to the heir.
-        UniverseState universeState = currentUniverse.universeState;
-        if ((universeState != UniverseState.Active) && (universeState != UniverseState.Forming)) {
-            revert InvalidUniverseState();
-        }
+        // Queries can only be resolved in an existing, operating or still-forming universe.
+        Universe storage universe = _checkUniverseState(universeId);
 
         Query storage query = queries[queryId];
         if (query.numberOfOutcomes == 0) revert InvalidQuery();
 
-        QueryResolution storage resolution = queryResolutions[currentUniverseId][queryId];
+        QueryResolution storage resolution = queryResolutions[universeId][queryId];
         if (resolution.outcome != UNRESOLVED) revert QueryAlreadyResolved();
 
-        uint48 queryCreateTime = _getAndUpdateQueryCreateTime(currentUniverseId, queryId);
+        uint48 queryCreateTime = _getAndUpdateQueryCreateTime(universeId, queryId);
 
         if (resolution.stakes.length == 0 && queryCreateTime + THREE_DAYS < block.timestamp) {
             // No report ever landed here, so the ancestor check was never run by report(): a query
             // resolved in an ancestor is inherited by this lineage (via getOutcome) and must not be
             // resolved again. The stakes branch below is already covered by report()'s first-stake check.
-            if (_findAncestorResolution(currentUniverseId, queryId) != UNRESOLVED) revert QueryAlreadyResolved();
+            if (_findAncestorResolution(universeId, queryId) != UNRESOLVED) revert QueryAlreadyResolved();
             // if the report period has passed and the query was not reported on then resolve the query as INVALID
             resolution.outcome = INVALID;
-            _recordResolvedUniverse(queryId, currentUniverseId, currentUniverse.isCanonical);
 
             // The resolver setting this query to INVALID earns a share of the fee
             // that ramps from 0 at the reporting deadline to the full fee three days later, then stays
@@ -659,24 +639,23 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
             uint256 queryFee = queries[queryId].fee;
             uint256 resolverPay = _timeBasedFeeShare(queryFee, block.timestamp - (queryCreateTime + THREE_DAYS));
             uint256 profit = queryFee - resolverPay;
-            emit ResolverRewardPaid(msg.sender, currentUniverseId, queryId, resolverPay);
-            currentUniverse.repToken.safeTransfer(msg.sender, resolverPay);
+            emit ResolverRewardPaid(msg.sender, universeId, queryId, resolverPay);
+            universe.repToken.safeTransfer(msg.sender, resolverPay);
             // The unpaid fee remainder is the query's profit: recorded for the fee controller and
             // burned as wREP, the same as on the stakes path.
             if (profit > 0) {
-                currentUniverse.repToken.burnShares(profit);
+                universe.repToken.burnShares(profit);
             }
-            _applyProfit(currentUniverseId, profit);
+            _applyProfit(universeId, profit);
 
-            emit QueryResolved(msg.sender, currentUniverseId, queryId, INVALID);
+            emit QueryResolved(msg.sender, universeId, queryId, INVALID);
         } else if (resolution.stakes.length > 0) {
             if (resolution.stakes[resolution.stakes.length - 1].time + ONE_DAY < block.timestamp) {
                 // If there are stakes and the appeal period has passed then resolve the query with the last outcome
                 // TODO: Unless the query is 1 step from fork threshold, then we should wait for the fork to finish
-                uint8 outcome = _calculateOutcomeAndEscalationPayoffs(currentUniverseId, queryId);
+                uint8 outcome = _calculateOutcomeAndEscalationPayoffs(universeId, queryId);
                 resolution.outcome = outcome;
-                _recordResolvedUniverse(queryId, currentUniverseId, currentUniverse.isCanonical);
-                emit QueryResolved(msg.sender, currentUniverseId, queryId, outcome);
+                emit QueryResolved(msg.sender, universeId, queryId, outcome);
             } else {
                 // appeal period is not over yet, cannot resolve
                 revert QueryNotReadyToResolve();
@@ -686,11 +665,11 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
             revert QueryNotReadyToResolve();
         }
 
-        if (currentUniverse.universeState == UniverseState.Active) {
+        if (universe.universeState == UniverseState.Active) {
             // check if Zoltar universe is forking
-            if (ZOLTAR.universes(currentUniverseId).forkTime != 0) {
+            if (ZOLTAR.universes(universeId).forkTime != 0) {
                 // if Zoltar is forking, then we should mirror the fork in this universe
-                _mirrorZoltarFork(currentUniverseId);
+                _mirrorZoltarFork(universeId);
             }
         }
     }
@@ -1276,31 +1255,22 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     /* ========================================== PUBLIC VIEW FUNCTIONS ========================================== */
     /**
      * @notice Returns the outcome of a query as seen from a given universe.
-     * @dev If the query is resolved in this universe, that outcome is returned directly. Otherwise the
-     *      query's resolutions are scanned for one recorded in an ancestor of this universe (a prefix
-     *      match on the inheritance path). A query is resolved at most once along any single lineage,
-     *      so the first ancestor match is the applicable resolution. Returns UNRESOLVED if neither this
-     *      universe nor any ancestor has resolved the query.
+     * @dev If the query is resolved in this universe, that outcome is returned directly.
+     *      Otherwise the universe's lineage is walked down to the query's origin universe looking for a
+     *      recorded resolution — for a canonical universe the walk starts at the canonicalHeir, so
+     *      resolutions recorded in canonical descendants after this universe forked are visible too. A
+     *      query is resolved at most once along any single lineage, so the first match is the applicable
+     *      resolution.
+     *      Returns UNRESOLVED if no universe on the lineage has resolved the query. Reverts
+     *      only if the universe does not exist; outcomes remain readable in any post-fork state.
      * @param universeId The universe to read the outcome from.
      * @param queryId The query to read.
      * @return The resolved outcome, or UNRESOLVED if none applies to this universe.
      */
     function getOutcome(uint248 universeId, uint256 queryId) external view returns (uint8) {
-        // Fast path: resolved in this universe.
-        uint8 localOutcome = queryResolutions[universeId][queryId].outcome;
-        if (localOutcome != UNRESOLVED) return localOutcome;
-
-        // Forward to the heir if this universe has forked, so we read from the current universe where
-        // report()/resolve() record resolutions. Reverts only if the universe does not exist; outcomes
-        // remain readable while the universe is forking (no fork-state check, unlike report/resolve).
-        (uint248 currentUniverseId,) = _getCurrentUniverse(universeId);
-        if (currentUniverseId != universeId) {
-            uint8 heirOutcome = queryResolutions[currentUniverseId][queryId].outcome;
-            if (heirOutcome != UNRESOLVED) return heirOutcome;
-        }
-
-        // Otherwise inherit the resolution from an ancestor universe, if any.
-        return _findAncestorResolution(currentUniverseId, queryId);
+        if (universes[universeId].universeState == UniverseState.NotExisting) revert InvalidUniverse();
+        // The walk checks this universe itself first, then inherits from an ancestor, if any.
+        return _findAncestorResolution(universeId, queryId);
     }
 
     /**
@@ -1320,12 +1290,13 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
 
     /**
      * @notice Returns the stake the next report on a query must post, and the universe's fork threshold.
-     * @dev Rejects a nonexistent query or universe. Forwards to the heir exactly like report()
-     *      does, so `requiredStakeAmount` is the amount report() would pull from the caller. A
-     *      required stake at or above `forkThreshold` means the next report triggers the fork path.
+     * @dev Rejects a nonexistent query or universe. Applies the same universe gating as report()
+     *      (exists and Active/Forming, no heir forwarding), so `requiredStakeAmount` is the amount
+     *      report() would pull from the caller.
+     *      A required stake at or above `forkThreshold` means the next report triggers the fork path.
      *      The FIRST stake is clamped down to half the fork threshold when the query fee exceeds it,
      *      so an opening report is never itself fork-level (see _requiredStakeAmountAndForkThreshold).
-     * @param universeId The universe to report in (forwarded to the heir if it has forked).
+     * @param universeId The universe to report in.
      * @param queryId The query to report on.
      * @return requiredStakeAmount The stake the next reporter must post.
      * @return forkThreshold The stake level at which posting triggers a fork.
@@ -1336,49 +1307,69 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         returns (uint256 requiredStakeAmount, uint256 forkThreshold)
     {
         if (queries[queryId].numberOfOutcomes == 0) revert InvalidQuery();
-        (uint248 currentUniverseId,) = _getCurrentUniverse(universeId);
-        return _requiredStakeAmountAndForkThreshold(currentUniverseId, queryId, universes[currentUniverseId].repToken);
+        Universe storage universe = _checkUniverseState(universeId);
+        return _requiredStakeAmountAndForkThreshold(universeId, queryId, universe.repToken);
     }
 
-    /* ========================================= HISTORY FUNCTIONS =========================================== */
+    /* ========================================= ANCESTRY FUNCTIONS =========================================== */
 
     /**
-     * @notice Returns the outcome of the first ancestor of `universeId` that has resolved `queryId`.
-     * @dev Scans the query's recorded resolution universes and prefix-matches their inheritance path
-     *      against `universeId`'s path. A query is resolved at most once along any single
-     *      lineage, so the first ancestor match is authoritative. Returns UNRESOLVED if no ancestor
-     *      has resolved the query.
+     * @notice Returns the outcome of `queryId` as recorded along `universeId`'s lineage.
+     * @dev Checks `universeId` itself first. A canonical universe then reads through the canonical
+     *      timeline: the walk starts at the canonicalHeir, so a resolution recorded in a canonical
+     *      descendant (after this universe forked) is found as well as one in an ancestor. A
+     *      non-canonical universe walks up from itself. The walk follows parent pointers and stops at
+     *      the query's origin universe: a query cannot be resolved above the universe it was created in.
+     *      A query is resolved at most once along any single lineage, so the first match is enough.
+     *      Returns UNRESOLVED if no universe on the lineage has resolved the query.
      */
-    function _findAncestorResolution(uint248 universeId, uint256 queryId) internal view returns (uint8) {
-        Universe storage universe = universes[universeId];
-        bytes32 history = universe.history;
-        uint16 forkDepth = universe.forkDepth;
-
-        uint248[] storage resolvedUniverses = queries[queryId].resolvedUniverses;
-        uint256 length = resolvedUniverses.length;
-        for (uint256 i = 0; i < length; i++) {
-            uint248 resolvedUniverseId = resolvedUniverses[i];
-            Universe storage candidate = universes[resolvedUniverseId];
-            if (LibHistory.isAncestor(candidate.history, candidate.forkDepth, history, forkDepth)) {
-                return queryResolutions[resolvedUniverseId][queryId].outcome;
-            }
+    function _findAncestorResolution(uint248 universeId, uint256 queryId)
+        internal
+        view
+        returns (uint8 resolvedOutcome)
+    {
+        // Check the universe itself first.
+        uint8 outcome = queryResolutions[universeId][queryId].outcome;
+        if (outcome != UNRESOLVED) {
+            return outcome;
         }
-        return UNRESOLVED;
+        // A canonical universe is always on the heir's parent chain, so starting the walk at the
+        // canonicalHeir covers its canonical descendants as well as its ancestors. A non-canonical
+        // universe has no heir; only its ancestors can hold an inherited resolution.
+        uint248 currentId = universes[universeId].isCanonical ? canonicalHeir : universeId;
+        uint248 originUniverseId = queries[queryId].originUniverse;
+        while (true) {
+            outcome = queryResolutions[currentId][queryId].outcome;
+            if (outcome != UNRESOLVED) {
+                return outcome;
+            }
+            // The query cannot be resolved above its origin universe, so the walk stops there. Id 0 also
+            // ends the walk: every parent chain terminates at 0 (the genesis when its id is 0, or the
+            // empty parent sentinel of a nonzero-id genesis).
+            if (currentId == originUniverseId || currentId == 0) {
+                return UNRESOLVED;
+            }
+            currentId = universes[currentId].parent;
+        }
     }
 
     /**
-     * @notice Records `universeId` as a universe where `queryId` is resolved.
-     * @dev Keeps a canonical universe's entry at index 0 so `_findAncestorResolution` finds the canonical
-     *      resolution first (the common-case read). Safe because the canonical chain is a single linear
-     *      path, so at most one canonical universe ever resolves a given query. Saves gas during lookups.
+     * @notice Returns whether `ancestorId` is `universeId` itself or one of its ancestors in the fork tree.
+     * @dev Walks the parent chain from `universeId` up to the root. Id 0 is checked as a universe in its
+     *      own right before ending the walk, since 0 is a valid id for the genesis universe.
      */
-    function _recordResolvedUniverse(uint256 queryId, uint248 universeId, bool isCanonical) internal {
-        uint248[] storage resolvedUniverses = queries[queryId].resolvedUniverses;
-        if (isCanonical && resolvedUniverses.length > 0) {
-            resolvedUniverses.push(resolvedUniverses[0]); // move current head to the tail
-            resolvedUniverses[0] = universeId; // canonical entry takes index 0
-        } else {
-            resolvedUniverses.push(universeId);
+    function _isSelfOrAncestor(uint248 ancestorId, uint248 universeId) internal view returns (bool isAncestor) {
+        uint248 currentId = universeId;
+        while (true) {
+            if (currentId == ancestorId) {
+                return true;
+            }
+            // Every parent chain terminates at 0 (the genesis when its id is 0, or the empty parent
+            // sentinel of a nonzero-id genesis).
+            if (currentId == 0) {
+                return false;
+            }
+            currentId = universes[currentId].parent;
         }
     }
 
@@ -1485,10 +1476,10 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
 
     /**
      * @notice Creates one child universe for a forking branch and links it into the fork tree.
-     * @dev Deploys the child's Lituus REP wrapping the child's Zoltar REP, sets parent/history/depth via
-     *      LibHistory.appendHistory, marks it Forming, and snapshots its pre-fork theoretical supply. On the
-     *      YES branch (zoltarOutcomeId == 1) it resolves the forking query to forkingOutcomeId and records
-     *      the resolution so descendants inherit it via the ancestor scan; the NO branch leaves it unresolved.
+     * @dev Deploys the child's Lituus REP wrapping the child's Zoltar REP, links it to its parent, marks it
+     *      Forming, and snapshots its pre-fork theoretical supply. On the YES branch (zoltarOutcomeId == 1)
+     *      it resolves the forking query to forkingOutcomeId so descendants inherit it via the ancestor
+     *      walk; the NO branch leaves it unresolved.
      *      Children are non-canonical at spawn — the favoriteChild is designated at fork finalization.
      * @param universeId The parent universe forking.
      * @param queryId The query that caused the fork.
@@ -1523,13 +1514,9 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         childUniverse.forkTime = uint48(block.timestamp);
         childUniverse.parent = universeId;
         childUniverse.favoriteChild = 0;
-        childUniverse.heir = 0;
 
         // TODO: inherit the parent's base fee
 
-        // The child extends the parent's inheritance path by the branch it was spawned on.
-        (childUniverse.history, childUniverse.forkDepth) =
-            LibHistory.appendHistory(parentUniverse.history, parentUniverse.forkDepth, zoltarOutcomeId);
         // isCanonical stays false at spawn time: only the favoriteChild inherits the canonical flag,
         // and it is designated at fork finalization.
         childUniverse.forkQuery = 0;
@@ -1539,11 +1526,8 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         QueryResolution storage resolution = queryResolutions[childUniverseId][queryId];
         resolution.queryCreateTime = uint48(block.timestamp);
         if (zoltarOutcomeId == 1) {
-            // The query is resolved in the Yes-universe
+            // The query is resolved in the Yes-universe; descendants inherit it via the ancestor walk.
             resolution.outcome = forkingOutcomeId;
-            // Record the resolution so descendants of the Yes-universe inherit it via the ancestor scan.
-            // Children are never canonical at spawn time (the favoriteChild is designated at fork finalization).
-            _recordResolvedUniverse(queryId, childUniverseId, false);
         }
     }
 
@@ -1599,10 +1583,27 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
 
     /* =========================================== INTERNAL HELPERS ============================================== */
     /**
-     * @notice Resolves a universe id to the current universe, forwarding to the heir if it has forked.
-     * @dev Reverts with InvalidUniverse only if the universe (or its heir) does not exist
-     *      (universeState == NotExisting). Does NOT check the fork progress, so callers that must operate
-     *      only on an active/forming universe (report/resolve) layer that check on top.
+     * @notice Checks that a universe can be operated on directly — it must exist and be Active or
+     *         Forming — and returns it.
+     * @dev No heir forwarding — only query creation forwards (see _getCurrentUniverse); every other
+     *      entry point acts on the universe exactly as given. Reverts with InvalidUniverse if the
+     *      universe does not exist and InvalidUniverseState if it is in any forking state.
+     */
+    function _checkUniverseState(uint248 universeId) internal view returns (Universe storage universe) {
+        universe = universes[universeId];
+        UniverseState universeState = universe.universeState;
+        if (universeState == UniverseState.NotExisting) revert InvalidUniverse();
+        if ((universeState != UniverseState.Active) && (universeState != UniverseState.Forming)) {
+            revert InvalidUniverseState();
+        }
+    }
+
+    /**
+     * @notice Resolves a universe id to the current universe for query creation.
+     * @dev Forwarding is supported only along the canonical timeline: a canonical universe resolves to
+     *      the global canonicalHeir (itself, until it forks and the fork finalizes). Non-canonical
+     *      universes never forward and resolve to themselves. Reverts with InvalidUniverse if the given
+     *      universe does not exist.
      */
     function _getCurrentUniverse(uint248 universeId)
         internal
@@ -1611,23 +1612,23 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     {
         currentUniverse = universes[universeId];
         if (currentUniverse.universeState == UniverseState.NotExisting) revert InvalidUniverse();
-        // Forward to the heir if this universe has forked.
-        // If heir is not 0 and not itself, then the universe has forked.
-        uint248 heirId = currentUniverse.heir;
-        if (heirId != universeId && heirId != 0) {
-            currentUniverse = universes[heirId];
-            if (currentUniverse.universeState == UniverseState.NotExisting) revert InvalidUniverse();
-            currentUniverseId = heirId;
-        } else {
-            currentUniverseId = universeId;
+        currentUniverseId = universeId;
+        // Forward only if the universe is post-fork
+        if (currentUniverse.universeState == UniverseState.PostFork) {
+            // The canonical timeline has a single global heir, so any canonical universe that has forked
+            // resolves to it (the heir is the universe itself until its fork finalizes).
+            if (currentUniverse.isCanonical && canonicalHeir != universeId) {
+                currentUniverseId = canonicalHeir;
+                currentUniverse = universes[currentUniverseId];
+            }
         }
     }
 
     /**
      * @notice Returns when a query became reportable in a universe, setting it lazily on first access.
      * @dev If already set, returns it. Otherwise the query can only be reported on if it was inherited
-     *      through a fork, i.e. its origin universe is an ancestor of this one — enforced via the history
-     *      prefix check. Its reportable time is then the universe's forkTime, which is stored and returned.
+     *      through a fork, i.e. its origin universe is an ancestor of this one — enforced by walking the
+     *      parent chain. Its reportable time is then the universe's forkTime, which is stored and returned.
      * @param universeId The universe the query is being acted on in.
      * @param queryId The query in question.
      * @return queryCreateTime The timestamp the query became reportable in this universe.
@@ -1645,15 +1646,12 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
             // available here if this universe descends from the query's origin universe. New queries cannot
             // be created in a forked (ancestor) universe, so an origin-is-ancestor match guarantees the
             // query was genuinely inherited.
-            Universe storage universe = universes[universeId];
-            Universe storage originUniverse = universes[queries[queryId].originUniverse];
-            if (!LibHistory.isAncestor(
-                    originUniverse.history, originUniverse.forkDepth, universe.history, universe.forkDepth
-                )) {
+            // TODO: query creation in a parent universe
+            if (!_isSelfOrAncestor(queries[queryId].originUniverse, universeId)) {
                 revert QueryNotInherited();
             }
             // The query becomes reportable in this universe at the moment of the fork.
-            queryCreateTime = universe.forkTime;
+            queryCreateTime = universes[universeId].forkTime;
             resolution.queryCreateTime = uint48(queryCreateTime);
             return queryCreateTime;
         }

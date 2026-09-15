@@ -45,12 +45,9 @@ contract MultiverseConstructorTest is MultiverseFixtures {
             ILituusRep repToken,
             Multiverse.UniverseState universeState,
             uint48 forkTime,
-            uint16 forkDepth,
             bool isCanonical,
             uint248 parent,
             uint248 favoriteChild,
-            uint248 heir,
-            bytes32 history,
             uint256 forkQuery,
             uint256 supplyBeforeFork,
             uint8 forkOutcome,
@@ -60,16 +57,15 @@ contract MultiverseConstructorTest is MultiverseFixtures {
         assertTrue(address(repToken) != address(0));
         assertEq(uint8(universeState), uint8(Multiverse.UniverseState.Active));
         assertEq(forkTime, uint48(block.timestamp));
-        assertEq(forkDepth, 0);
         assertTrue(isCanonical);
         assertEq(parent, 0);
         assertEq(favoriteChild, 0);
-        assertEq(heir, 0);
-        assertEq(history, bytes32(0));
         assertEq(forkQuery, 0);
         assertEq(supplyBeforeFork, expectedSupply);
         assertEq(forkOutcome, 0);
         assertFalse(isLituusFork);
+        // The canonical timeline starts at the genesis.
+        assertEq(newMultiverse.canonicalHeir(), GENESIS_UID);
     }
 
     function test_Constructor_DeploysRepToken() public view {
