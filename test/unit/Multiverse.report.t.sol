@@ -219,7 +219,9 @@ contract MultiverseReportTest is MultiverseFixtures {
 
         assertEq(_resolution(queryId).stakeCount, 3);
         assertEq(multiverse.getOutcomeStakes(GENESIS_UID, queryId, OUTCOME_A).totalOutcomeStaked, DEFAULT_FEE);
-        assertEq(multiverse.getOutcomeStakes(GENESIS_UID, queryId, multiverse.INVALID()).totalOutcomeStaked, 2 * DEFAULT_FEE);
+        assertEq(
+            multiverse.getOutcomeStakes(GENESIS_UID, queryId, multiverse.INVALID()).totalOutcomeStaked, 2 * DEFAULT_FEE
+        );
         assertEq(multiverse.getOutcomeStakes(GENESIS_UID, queryId, OUTCOME_B).totalOutcomeStaked, 6 * DEFAULT_FEE);
     }
 

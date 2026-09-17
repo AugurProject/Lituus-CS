@@ -53,8 +53,7 @@ contract MultiverseClaimFuzzTest is MultiverseFuzzFixtures {
         fee = bound(fee, 1, MAX_LADDER_FEE);
         feeCtl.setFee(fee);
 
-        (uint256 queryId, uint256 totalStaked, uint256 stakedOnOne, uint256 stakedOnTwo) =
-            _buildTrackedLadder(rounds);
+        (uint256 queryId, uint256 totalStaked, uint256 stakedOnOne, uint256 stakedOnTwo) = _buildTrackedLadder(rounds);
         vm.warp(vm.getBlockTimestamp() + multiverse.ONE_DAY() + 1);
         vm.prank(resolver);
         multiverse.resolve(GENESIS_UID, queryId);

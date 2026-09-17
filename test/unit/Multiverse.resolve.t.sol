@@ -13,7 +13,11 @@ import { MultiverseFixtures } from "./Multiverse.fixtures.sol";
 contract MultiverseResolveTest is MultiverseFixtures {
     /// @dev The settlement totals of a query as claim() derives them: the winning outcome's stake total
     ///      and the losing stakes minus the burn cut. Both zero while the query is unresolved.
-    function _settlementTotals(uint256 queryId) internal view returns (uint256 totalDistributable, uint256 winnerStaked) {
+    function _settlementTotals(uint256 queryId)
+        internal
+        view
+        returns (uint256 totalDistributable, uint256 winnerStaked)
+    {
         ResolutionView memory r = _resolution(queryId);
         if (r.outcome == multiverse.UNRESOLVED()) return (0, 0);
         winnerStaked = multiverse.getOutcomeStakes(GENESIS_UID, queryId, r.outcome).totalOutcomeStaked;

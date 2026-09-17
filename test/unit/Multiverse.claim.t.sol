@@ -24,7 +24,11 @@ contract MultiverseClaimTest is MultiverseFixtures {
 
     /// @dev The settlement totals of a resolved query as claim() derives them: the winning outcome's
     ///      stake total and the losing stakes minus the burn cut.
-    function _settlementTotals(uint256 queryId) internal view returns (uint256 totalDistributable, uint256 winnerStaked) {
+    function _settlementTotals(uint256 queryId)
+        internal
+        view
+        returns (uint256 totalDistributable, uint256 winnerStaked)
+    {
         ResolutionView memory r = _resolution(queryId);
         winnerStaked = multiverse.getOutcomeStakes(GENESIS_UID, queryId, r.outcome).totalOutcomeStaked;
         uint256 totalLoserStakes = uint256(r.totalStaked) - winnerStaked;

@@ -108,7 +108,9 @@ contract MultiverseInvariantTest is MultiverseDeployFixture {
                 uint8 outcome = handler.ghostStakeOutcome(i, j);
                 uint256 expectedUserStake;
                 for (uint256 k = 0; k < stakeCount; ++k) {
-                    if (handler.ghostStakeReporter(i, k) != owner || handler.ghostStakeOutcome(i, k) != outcome) continue;
+                    if (handler.ghostStakeReporter(i, k) != owner || handler.ghostStakeOutcome(i, k) != outcome) {
+                        continue;
+                    }
                     if (!handler.ghostClaimed(i, k)) expectedUserStake += handler.ghostStakeAmount(i, k);
                 }
                 assertEq(multiverse.getUserStake(GENESIS_UID, i, owner, outcome), expectedUserStake);
@@ -120,7 +122,9 @@ contract MultiverseInvariantTest is MultiverseDeployFixture {
                 uint8 outcome = handler.ghostStakeOutcome(i, j);
                 uint256 expectedOutcomeStaked;
                 for (uint256 k = 0; k < stakeCount; ++k) {
-                    if (handler.ghostStakeOutcome(i, k) == outcome) expectedOutcomeStaked += handler.ghostStakeAmount(i, k);
+                    if (handler.ghostStakeOutcome(i, k) == outcome) {
+                        expectedOutcomeStaked += handler.ghostStakeAmount(i, k);
+                    }
                 }
                 assertEq(multiverse.getOutcomeStakes(GENESIS_UID, i, outcome).totalOutcomeStaked, expectedOutcomeStaked);
                 assertLe(expectedOutcomeStaked, r.cap);
@@ -137,8 +141,7 @@ contract MultiverseInvariantTest is MultiverseDeployFixture {
         for (uint256 i = 0; i < count; ++i) {
             ResolutionView memory r = _resolution(i);
             if (r.stakeCount < 2) continue;
-            uint256 onLatest =
-                multiverse.getOutcomeStakes(GENESIS_UID, i, r.lastReportedOutcome).totalOutcomeStaked;
+            uint256 onLatest = multiverse.getOutcomeStakes(GENESIS_UID, i, r.lastReportedOutcome).totalOutcomeStaked;
             uint256 onTheRest = uint256(r.totalStaked) - onLatest;
             assertTrue(onLatest == 2 * onTheRest || onLatest == r.cap);
         }
