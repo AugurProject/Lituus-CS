@@ -222,19 +222,20 @@ contract QueryTokenizerTest is QueryTokenizerFixtures {
         // The other whole token remains backed by exactly the average.
         assertEq(tokenizer.pooledRep(GENESIS_UID), 1.1 ether);
 
-        // The opening bond is the RECORDED pool-average fee (1.1 REP, below the cap so no clamp is
-        // involved) — not the live controller fee (1 REP).
-        (uint256 requiredStake,) = multiverse.getNextRequiredStake(GENESIS_UID, queryId);
-        assertEq(requiredStake, fee);
+        // The opening bond derives from the RECORDED pool-average fee (1.1 REP), not the live
+        // controller fee: rounded to the cap grid (cap 32: steps ..., 1, 2, ...), 1.1 sits below the
+        // geometric mean of 1 and 2 and opens at the 1 REP step.
+        uint256 requiredStake = multiverse.getNextRequiredStake(GENESIS_UID, queryId, OUTCOME_A);
+        assertEq(requiredStake, 1 ether);
 
         // From here the query lives an ordinary oracle life. Escalate A → B → A; the first report
         // lands 18 hours in, so the reporter-reward ramp is exactly a quarter of the fee.
         vm.warp(vm.getBlockTimestamp() + 18 hours);
-        _report(user, queryId, OUTCOME_A); // 1.1
+        _report(user, queryId, OUTCOME_A); // 1
         vm.warp(vm.getBlockTimestamp() + 12 hours);
-        _report(challenger, queryId, OUTCOME_B); // 2.2
+        _report(challenger, queryId, OUTCOME_B); // 2
         vm.warp(vm.getBlockTimestamp() + 12 hours);
-        _report(bystander, queryId, OUTCOME_A); // 4.4
+        _report(bystander, queryId, OUTCOME_A); // 3, A now holds twice B
         _warpPastAppealWindow(queryId);
 
         // Resolution pays the first correct reporter from the POOL-AVERAGE fee: 1.1 / 4 = 0.275.
@@ -242,10 +243,10 @@ contract QueryTokenizerTest is QueryTokenizerFixtures {
         emit Multiverse.ReporterRewardPaid(user, GENESIS_UID, queryId, 0.275 ether);
         assertEq(_resolve(user, queryId), OUTCOME_A);
 
-        // Claims: stake plus the pro-rata share of the losing 2.2 after the 20% burn
-        // (distributable 1.76 over 5.5 winner-staked).
-        assertEq(_claim(user, queryId, 0), 1.452 ether);
-        assertEq(_claim(bystander, queryId, 2), 5.808 ether);
+        // Claims: stake plus the pro-rata share of the losing 2 after the 20% burn
+        // (distributable 1.6 over 4 winner-staked): user 1 + 0.4, bystander 3 + 1.2.
+        assertEq(_claim(user, queryId), 1.4 ether);
+        assertEq(_claim(bystander, queryId), 4.2 ether);
     }
 
     function test_Redeem_AverageInvariance() public {

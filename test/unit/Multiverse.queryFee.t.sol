@@ -421,25 +421,25 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
 
     function test_QueryFee_CappedFeeQueryIsReportable() public {
         // A query whose fee was capped to exactly half the fork threshold must accept its first
-        // report as an ordinary stake: the required stake equals the capped fee and stays strictly
-        // below the fork threshold. Guards the boundary between the fee cap and the stake rule —
-        // a stake rule that escalates at (rather than above) half the threshold would make every
-        // capped query unreportable. Lives here to keep the cap tests self-contained.
-        uint256 cap = _queryFeeCapWrep();
-        feeCtl.setFee(2 * cap);
-        assertEq(_chargedFee(), cap);
+        // report as an ordinary stake. The first stake is not the fee itself: it is bounded to a
+        // quarter of the per-outcome stake cap (1% of the supply) before rounding, so even a fee
+        // at its cap opens a ladder well below the fork level. Lives here to keep the cap tests
+        // self-contained.
+        uint256 feeCap = _queryFeeCapWrep();
+        feeCtl.setFee(2 * feeCap);
+        assertEq(_chargedFee(), feeCap);
 
-        (uint256 requiredStakeAmount, uint256 forkThreshold) = multiverse.getNextRequiredStake(GENESIS_UID, 0);
-        assertEq(requiredStakeAmount, cap);
-        assertEq(forkThreshold, _forkThresholdWrep());
-        assertLt(requiredStakeAmount, forkThreshold);
+        uint256 firstStakeCap = _capWrep() / multiverse.FIRST_STAKE_CAP_DIVISOR();
+        assertLt(firstStakeCap, feeCap);
+        uint256 requiredStakeAmount = multiverse.getNextRequiredStake(GENESIS_UID, 0, OUTCOME_A);
+        assertEq(requiredStakeAmount, firstStakeCap);
+        assertLt(requiredStakeAmount, _forkThresholdWrep());
 
         vm.prank(user);
         multiverse.report(GENESIS_UID, 0, OUTCOME_A);
 
-        Multiverse.Stake[] memory stakes = multiverse.getStakes(GENESIS_UID, 0);
-        assertEq(stakes.length, 1);
-        assertEq(stakes[0].amount, cap);
+        assertEq(_resolution(0).stakeCount, 1);
+        assertEq(multiverse.getUserStake(GENESIS_UID, 0, user, OUTCOME_A), firstStakeCap);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -471,7 +471,7 @@ contract MultiverseQueryFeeStressTest is QueryFeeTestHelpers {
     //////////////////////////////////////////////////////////////*/
     function test_QueryFee_Stress_OneWeiBaseAtNeutralCharges1Wei() public {
         // 1 wei base at the genesis-neutral point: modifier 1.0, fee = 1 wei. Passes ZeroFee and is
-        // reportable (the first stake equals the 1 wei fee, above the ZeroStakeAmount guard).
+        // reportable (the first stake is derived from the 1 wei fee).
         feeCtl.setFee(1);
 
         assertEq(_chargedFee(), 1);
