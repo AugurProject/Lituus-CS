@@ -65,6 +65,7 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
     mapping(uint256 queryId => mapping(uint256 stakeIndex => uint256)) public ghostStakeAmount;
     mapping(uint256 queryId => mapping(uint256 stakeIndex => address)) public ghostStakeReporter;
     mapping(uint256 queryId => mapping(uint256 stakeIndex => uint8)) public ghostStakeOutcome;
+    mapping(uint256 queryId => mapping(uint256 stakeIndex => uint256)) public ghostStakeTime;
     mapping(uint256 queryId => bool) public ghostResolved;
     mapping(uint256 queryId => uint8) public ghostResolvedOutcome;
     mapping(uint256 queryId => mapping(uint256 stakeIndex => bool)) public ghostClaimed;
@@ -110,6 +111,11 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
         ghostTotalFees += chargedFee;
     }
 
+    /// @dev The time of the latest stake on a query, read off the resolution record.
+    function _lastStakeTime(uint256 queryId) internal view returns (uint256 lastStakeTime) {
+        (,, lastStakeTime,,,,,) = MULTIVERSE.queryResolutions(GENESIS_UID, queryId);
+    }
+
     /// @notice Report on an existing query as a random actor, with a valid outcome that differs
     ///         from the previous one. No-ops when no report can land (nothing created yet, the
     ///         query already resolved, the reporting/appeal window expired, the next stake would
@@ -119,17 +125,12 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
         uint256 queryId = bound(querySeed, 0, ghostQueriesCreated - 1);
         if (ghostResolved[queryId]) return;
 
-        // A stake clamped up to the fork threshold would make report() revert ForkingNotImplemented.
-        (uint256 requiredStake, uint256 forkThreshold) = MULTIVERSE.getNextRequiredStake(GENESIS_UID, queryId);
-        if (requiredStake == 0 || requiredStake >= forkThreshold) return;
-
         // Respect the reporting window for the first report and the appeal window for escalations.
         uint256 stakeCount = ghostStakeCount[queryId];
         if (stakeCount == 0) {
             if (ghostNow > ghostQueryCreateTime[queryId] + MULTIVERSE.THREE_DAYS()) return;
         } else {
-            Multiverse.Stake[] memory stakes = MULTIVERSE.getStakes(GENESIS_UID, queryId);
-            if (ghostNow > uint256(stakes[stakes.length - 1].time) + MULTIVERSE.ONE_DAY()) return;
+            if (ghostNow > _lastStakeTime(queryId) + MULTIVERSE.ONE_DAY()) return;
         }
 
         // Pick from the valid outcome set {1..numberOfOutcomes, INVALID}; when escalating, shift
@@ -141,6 +142,15 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
         if (stakeCount != 0 && outcome == ghostLastOutcome[queryId]) {
             pick = pick % (uint256(numberOfOutcomes) + 1) + 1;
             outcome = pick == uint256(numberOfOutcomes) + 1 ? MULTIVERSE.INVALID() : uint8(pick);
+        }
+
+        // The stake the contract requires for this outcome; an outcome that cannot be staked on
+        // (the leader, or one at the cap) makes the view revert, which is a no-op here.
+        uint256 requiredStake;
+        try MULTIVERSE.getNextRequiredStake(GENESIS_UID, queryId, outcome) returns (uint256 stake) {
+            requiredStake = stake;
+        } catch {
+            return;
         }
 
         address actor = actors[bound(actorSeed, 0, actors.length - 1)];
@@ -155,6 +165,7 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
         ghostStakeAmount[queryId][stakeCount] = requiredStake;
         ghostStakeReporter[queryId][stakeCount] = actor;
         ghostStakeOutcome[queryId][stakeCount] = outcome;
+        ghostStakeTime[queryId][stakeCount] = ghostNow;
         ++ghostStakeCount[queryId];
         ghostLastOutcome[queryId] = outcome;
         ghostQueryStaked[queryId] += requiredStake;
@@ -182,8 +193,7 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
         if (stakeCount == 0) {
             if (ghostNow <= ghostQueryCreateTime[queryId] + MULTIVERSE.THREE_DAYS()) return;
         } else {
-            Multiverse.Stake[] memory stakes = MULTIVERSE.getStakes(GENESIS_UID, queryId);
-            if (ghostNow <= uint256(stakes[stakes.length - 1].time) + MULTIVERSE.ONE_DAY()) return;
+            if (ghostNow <= _lastStakeTime(queryId) + MULTIVERSE.ONE_DAY()) return;
         }
 
         uint8 winnerOutcome = stakeCount == 0 ? MULTIVERSE.INVALID() : ghostLastOutcome[queryId];
@@ -243,27 +253,27 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
         ghostResolved[queryId] = true;
         ghostResolvedOutcome[queryId] = winnerOutcome;
 
-        // Observe settlement through the contract's own settled flag (amount == 0) instead of
-        // mirroring resolve()'s internals. ONLY a single-stake
+        // Observe settlement through the contract's own settled flag (the staker's balance on the
+        // winning outcome zeroed) instead of mirroring resolve()'s internals. ONLY a single-stake
         // query is auto-settled.
         uint256 settledCount;
-        if (stakeCount > 0) {
-            Multiverse.Stake[] memory stakesAfter = MULTIVERSE.getStakes(GENESIS_UID, queryId);
-            for (uint256 i = 0; i < stakeCount; ++i) {
-                if (stakesAfter[i].amount == 0) {
-                    ghostClaimed[queryId][i] = true;
-                    ++ghostClaimsPerformed;
-                    ++settledCount;
-                }
+        for (uint256 i = 0; i < stakeCount; ++i) {
+            if (ghostStakeOutcome[queryId][i] != winnerOutcome) continue;
+            address owner = ghostStakeReporter[queryId][i];
+            if (MULTIVERSE.getUserStake(GENESIS_UID, queryId, owner, winnerOutcome) == 0) {
+                ghostClaimed[queryId][i] = true;
+                ++settledCount;
             }
         }
+        if (settledCount > 0) ++ghostClaimsPerformed;
         require(settledCount == (stakeCount == 1 ? 1 : 0), "resolveQuery: unexpected auto-settlement");
     }
 
-    /// @notice Claim a winning, still-unclaimed stake on a resolved query, pranked as the stake's
-    ///         own reporter. No-ops when the query is unresolved or nothing is claimable on it.
-    /// @dev    The payout amount is observed, but bounded independently of the payout formula:
-    ///         a winner gets at least their stake back and never more than the query's whole
+    /// @notice Claim the payout of a winning, still-unclaimed staker on a resolved query, pranked as
+    ///         that staker. No-ops when the query is unresolved or nothing is claimable on it.
+    /// @dev    A claim settles every stake the staker placed on the winning outcome at once. The
+    ///         payout amount is observed, but bounded independently of the payout formula: a
+    ///         winner gets at least those stakes back and never more than the query's whole
     ///         ladder, so a zero/under/over-payment regression reverts here.
     function claimStake(uint256 querySeed, uint256 stakeSeed) external {
         if (ghostQueriesCreated == 0) return;
@@ -274,7 +284,7 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
         if (stakeCount == 0) return;
 
         // Scan the per-stake ghosts for a winning, unclaimed stake, starting from a random
-        // offset for coverage.
+        // offset for coverage; its reporter claims, settling all their stakes on the outcome.
         uint8 winnerOutcome = ghostResolvedOutcome[queryId];
         uint256 offset = bound(stakeSeed, 0, stakeCount - 1);
         for (uint256 i = 0; i < stakeCount; ++i) {
@@ -283,16 +293,23 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
             if (ghostStakeOutcome[queryId][stakeIndex] != winnerOutcome) continue;
 
             address owner = ghostStakeReporter[queryId][stakeIndex];
+            uint256 ownerStaked;
+            for (uint256 j = 0; j < stakeCount; ++j) {
+                if (ghostStakeReporter[queryId][j] == owner && ghostStakeOutcome[queryId][j] == winnerOutcome) {
+                    ownerStaked += ghostStakeAmount[queryId][j];
+                    ghostClaimed[queryId][j] = true;
+                }
+            }
+
             uint256 ownerBalanceBefore = REP.balanceOf(owner);
             vm.prank(owner);
-            MULTIVERSE.claim(GENESIS_UID, queryId, stakeIndex);
+            MULTIVERSE.claim(GENESIS_UID, queryId);
 
             uint256 payout = REP.balanceOf(owner) - ownerBalanceBefore;
-            require(payout >= ghostStakeAmount[queryId][stakeIndex], "claimStake: winner paid less than the stake");
+            require(payout >= ownerStaked, "claimStake: winner paid less than the stake");
             require(payout <= ghostQueryStaked[queryId], "claimStake: payout exceeds the query's ladder");
             ghostTotalPaidOut += payout;
             ghostActorReceived[owner] += payout;
-            ghostClaimed[queryId][stakeIndex] = true;
             ++ghostClaimsPerformed;
             return;
         }

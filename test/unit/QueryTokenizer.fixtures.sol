@@ -17,10 +17,11 @@ import { MultiverseFixtures } from "./Multiverse.fixtures.sol";
 ///      (`setMultiverse` — the deployer is this test contract). The funded actors additionally
 ///      approve the tokenizer on the genesis Lituus REP, since `mint` pulls wREP from the caller.
 abstract contract QueryTokenizerFixtures is MultiverseFixtures {
-    // The funded actors wrap 3 × 1000 underlying into the genesis vault, so MockZoltar's fork
-    // threshold is 3000 / 20 = 150 REP. Half of it — the cap on both the tokenizer's mint price
-    // and the direct-path query fee — is the single derivation every cap assertion builds on.
-    uint256 internal constant HALF_FORK_THRESHOLD = 75 ether;
+    // The funded fixture holds 3200 underlying (3 × 1000 wrapped by the actors plus the 200 top-up
+    // that aligns the fee with the cap grid), so MockZoltar's fork threshold is 3200 / 20 = 160 REP.
+    // Half of it — the cap on both the tokenizer's mint price and the direct-path query fee — is
+    // the single derivation every cap assertion builds on.
+    uint256 internal constant HALF_FORK_THRESHOLD = 80 ether;
 
     QueryTokenizer internal tokenizer;
 
@@ -116,7 +117,9 @@ abstract contract QueryTokenizerFixtures is MultiverseFixtures {
         assertEq(fee, price);
         assertEq(question, DEFAULT_QUESTION);
 
-        (uint48 queryCreateTime, uint8 outcome,,) = multiverse.queryResolutions(GENESIS_UID, queryId);
+        ResolutionView memory r = _resolution(queryId);
+        uint48 queryCreateTime = r.queryCreateTime;
+        uint8 outcome = r.outcome;
         assertEq(queryCreateTime, uint48(vm.getBlockTimestamp()));
         assertEq(outcome, multiverse.UNRESOLVED());
     }

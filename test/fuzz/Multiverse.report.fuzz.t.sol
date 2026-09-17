@@ -17,10 +17,10 @@ contract MultiverseReportFuzzTest is MultiverseFuzzFixtures {
         vm.prank(user);
         multiverse.report(GENESIS_UID, queryId, outcome);
 
-        Multiverse.Stake[] memory stakes = multiverse.getStakes(GENESIS_UID, queryId);
-        assertEq(stakes.length, 1);
-        assertEq(stakes[0].reportedOutcome, outcome);
-        assertEq(stakes[0].amount, DEFAULT_FEE);
+        ResolutionView memory r = _resolution(queryId);
+        assertEq(r.stakeCount, 1);
+        assertEq(r.lastReportedOutcome, outcome);
+        assertEq(multiverse.getUserStake(GENESIS_UID, queryId, user, outcome), DEFAULT_FEE);
     }
 
     /// @dev Property: a first report any time up to and including the deadline succeeds.
@@ -32,7 +32,7 @@ contract MultiverseReportFuzzTest is MultiverseFuzzFixtures {
         vm.prank(user);
         multiverse.report(GENESIS_UID, queryId, 1);
 
-        assertEq(multiverse.getStakes(GENESIS_UID, queryId).length, 1);
+        assertEq(_resolution(queryId).stakeCount, 1);
     }
 
     /// @dev Property: a first report any time past the deadline always reverts.
@@ -46,24 +46,48 @@ contract MultiverseReportFuzzTest is MultiverseFuzzFixtures {
         multiverse.report(GENESIS_UID, queryId, 1);
     }
 
-    /// @dev Property: each escalation doubles the previous stake and the contract holds
-    /// the creation fee plus every stake.
-    function testFuzz_Report_EscalationDoubles(uint8 rounds) public {
+    /// @dev Property: the first stake never differs from the query fee by more than a factor of
+    /// sqrt(2), and always divides the per-outcome cap evenly. The fee range starts well above the
+    /// point where the halving steps stop dividing the cap exactly, and ends at the quarter-cap
+    /// bound so the fee itself is what gets rounded.
+    function testFuzz_Report_FirstStakeWithinSqrtTwoOfFee(uint256 fee) public {
+        uint256 cap = _capWrep();
+        fee = bound(fee, 1e13, cap / multiverse.FIRST_STAKE_CAP_DIVISOR());
+        feeCtl.setFee(fee);
+
+        uint256 queryId = _createQuery();
+        (,, uint256 chargedFee,) = multiverse.queries(queryId);
+        uint256 firstStake = multiverse.getNextRequiredStake(GENESIS_UID, queryId, 1);
+
+        // Both directions of the bound, squared to avoid a square root: stake^2 <= 2 * fee^2 and
+        // fee^2 <= 2 * stake^2.
+        assertLe(firstStake * firstStake, 2 * chargedFee * chargedFee);
+        assertLe(chargedFee * chargedFee, 2 * firstStake * firstStake);
+        assertEq(cap % firstStake, 0);
+    }
+
+    /// @dev Property: after every escalation the outcome just staked on holds exactly twice the total
+    /// of every other outcome (the ladder never reaches the cap at these depths), and the contract
+    /// holds the creation fee plus every stake.
+    function testFuzz_Report_EscalationKeepsLeaderAtDoubleTheRest(uint8 rounds) public {
         rounds = uint8(bound(uint256(rounds), 1, 5));
         uint256 queryId = _createQuery();
 
-        for (uint256 i = 0; i < rounds; i++) {
-            vm.prank(user);
-            multiverse.report(GENESIS_UID, queryId, i % 2 == 0 ? 1 : 2);
-        }
-
-        Multiverse.Stake[] memory stakes = multiverse.getStakes(GENESIS_UID, queryId);
-        assertEq(stakes.length, rounds);
         uint256 totalStaked;
         for (uint256 i = 0; i < rounds; i++) {
-            assertEq(stakes[i].amount, DEFAULT_FEE << i);
-            totalStaked += stakes[i].amount;
+            uint8 outcome = i % 2 == 0 ? 1 : 2;
+            uint256 stake = multiverse.getNextRequiredStake(GENESIS_UID, queryId, outcome);
+            vm.prank(user);
+            multiverse.report(GENESIS_UID, queryId, outcome);
+            totalStaked += stake;
+
+            uint256 onOutcome = multiverse.getOutcomeStakes(GENESIS_UID, queryId, outcome).totalOutcomeStaked;
+            if (i == 0) assertEq(stake, DEFAULT_FEE);
+            else assertEq(onOutcome, 2 * (totalStaked - onOutcome));
         }
+
+        assertEq(_resolution(queryId).stakeCount, rounds);
+        assertEq(_resolution(queryId).totalStaked, totalStaked);
         assertEq(genesisRep.balanceOf(address(multiverse)), DEFAULT_FEE + totalStaked);
     }
 
@@ -78,7 +102,7 @@ contract MultiverseReportFuzzTest is MultiverseFuzzFixtures {
         vm.prank(user);
         multiverse.report(GENESIS_UID, queryId, 2);
 
-        assertEq(multiverse.getStakes(GENESIS_UID, queryId).length, 2);
+        assertEq(_resolution(queryId).stakeCount, 2);
     }
 
     /// @dev Property: an escalation any time past the appeal deadline always reverts.
