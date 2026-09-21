@@ -119,6 +119,88 @@ contract MultiverseClaimTest is MultiverseFixtures {
         assertEq(genesisRep.balanceOf(address(multiverse)), 0);
     }
 
+    function test_Claim_OnlyWinningSideOfAStakerIsPaid() public {
+        // user backs A and later B; B wins. The claim pays user's B stake with its share and leaves the
+        // A stake where it is: it was lost. Ladder: A 1 (user), B 2 (challenger), A 3 (bystander),
+        // B 6 (user), so B holds 8 and A holds 4.
+        uint256 queryId = _createDefaultQuery();
+        _report(user, queryId, OUTCOME_A);
+        _report(challenger, queryId, OUTCOME_B);
+        _report(bystander, queryId, OUTCOME_A);
+        _report(user, queryId, OUTCOME_B);
+        _warpPastAppealWindow(queryId);
+        assertEq(_resolve(bystander, queryId), OUTCOME_B);
+
+        // Losers staked 4 ether: 0.8 burned, 3.2 to the winners.
+        // user: 6 + 6 * 3.2 / 8 = 8.4, challenger: 2 + 2 * 3.2 / 8 = 2.8
+        assertEq(_claim(user, queryId), 8.4 ether);
+        assertEq(multiverse.getUserStake(GENESIS_UID, queryId, user, OUTCOME_A), 1 ether);
+        assertEq(_claim(challenger, queryId), 2.8 ether);
+    }
+
+    function test_Claim_SeveralWinningStakesSettleInOneClaim() public {
+        // user backs A twice (1 and 3 ether) and A wins: one claim pays both stakes together, and a
+        // second claim finds nothing.
+        uint256 queryId = _createDefaultQuery();
+        _report(user, queryId, OUTCOME_A);
+        _report(challenger, queryId, OUTCOME_B);
+        _report(user, queryId, OUTCOME_A);
+        _warpPastAppealWindow(queryId);
+        assertEq(_resolve(bystander, queryId), OUTCOME_A);
+
+        // Losers staked 2 ether: 0.4 burned, 1.6 to the winner. user: 4 + 1.6 = 5.6
+        assertEq(_claim(user, queryId), 5.6 ether);
+
+        vm.expectRevert(Multiverse.NothingToClaim.selector);
+        vm.prank(user);
+        multiverse.claim(GENESIS_UID, queryId);
+    }
+
+    function test_Claim_InvalidWinnerStakersClaim() public {
+        // INVALID is an ordinary outcome: it can win a multi-stake ladder and its backers claim like any
+        // winner. Ladder: A 1 (user), INVALID 2 (challenger), A 3 (user), INVALID 6 (bystander).
+        uint256 queryId = _createDefaultQuery();
+        _report(user, queryId, OUTCOME_A);
+        _report(challenger, queryId, multiverse.INVALID());
+        _report(user, queryId, OUTCOME_A);
+        _report(bystander, queryId, multiverse.INVALID());
+        _warpPastAppealWindow(queryId);
+        assertEq(_resolve(user, queryId), multiverse.INVALID());
+
+        // Losers staked 4 ether: 0.8 burned, 3.2 to the winners.
+        // challenger: 2 + 2 * 3.2 / 8 = 2.8, bystander: 6 + 6 * 3.2 / 8 = 8.4
+        assertEq(_claim(challenger, queryId), 2.8 ether);
+        assertEq(_claim(bystander, queryId), 8.4 ether);
+
+        vm.expectRevert(Multiverse.NothingToClaim.selector);
+        vm.prank(user);
+        multiverse.claim(GENESIS_UID, queryId);
+    }
+
+    function test_Claim_ThreeOutcomesWinnerAtCap() public {
+        // With three outcomes the losing stakes can outweigh half the winner's. The last stake on A is
+        // bounded by the cap (it would need 87 to double the rest, only 31 fits), so A wins holding 32
+        // against 14 on B and 30 on C, and collects 80% of all 44 lost.
+        // Ladder: A 1, B 2, C 6, B 12, C 24, A 31.
+        uint256 queryId = _createDefaultQuery();
+        _report(user, queryId, OUTCOME_A);
+        _report(challenger, queryId, OUTCOME_B);
+        _report(bystander, queryId, OUTCOME_C);
+        _report(challenger, queryId, OUTCOME_B);
+        _report(bystander, queryId, OUTCOME_C);
+        _report(user, queryId, OUTCOME_A);
+
+        ResolutionView memory r = _resolution(queryId);
+        assertEq(multiverse.getOutcomeStakes(GENESIS_UID, queryId, OUTCOME_A).totalOutcomeStaked, r.cap);
+        assertEq(r.noOfOutcomesAtCap, 1);
+
+        _warpPastAppealWindow(queryId);
+        assertEq(_resolve(challenger, queryId), OUTCOME_A);
+
+        // Losers staked 44 ether: 8.8 burned, 35.2 to the winner. user: 32 + 35.2 = 67.2
+        assertEq(_claim(user, queryId), 67.2 ether);
+    }
+
     /*//////////////////////////////////////////////////////////////
                           CLAIM - REVERT PATHS
     //////////////////////////////////////////////////////////////*/

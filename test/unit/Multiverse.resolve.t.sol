@@ -580,6 +580,63 @@ contract MultiverseResolveTest is MultiverseFixtures {
         assertEq(_claim(bystander, queryId), 33.6 ether);
     }
 
+    function test_Resolve_Ladder_FeeRewardGoesToWinningOutcomeFirstReporter() public {
+        // The fee reward belongs to whoever first backed the winning outcome, not to the query's first
+        // reporter: user opens on A, challenger answers B and B wins. The ramp is measured from
+        // challenger's own report, 36h in, so the reward is half the fee.
+        uint256 queryId = _createDefaultQuery();
+
+        vm.warp(START_TIME + 18 hours);
+        _report(user, queryId, OUTCOME_A); // 1 ether
+        vm.warp(START_TIME + 36 hours);
+        _report(challenger, queryId, OUTCOME_B); // 2 ether
+        _warpPastAppealWindow(queryId);
+
+        uint256 userBalanceBefore = genesisRep.balanceOf(user);
+        uint256 challengerBalanceBefore = genesisRep.balanceOf(challenger);
+
+        vm.expectEmit(true, true, true, true, address(multiverse));
+        emit Multiverse.ReporterRewardPaid(challenger, GENESIS_UID, queryId, 0.5 ether);
+        assertEq(_resolve(bystander, queryId), OUTCOME_B);
+
+        // The reward is pushed at resolve; user reported first but on the losing side and gets nothing.
+        assertEq(genesisRep.balanceOf(challenger), challengerBalanceBefore + 0.5 ether);
+        assertEq(genesisRep.balanceOf(user), userBalanceBefore);
+
+        // Losers staked 1 ether: 0.2 burned, 0.8 to the winners. challenger: 2 + 2 * 0.8 / 2 = 2.8
+        assertEq(_claim(challenger, queryId), 2.8 ether);
+        vm.expectRevert(Multiverse.NothingToClaim.selector);
+        vm.prank(user);
+        multiverse.claim(GENESIS_UID, queryId);
+    }
+
+    function test_Resolve_Ladder_LateWinningOutcomeEarnsWholeFee() public {
+        // An outcome can first be backed after the reporting window, as an appeal. If it wins, its first
+        // reporter's ramp runs past THREE_DAYS and pays the whole fee. Ladder: A 1, B 2, A 3, then C
+        // enters at 78h with twice the pot (12) and wins.
+        uint256 queryId = _createDefaultQuery();
+
+        vm.warp(START_TIME + 12 hours);
+        _report(user, queryId, OUTCOME_A); // 1 ether
+        vm.warp(START_TIME + 34 hours);
+        _report(challenger, queryId, OUTCOME_B); // 2 ether
+        vm.warp(START_TIME + 56 hours);
+        _report(user, queryId, OUTCOME_A); // 3 ether, A holds 4
+        vm.warp(START_TIME + 78 hours);
+        _report(bystander, queryId, OUTCOME_C); // 12 ether
+        _warpPastAppealWindow(queryId);
+
+        uint256 bystanderBalanceBefore = genesisRep.balanceOf(bystander);
+
+        vm.expectEmit(true, true, true, true, address(multiverse));
+        emit Multiverse.ReporterRewardPaid(bystander, GENESIS_UID, queryId, DEFAULT_FEE);
+        assertEq(_resolve(challenger, queryId), OUTCOME_C);
+        assertEq(genesisRep.balanceOf(bystander), bystanderBalanceBefore + DEFAULT_FEE);
+
+        // Losers staked 4 + 2 = 6 ether: 1.2 burned, 4.8 to the winner. bystander: 12 + 4.8 = 16.8
+        assertEq(_claim(bystander, queryId), 16.8 ether);
+    }
+
     /*//////////////////////////////////////////////////////////////
                 RESOLVE - TIMING BOUNDARIES & MISC
     //////////////////////////////////////////////////////////////*/

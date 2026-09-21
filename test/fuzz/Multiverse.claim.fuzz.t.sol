@@ -13,10 +13,40 @@ import { MultiverseFuzzFixtures } from "./Multiverse.fuzz.fixtures.sol";
 ///      bound keeps the leading outcome's total (128 times the first stake after MAX_ROUNDS rounds)
 ///      below the per-outcome cap of this suite's supply (3200e18 -> cap 32e18), so no stake ever
 ///      lands on the cap, and keeps every actor's cumulative stakes within USER_REP_BALANCE.
+///
+///      The random-ladder properties spread stakes over A, B, C and INVALID and over four reporters,
+///      so several accounts can share the winning side. The two extra reporters get wREP wrapped
+///      from the test contract's unwrapped REP and transferred to them: nothing is minted, so the
+///      REP supply, and with it the cap, stays where the fixture put it.
 contract MultiverseClaimFuzzTest is MultiverseFuzzFixtures {
     uint256 internal constant MIN_ROUNDS = 2;
     uint256 internal constant MAX_ROUNDS = 8;
     uint256 internal constant MAX_LADDER_FEE = 0.1 ether;
+    uint256 internal constant RANDOM_LADDER_STEPS = 12;
+    uint256 internal constant EXTRA_REPORTER_BALANCE = 500 ether;
+
+    address internal reporterTwo = makeAddr("reporterTwo");
+    address internal reporterThree = makeAddr("reporterThree");
+    address[] internal reporters;
+
+    function setUp() public override {
+        super.setUp();
+
+        underlying.approve(address(genesisRep), type(uint256).max);
+        multiverse.wrap(GENESIS_UID, 2 * EXTRA_REPORTER_BALANCE, 0);
+        address[2] memory extraReporters = [reporterTwo, reporterThree];
+        for (uint256 i = 0; i < extraReporters.length; i++) {
+            genesisRep.transfer(extraReporters[i], EXTRA_REPORTER_BALANCE);
+            vm.prank(extraReporters[i]);
+            genesisRep.approve(address(multiverse), type(uint256).max);
+        }
+        assertEq(_capWrep(), 32 * DEFAULT_FEE);
+
+        reporters.push(user);
+        reporters.push(reporter);
+        reporters.push(reporterTwo);
+        reporters.push(reporterThree);
+    }
 
     /// @dev Builds a same-block ladder like _buildLadder while adding up what each outcome and the
     ///      whole query received, from the stake required before each report, so the totals the
@@ -139,5 +169,123 @@ contract MultiverseClaimFuzzTest is MultiverseFuzzFixtures {
             uint8 outcome = _resolution(queryIds[i]).outcome;
             assertEq(multiverse.getUserStake(GENESIS_UID, queryIds[i], winner, outcome), 0);
         }
+    }
+
+    /// @dev Builds a ladder on a fresh query from a random sequence of outcomes (A, B, C, INVALID) and
+    ///      reporters, all in one block. A step that report() would reject (restating the latest outcome,
+    ///      or an outcome already holding twice the rest) is skipped, and so is a step that would bring a
+    ///      second outcome to the cap: that is a fork, and these properties are about ordinary resolution.
+    /// @return queryId The id of the reported query.
+    /// @return steps How many reports landed.
+    function _buildRandomLadder(uint256 seed) internal returns (uint256 queryId, uint256 steps) {
+        queryId = _createQuery();
+        uint8[4] memory outcomes = [uint8(1), 2, 3, multiverse.INVALID()];
+        for (uint256 i = 0; i < RANDOM_LADDER_STEPS; i++) {
+            uint256 word = uint256(keccak256(abi.encode(seed, i)));
+            uint8 outcome = outcomes[word % outcomes.length];
+
+            uint256 requiredStake;
+            try multiverse.getNextRequiredStake(GENESIS_UID, queryId, outcome) returns (uint256 stake) {
+                requiredStake = stake;
+            } catch {
+                continue;
+            }
+            ResolutionView memory r = _resolution(queryId);
+            if (r.noOfOutcomesAtCap == 1) {
+                uint256 onOutcome = multiverse.getOutcomeStakes(GENESIS_UID, queryId, outcome).totalOutcomeStaked;
+                if (onOutcome + requiredStake == r.cap) continue;
+            }
+
+            vm.prank(reporters[(word >> 8) % reporters.length]);
+            multiverse.report(GENESIS_UID, queryId, outcome);
+            ++steps;
+        }
+    }
+
+    /// @dev Resolves `queryId` after its appeal window and has every reporter holding a stake on the
+    ///      winning outcome claim it.
+    /// @return winnerStaked The winning outcome's total stake.
+    /// @return totalDistributable The losing stakes after the burn cut.
+    /// @return paidOut The sum of all claim payouts.
+    /// @return claimants How many accounts claimed.
+    function _resolveAndClaimAll(uint256 queryId)
+        internal
+        returns (uint256 winnerStaked, uint256 totalDistributable, uint256 paidOut, uint256 claimants)
+    {
+        vm.warp(vm.getBlockTimestamp() + multiverse.ONE_DAY() + 1);
+        vm.prank(resolver);
+        multiverse.resolve(GENESIS_UID, queryId);
+
+        ResolutionView memory r = _resolution(queryId);
+        winnerStaked = multiverse.getOutcomeStakes(GENESIS_UID, queryId, r.outcome).totalOutcomeStaked;
+        uint256 totalLoserStakes = uint256(r.totalStaked) - winnerStaked;
+        totalDistributable = totalLoserStakes - totalLoserStakes / multiverse.BURN_DIVIDER();
+
+        for (uint256 i = 0; i < reporters.length; i++) {
+            if (multiverse.getUserStake(GENESIS_UID, queryId, reporters[i], r.outcome) == 0) continue;
+            uint256 balanceBefore = genesisRep.balanceOf(reporters[i]);
+            vm.prank(reporters[i]);
+            multiverse.claim(GENESIS_UID, queryId);
+            paidOut += genesisRep.balanceOf(reporters[i]) - balanceBefore;
+            ++claimants;
+        }
+    }
+
+    /// @dev Property: on a two-outcome ladder of any depth and any fee, the winner ends up holding
+    /// exactly twice what lost, so the winner's profit is exactly 40% of the winning stake, to the wei.
+    /// The fee is bounded so the ladder never brings a second outcome to the cap within MAX depth.
+    function testFuzz_Claim_TwoOutcomesWinnersEarnExactlyFortyPercent(uint256 rounds, uint256 fee) public {
+        rounds = bound(rounds, 2, 6);
+        fee = bound(fee, 1e13, _capWrep() / 32);
+        feeCtl.setFee(fee);
+
+        uint256 queryId = _buildLadder(rounds);
+        vm.warp(vm.getBlockTimestamp() + multiverse.ONE_DAY() + 1);
+        vm.prank(resolver);
+        multiverse.resolve(GENESIS_UID, queryId);
+
+        ResolutionView memory r = _resolution(queryId);
+        uint256 winnerStaked = multiverse.getOutcomeStakes(GENESIS_UID, queryId, r.outcome).totalOutcomeStaked;
+        uint256 loserStaked = uint256(r.totalStaked) - winnerStaked;
+        assertEq(winnerStaked, 2 * loserStaked);
+
+        address winner = _winnerOf(rounds);
+        uint256 balanceBefore = genesisRep.balanceOf(winner);
+        vm.prank(winner);
+        multiverse.claim(GENESIS_UID, queryId);
+        uint256 profit = genesisRep.balanceOf(winner) - balanceBefore - winnerStaked;
+
+        assertEq(profit * 5, winnerStaked * 2);
+    }
+
+    /// @dev Property: whatever the mix of outcomes, the winners together never earn less than 40% of
+    /// what they staked. The latest stake leaves its outcome at twice the rest or at the cap, below
+    /// twice the rest, so the losers always hold at least half the winning stake. The tolerance of one
+    /// wei per claimant covers the rounding of each payout.
+    function testFuzz_Claim_WinnersNeverEarnLessThanFortyPercent(uint256 seed) public {
+        (uint256 queryId, uint256 steps) = _buildRandomLadder(seed);
+        vm.assume(steps >= 2);
+
+        (uint256 winnerStaked,, uint256 paidOut, uint256 claimants) = _resolveAndClaimAll(queryId);
+        uint256 profit = paidOut - winnerStaked;
+
+        assertGe((profit + claimants) * 5, winnerStaked * 2);
+    }
+
+    /// @dev Property: whatever the mix of outcomes and winners, claims never pay out more than the
+    /// winning stake plus the distributable losing stakes, each claim rounds away less than one wei,
+    /// and what the rounding leaves is exactly what stays in the contract once every winner has
+    /// claimed: the fee and the burned fifth are gone, nothing else is left behind.
+    function testFuzz_Claim_PayoutsNeverExceedWhatLostAndDustIsBounded(uint256 seed) public {
+        (uint256 queryId, uint256 steps) = _buildRandomLadder(seed);
+        vm.assume(steps >= 2);
+
+        (uint256 winnerStaked, uint256 totalDistributable, uint256 paidOut, uint256 claimants) =
+            _resolveAndClaimAll(queryId);
+        uint256 owed = winnerStaked + totalDistributable;
+
+        assertLe(paidOut, owed);
+        assertLt(owed - paidOut, claimants);
+        assertEq(genesisRep.balanceOf(address(multiverse)), owed - paidOut);
     }
 }
