@@ -22,4 +22,8 @@ contract MockQueryFeeController is IQueryFeeController {
     function changeBaseFee(uint248, uint256, uint256) external {
         fee = INITIAL_BASE_FEE;
     }
+
+    function initializeFeeState(uint248, uint256) external {
+        // no-op: the mock returns the same flat fee for every universe
+    }
 }

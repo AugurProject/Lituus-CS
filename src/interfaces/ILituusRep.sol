@@ -81,6 +81,18 @@ interface ILituusRep is IERC20 {
     /// @return shares The amount of shares burned from `sender`.
     function unwrapAssets(address sender, uint256 assets) external returns (uint256 shares);
 
+    /// @notice Moves `from`'s shares out of the vault as underlying, sent to the owner (the Multiverse).
+    /// @dev The fork-migration exit: burns `shares` from `from`, debits the asset ledger by
+    ///      `shares * rate / SCALE` rounded DOWN, and transfers that underlying to the OWNER — the
+    ///      Multiverse then routes it through Zoltar migration into a child universe. Deliberately
+    ///      exempt from the unwrap pause (it does not route through `unwrap`): the pause keeps the
+    ///      underlying from leaving the electorate, while migration IS the electorate voting.
+    ///      Rate-preserving: shares and assets leave proportionally. Only the owner may call.
+    /// @param from The account whose shares are burned.
+    /// @param shares The exact amount of shares to migrate out.
+    /// @return assets The amount of underlying REP transferred to the owner.
+    function migrateOut(address from, uint256 shares) external returns (uint256 assets);
+
     /* ============================================== BURN FUNCTIONS ============================================= */
 
     /// @notice Burns shares from the owner's balance and recomputes the rate.

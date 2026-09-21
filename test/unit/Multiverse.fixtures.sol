@@ -70,11 +70,11 @@ abstract contract MultiverseDeployFixture is Test {
 
         underlying = new MockERC20("Underlying", "U");
         zoltarQuestionData = new MockZoltarQuestionData();
-        zoltar = new MockZoltar(IReputationToken(address(underlying)), zoltarQuestionData);
+        zoltar = new MockZoltar(IReputationToken(address(underlying)), zoltarQuestionData, GENESIS_UID);
         IQueryFeeController controller = _deployFeeController();
         multiverse = _deployMultiverse(controller);
 
-        (ILituusRep repToken,,,,,,,,,) = multiverse.universes(GENESIS_UID);
+        (ILituusRep repToken,,,,,,,,,,) = multiverse.universes(GENESIS_UID);
         genesisRep = repToken;
 
         _afterProtocolDeploy();

@@ -119,7 +119,8 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
         uint256 queryId = bound(querySeed, 0, ghostQueriesCreated - 1);
         if (ghostResolved[queryId]) return;
 
-        // A stake clamped up to the fork threshold would make report() revert ForkingNotImplemented.
+        // A stake clamped up to the fork threshold would fork the universe; this handler models
+        // the pre-fork escalation game only, so fork-level reports are skipped.
         (uint256 requiredStake, uint256 forkThreshold) = MULTIVERSE.getNextRequiredStake(GENESIS_UID, queryId);
         if (requiredStake == 0 || requiredStake >= forkThreshold) return;
 
