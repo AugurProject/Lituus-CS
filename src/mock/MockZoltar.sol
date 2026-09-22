@@ -30,6 +30,9 @@ contract MockZoltar is IZoltar {
     // Caller-keyed migration balances per parent universe (credit-only stub: the parent REP is not
     // actually locked/burned here).
     mapping(address holder => mapping(uint248 universeId => uint256)) public migrationBalances;
+    // Cumulative amount split per child outcome, capped by the holder's persistent balance.
+    mapping(address holder => mapping(uint248 universeId => mapping(uint256 outcomeIndex => uint256))) public
+        splitPerChild;
 
     error ChildNotDeployed();
     error ChildAlreadyDeployed();
@@ -99,10 +102,13 @@ contract MockZoltar is IZoltar {
         migrationBalances[msg.sender][universeId] += amount;
     }
 
-    /// @dev Mints the child's mock REP to the caller against their migration balance, 1:1.
+    /// @dev Mints the child's mock REP to the caller 1:1 against their persistent migration
+    ///      balance: the per-child cumulative draw may not exceed the balance, but the balance is
+    ///      never decremented — duplication across mutually exclusive child worlds is the design.
     function splitMigrationRep(uint248 universeId, uint256 amount, uint256 outcomeIndex) external {
-        if (migrationBalances[msg.sender][universeId] < amount) revert InsufficientMigrationBalance();
-        migrationBalances[msg.sender][universeId] -= amount;
+        uint256 spent = splitPerChild[msg.sender][universeId][outcomeIndex] + amount;
+        if (spent > migrationBalances[msg.sender][universeId]) revert InsufficientMigrationBalance();
+        splitPerChild[msg.sender][universeId][outcomeIndex] = spent;
         uint248 childUniverseId = getChildUniverseId(universeId, outcomeIndex);
         IReputationToken childToken = childRepTokens[childUniverseId];
         if (address(childToken) == address(0)) revert ChildNotDeployed();

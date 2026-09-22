@@ -50,7 +50,9 @@ contract MultiverseConstructorTest is MultiverseFixtures {
             uint128 totalMigratedIn,
             uint128 maxMigratedOut,
             uint256 forkQuery,
-            uint256 totalMigratedOut
+            uint256 totalMigratedOut,
+            uint256 totalQueryFees,
+            uint256 unmigratedSupply
         ) = newMultiverse.universes(GENESIS_UID);
 
         assertTrue(address(repToken) != address(0));
@@ -66,6 +68,9 @@ contract MultiverseConstructorTest is MultiverseFixtures {
         assertEq(forkQuery, 0);
         // totalMigratedOut stays 0 until the universe forks and migration begins.
         assertEq(totalMigratedOut, 0);
+        // No queries yet, no parked pot.
+        assertEq(totalQueryFees, 0);
+        assertEq(unmigratedSupply, 0);
         // The canonical timeline starts at the genesis.
         assertEq(newMultiverse.canonicalHeir(), GENESIS_UID);
     }

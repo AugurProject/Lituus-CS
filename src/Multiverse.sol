@@ -127,6 +127,19 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         // complete. Read at the end of migration it is the
         // 2/3-supermajority denominator and the max supply for SupplyRestoration.
         uint128 totalMigratedOut;
+        // Packed together into one slot; both are REP amounts within uint128.
+        // Unconsumed query fees held for this universe, in nominal wREP shares: += at createQuery,
+        // -= when a resolution consumes the fee (reporter/resolver share + burn). At a fork the
+        // aggregate (minus the forking query's own fee) is split into EVERY child at its spawn,
+        // funding inherited queries' resolutions there; the counter carries recursively.
+        uint128 totalQueryFees;
+        // The supply for migration at fork, in underlying assets: the contract's entire wREP balance (fees,
+        // forking-query stakes, other stakes/winnings), moved into the Zoltar migration balance in
+        // the fork tx. Written once. Supply committed to the child level but not yet realized as
+        // counted migration — SR max supply = totalMigratedOut + unmigratedSupply. Future
+        // stake-claims move value across (parked -> counted); fee splits move neither (per-world
+        // duplicated copies). Kept locally: Zoltar's balance would include foreign flows.
+        uint128 unmigratedSupply;
     }
 
     struct UniverseStatistics {
@@ -512,6 +525,11 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         query.fee = fee;
         query.question = question;
 
+        // The fee joins the universe's unconsumed-fee aggregate, migrated to children at a fork.
+        // Fees are REP amounts within uint128.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        universes[currentUniverseId].totalQueryFees += uint128(fee);
+
         // A universe-specific resolution record starts with outcome == UNRESOLVED.
         // Set the queryCreateTime so the reporting window can be enforced in this universe.
         QueryResolution storage resolution = queryResolutions[currentUniverseId][queryCount];
@@ -639,6 +657,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
             uint256 queryFee = queries[queryId].fee;
             uint256 resolverPay = _timeBasedFeeShare(queryFee, block.timestamp - (queryCreateTime + THREE_DAYS));
             uint256 profit = queryFee - resolverPay;
+            _consumeQueryFee(universe, queryFee);
             emit ResolverRewardPaid(msg.sender, universeId, queryId, resolverPay);
             universe.repToken.safeTransfer(msg.sender, resolverPay);
             // The unpaid fee remainder is the query's profit: recorded for the fee controller and
@@ -684,9 +703,12 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * @param stakeIndex The index of the stake being claimed.
      */
     function claim(uint248 universeId, uint256 queryId, uint256 stakeIndex) external nonReentrant {
+        // Only while the universe is Active: once it forks, the whole pot is parked in the Zoltar
+        // migration balance and claims become claim-and-migrate into a child.
+        Universe storage universe = _checkUniverseState(universeId);
         uint256 payout = _claim(universeId, queryId, stakeIndex);
 
-        universes[universeId].repToken.safeTransfer(msg.sender, payout);
+        universe.repToken.safeTransfer(msg.sender, payout);
 
         emit StakeClaimed(msg.sender, universeId, queryId, stakeIndex, payout);
     }
@@ -707,6 +729,8 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     {
         uint256 length = queryIds.length;
         if (length == 0 || length != stakeIndices.length) revert InvalidClaimBatch();
+        // Same gate as claim(): parent-side payouts end at the fork.
+        _checkUniverseState(universeId);
 
         uint256 totalPayout;
         for (uint256 i = 0; i < length;) {
@@ -1109,6 +1133,8 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         uint256 loserBurn = totalLoserStakes / BURN_DIVIDER;
         uint256 profit = loserBurn + (queryFee - reporterPay);
 
+        _consumeQueryFee(universes[universeId], queryFee);
+
         ILituusRep repToken = universes[universeId].repToken;
 
         QueryResolution storage resolution = queryResolutions[universeId][queryId];
@@ -1496,10 +1522,44 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         // forge-lint: disable-next-line(unsafe-typecast)
         universe.forkQuery = uint128(queryId);
         universe.isLituusFork = true;
+        // The forking query's fee leaves the fee aggregate: every child resolves the query at spawn
+        // by writing the outcome directly, so no payoff path ever consumes this fee in any child.
+        _consumeQueryFee(universe, queries[queryId].fee);
+        _addPotToMigrationBalance(universeId, universe);
         // Permanent: wrapped capital in a forked universe exits ONLY through the counted Lituus
         // migration lane (migrate(), and later the claim lanes) — never by unwrapping to the Zoltar
         // level. No code path ever unpauses a forked universe's vault.
         universe.repToken.setUnwrapPaused(true);
+    }
+
+    /**
+     * @notice Parks the contract's entire wREP holding of a forking universe in the Zoltar
+     *         migration balance: query fees, the forking query's pot, and all other stakes and
+     *         unclaimed winnings. Runs once, in the fork tx.
+     * @dev From here every path to this value is a "second part" of a migration — minting into a
+     *      child universe (fee splits at spawn now; per-stake claims/refunds in the claims phase).
+     *      Nothing is ever withdrawable on the parent side again. The parked total is recorded in
+     *      unmigratedSupply: SR max supply = totalMigratedOut + unmigratedSupply.
+     */
+    function _addPotToMigrationBalance(uint248 universeId, Universe storage universe) internal {
+        uint256 potShares = universe.repToken.balanceOf(address(this));
+        if (potShares > 0) {
+            uint256 potAssets = universe.repToken.migrateOut(address(this), potShares);
+            ZOLTAR.addRepToMigrationBalance(universeId, potAssets);
+            // Asset amounts are REP amounts within uint128.
+            // forge-lint: disable-next-line(unsafe-typecast)
+            universe.unmigratedSupply = uint128(potAssets);
+        }
+    }
+
+    /// @dev Marks a query's fee consumed in this universe's fee aggregate. Saturating: the
+    ///      spawn-time fee split rounds down twice, so a child's carried aggregate can run short of
+    ///      the nominal fee sum by dust.
+    // TODO: rewrite the fee accounting so that it correctly handles dust and rounding issues.
+    function _consumeQueryFee(Universe storage universe, uint256 fee) internal {
+        uint128 totalQueryFees = universe.totalQueryFees;
+        // forge-lint: disable-next-line(unsafe-typecast)
+        universe.totalQueryFees = fee >= totalQueryFees ? 0 : totalQueryFees - uint128(fee);
     }
 
     /**
@@ -1582,6 +1642,21 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
 
         // Inherit the parent's base fee so the child can charge nonzero query fees from birth
         QUERY_FEE_CONTROLLER.initializeFeeState(childUniverseId, QUERY_FEE_CONTROLLER.getQueryFee(universeId));
+
+        // Fund the child with the parent's whole fee aggregate: split from the parked migration
+        // balance (a full copy per child — Zoltar's per-child escrow makes the duplication legal)
+        // and wrap into the child vault. This backs the resolutions of EVERY query the child
+        // inherits; the carried counter re-parks if the child itself forks later. Deliberately NOT
+        // counted in totalMigratedIn/totalMigratedOut/max: fees duplicate per child and are not
+        // single-spend voting capital — totalQueryFees is their ledger.
+        uint256 feeAssets = parentUniverse.repToken.convertToAssets(parentUniverse.totalQueryFees);
+        if (feeAssets > 0) {
+            ZOLTAR.splitMigrationRep(universeId, feeAssets, outcome);
+            uint256 feeShares = childUniverseRepToken.wrap(address(this), feeAssets);
+            // Share amounts are REP amounts within uint128.
+            // forge-lint: disable-next-line(unsafe-typecast)
+            childUniverse.totalQueryFees = uint128(feeShares);
+        }
 
         // Every child resolves the forking query to its own outcome; descendants inherit it via the
         // ancestor walk
@@ -1722,6 +1797,10 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         emit QueryCreated(msg.sender, queryId, universeId, questionData.title, 2);
 
         queryCount++;
+
+        // Park BEFORE the eager spawns: each spawn splits the fee aggregate from the balance the
+        // parking fills. (The mirrored query's own fee is 0 — nothing to exclude.)
+        _addPotToMigrationBalance(universeId, universe);
 
         // Spawn child universes. Each child resolves the mirrored query to its own outcome, keyed
         // by the same identity mapping migrate/spawn use (real Zoltar's binary indexes are 0-based —

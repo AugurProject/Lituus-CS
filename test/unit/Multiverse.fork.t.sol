@@ -57,7 +57,7 @@ contract MultiverseForkTest is MultiverseFixtures {
     }
 
     function _universeState(uint248 universeId) internal view returns (Multiverse.UniverseState state) {
-        (, state,,,,,,,,,) = multiverse.universes(universeId);
+        (, state,,,,,,,,,,,) = multiverse.universes(universeId);
     }
 
     /* ============================================= FORK TRIGGER ============================================= */
@@ -73,7 +73,9 @@ contract MultiverseForkTest is MultiverseFixtures {
             uint248 favoriteChild,
             bool isLituusFork,,,
             uint256 forkQuery,
-            uint256 totalMigratedOut
+            uint256 totalMigratedOut,
+            uint256 totalQueryFees,
+            uint256 unmigratedSupply
         ) = multiverse.universes(GENESIS_UID);
         assertEq(uint8(universeState), uint8(Multiverse.UniverseState.Migration));
         assertEq(forkTime, uint48(vm.getBlockTimestamp()));
@@ -93,6 +95,20 @@ contract MultiverseForkTest is MultiverseFixtures {
         assertEq(zoltar.getForkTime(GENESIS_UID), vm.getBlockTimestamp());
         // The forking universe itself still reads UNRESOLVED (it never resolves the query locally).
         assertEq(multiverse.getOutcome(GENESIS_UID, queryId), 0);
+
+        // The whole pot parked: the contract's entire wREP holding (the forking query's fee + all
+        // its stakes; rate is 1 here so assets == shares) moved into the Zoltar migration balance
+        // and is recorded as unmigratedSupply. Parent-side value is no longer withdrawable.
+        uint256 totalStakes;
+        for (uint256 i = 0; i < stakes.length; i++) {
+            totalStakes += stakes[i].amount;
+        }
+        assertEq(genesisRep.balanceOf(address(multiverse)), 0);
+        assertEq(unmigratedSupply, totalStakes + DEFAULT_FEE);
+        assertEq(zoltar.getMigrationRepBalance(address(multiverse), GENESIS_UID), unmigratedSupply);
+        // The forking query's own fee is excluded from the fee aggregate (no payoff path ever
+        // consumes it in a child — its resolution is pre-written at spawn); it stays parked.
+        assertEq(totalQueryFees, 0);
     }
 
     function test_Fork_RevertsWhenZoltarUniverseAlreadyForking() public {
@@ -153,10 +169,14 @@ contract MultiverseForkTest is MultiverseFixtures {
             uint48 forkTime,
             bool isCanonical,
             uint248 parent,,,,,
-            uint256 forkQuery,
+            uint256 forkQuery,,
+            uint256 childQueryFees,
         ) = multiverse.universes(child1);
         // Children spawn Active: fully functional immediately, no activation step.
         assertEq(uint8(universeState), uint8(Multiverse.UniverseState.Active));
+        // The only pre-fork query was the forking one, whose fee is excluded from the aggregate —
+        // so this child receives no fee pot.
+        assertEq(childQueryFees, 0);
         assertEq(parent, GENESIS_UID);
         assertFalse(isCanonical);
         assertEq(forkQuery, 0);
@@ -176,6 +196,98 @@ contract MultiverseForkTest is MultiverseFixtures {
         vm.prank(user);
         vm.expectRevert(Multiverse.QueryAlreadyResolved.selector);
         multiverse.report(child1, queryId, OUTCOME_B);
+    }
+
+    /* ============================================ POT MIGRATION ============================================ */
+
+    /// @dev A helper for the query-fee read (field 12 of the Universe struct).
+    function _totalQueryFees(uint248 universeId) internal view returns (uint256 fees) {
+        (,,,,,,,,,,, fees,) = multiverse.universes(universeId);
+    }
+
+    function test_PotMigration_FeeFundsInheritedQueryResolutionInChildren() public {
+        // An open (non-forking) query exists when the genesis forks: its fee must follow the fork.
+        uint256 openQueryId = _createDefaultQuery();
+        assertEq(_totalQueryFees(GENESIS_UID), DEFAULT_FEE);
+        _forkGenesis();
+
+        // EVERY spawned child receives the full fee pot (per-child Zoltar escrow duplication),
+        // wrapped into its vault; the migration counters are untouched by it.
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_B);
+        uint248 child1 = _childId(GENESIS_UID, OUTCOME_A);
+        uint248 child2 = _childId(GENESIS_UID, OUTCOME_B);
+        assertEq(_totalQueryFees(child1), DEFAULT_FEE);
+        assertEq(_totalQueryFees(child2), DEFAULT_FEE);
+        assertEq(multiverse.repTokenOf(child1).totalAssets(), DEFAULT_FEE);
+        (,,,,,,, uint128 totalIn,,, uint256 totalOut,,) = multiverse.universes(GENESIS_UID);
+        assertEq(totalIn, 0);
+        assertEq(totalOut, 0);
+
+        // The inherited query resolves in a child WITHOUT insolvency: the resolver's fee share is
+        // paid from the spawn-time funding.
+        // No report lands, so after the reporting window it resolves INVALID with a resolver reward.
+        vm.warp(vm.getBlockTimestamp() + multiverse.THREE_DAYS() + multiverse.THREE_DAYS());
+        uint256 resolverBalanceBefore = multiverse.repTokenOf(child1).balanceOf(bystander);
+        vm.prank(bystander);
+        multiverse.resolve(child1, openQueryId);
+        assertEq(multiverse.getOutcome(child1, openQueryId), INVALID_OUTCOME);
+        assertEq(multiverse.repTokenOf(child1).balanceOf(bystander), resolverBalanceBefore + DEFAULT_FEE);
+        // The consumed fee leaves the child's aggregate; the sibling's copy is independent.
+        assertEq(_totalQueryFees(child1), 0);
+        assertEq(_totalQueryFees(child2), DEFAULT_FEE);
+    }
+
+    function test_PotMigration_ParentClaimsBlockedAfterFork() public {
+        // A query resolved BEFORE the fork with an unclaimed winning stake.
+        uint256 resolvedQueryId = _createDefaultQuery();
+        _report(user, resolvedQueryId, OUTCOME_A);
+        _report(challenger, resolvedQueryId, OUTCOME_B);
+        _warpPastAppealWindow(resolvedQueryId);
+        vm.prank(bystander);
+        multiverse.resolve(GENESIS_UID, resolvedQueryId);
+
+        _forkGenesis();
+
+        // The pot is moved: parent-side claims are gated off cleanly (the claim-and-migrate lane
+        // into a child is still TODO).
+        vm.prank(challenger);
+        vm.expectRevert(Multiverse.InvalidUniverseState.selector);
+        multiverse.claim(GENESIS_UID, resolvedQueryId, 1);
+        uint256[] memory queryIds = new uint256[](1);
+        queryIds[0] = resolvedQueryId;
+        uint256[] memory stakeIndices = new uint256[](1);
+        stakeIndices[0] = 1;
+        vm.prank(challenger);
+        vm.expectRevert(Multiverse.InvalidUniverseState.selector);
+        multiverse.claimMultiple(GENESIS_UID, queryIds, stakeIndices);
+    }
+
+    function test_PotMigration_FeePotCarriesThroughNestedForks() public {
+        // A genesis-era open query; the genesis forks; child1 spawns funded with its fee.
+        uint256 openQueryId = _createDefaultQuery();
+        (, uint248 child1,) = _forkGenesisWithTwoChildren();
+        assertEq(_totalQueryFees(child1), DEFAULT_FEE);
+
+        // child1 gets a native query (paid in child1 wREP by the migrated user), then forks on it.
+        ILituusRep child1Rep = multiverse.repTokenOf(child1);
+        vm.prank(user);
+        child1Rep.approve(address(multiverse), type(uint256).max);
+        uint256 nestedQueryId = multiverse.queryCount();
+        vm.prank(user);
+        multiverse.createQuery(child1, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
+        assertEq(_totalQueryFees(child1), 2 * DEFAULT_FEE);
+        _escalateToFork(child1, nestedQueryId, user, user);
+
+        // At child1's own fork the nested forking query's fee is excluded; the genesis-era fee
+        // carries: the grandchild spawns funded with it, so the inherited query is resolvable
+        // two fork levels below its origin.
+        assertEq(_totalQueryFees(child1), DEFAULT_FEE);
+        vm.prank(bystander);
+        multiverse.spawnChildUniverse(child1, OUTCOME_A);
+        uint248 grandchild = _childId(child1, OUTCOME_A);
+        assertEq(_totalQueryFees(grandchild), DEFAULT_FEE);
+        assertEq(multiverse.getOutcome(grandchild, openQueryId), 0); // still unresolved
     }
 
     function test_Spawn_Reverts() public {
@@ -226,36 +338,36 @@ contract MultiverseForkTest is MultiverseFixtures {
         ILituusRep child1Rep = multiverse.repTokenOf(child1);
         assertEq(child1Rep.balanceOf(user), 100 ether); // rate parity: same share count
 
-        (,,,,, uint248 favoriteChild,, uint128 totalIn1, uint128 maxOut,,) = multiverse.universes(child1);
+        (,,,,, uint248 favoriteChild,, uint128 totalIn1, uint128 maxOut,,,,) = multiverse.universes(child1);
         assertEq(totalIn1, 100 ether);
-        (,,,,, favoriteChild,,, maxOut,,) = multiverse.universes(GENESIS_UID);
+        (,,,,, favoriteChild,,, maxOut,,,,) = multiverse.universes(GENESIS_UID);
         assertEq(maxOut, 100 ether);
         assertEq(favoriteChild, child1);
 
         // challenger outvotes into child2: the running max flips (strict >).
         vm.prank(challenger);
         multiverse.migrate(GENESIS_UID, OUTCOME_B, 150 ether);
-        (,,,,, favoriteChild,,, maxOut,,) = multiverse.universes(GENESIS_UID);
+        (,,,,, favoriteChild,,, maxOut,,,,) = multiverse.universes(GENESIS_UID);
         assertEq(maxOut, 150 ether);
         assertEq(favoriteChild, child2);
 
         // An equal amount does NOT flip the winner: first-to-reach holds it.
         vm.prank(user);
         multiverse.migrate(GENESIS_UID, OUTCOME_A, 50 ether);
-        (,,,,, favoriteChild,,, maxOut,,) = multiverse.universes(GENESIS_UID);
+        (,,,,, favoriteChild,,, maxOut,,,,) = multiverse.universes(GENESIS_UID);
         assertEq(maxOut, 150 ether);
         assertEq(favoriteChild, child2);
 
         // Adding to previously leading child does flip the winner: the running max is strict >.
         vm.prank(user);
         multiverse.migrate(GENESIS_UID, OUTCOME_A, 1 ether);
-        (,,,,, favoriteChild,,, maxOut,,) = multiverse.universes(GENESIS_UID);
+        (,,,,, favoriteChild,,, maxOut,,,,) = multiverse.universes(GENESIS_UID);
         assertEq(maxOut, 151 ether);
         assertEq(favoriteChild, child1);
 
         // The parent's outflow counter accumulates every migration: the live electorate measure
         // (the 2/3 denominator and the SR max supply, read at the end of migration).
-        (,,,,,,,,,, uint256 totalMigratedOut) = multiverse.universes(GENESIS_UID);
+        (,,,,,,,,,, uint256 totalMigratedOut,,) = multiverse.universes(GENESIS_UID);
         assertEq(totalMigratedOut, 301 ether);
     }
 
@@ -312,7 +424,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         assertEq(uint8(_universeState(GENESIS_UID)), uint8(Multiverse.UniverseState.PostFork));
         assertTrue(genesisRep.unwrapPaused());
         assertEq(multiverse.canonicalHeir(), child2);
-        (,,, bool isCanonical,,,,,,,) = multiverse.universes(child2);
+        (,,, bool isCanonical,,,,,,,,,) = multiverse.universes(child2);
         assertTrue(isCanonical);
 
         // Children need no per-child resolution: they have been Active since spawn (whether the
@@ -335,7 +447,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         // Each child answers the forking query its own way.
         assertEq(multiverse.getOutcome(child1, forkQueryId), OUTCOME_A);
         assertEq(multiverse.getOutcome(child2, forkQueryId), OUTCOME_B);
-        (,,,,, uint248 favoriteChild,,,,,) = multiverse.universes(GENESIS_UID);
+        (,,,,, uint248 favoriteChild,,,,,,,) = multiverse.universes(GENESIS_UID);
         assertEq(favoriteChild, child2);
 
         // A freshly spawned child is query-functional while its parent is still mid-Migration.
@@ -418,7 +530,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         vm.warp(vm.getBlockTimestamp() + multiverse.SIXTY_DAYS());
         multiverse.advanceForkState(GENESIS_UID);
         multiverse.advanceForkState(child1);
-        (,,,,, uint248 favoriteChild,,,,,) = multiverse.universes(child1);
+        (,,,,, uint248 favoriteChild,,,,,,,) = multiverse.universes(child1);
         assertEq(favoriteChild, grandchild);
 
         // The forking query never resolves in child1 itself; a lookup keyed to the stale
