@@ -39,6 +39,23 @@ contract MultiverseForkTest is MultiverseFixtures {
         return zoltar.getChildUniverseId(parentId, outcome);
     }
 
+    /// @dev Forks the genesis into two spawned children with the standard vote split: user migrates
+    ///      320 ether to the OUTCOME_A child, challenger 400 ether to the OUTCOME_B child — child2
+    ///      leads the running max, so child1's line goes non-canonical once the fork settles.
+    function _forkGenesisWithTwoChildren() internal returns (uint256 forkQueryId, uint248 child1, uint248 child2) {
+        (forkQueryId,) = _forkGenesis();
+        vm.prank(bystander);
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
+        vm.prank(bystander);
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_B);
+        child1 = _childId(GENESIS_UID, OUTCOME_A);
+        child2 = _childId(GENESIS_UID, OUTCOME_B);
+        vm.prank(user);
+        multiverse.migrate(GENESIS_UID, OUTCOME_A, 320 ether);
+        vm.prank(challenger);
+        multiverse.migrate(GENESIS_UID, OUTCOME_B, 400 ether);
+    }
+
     function _universeState(uint248 universeId) internal view returns (Multiverse.UniverseState state) {
         (, state,,,,,,,,,) = multiverse.universes(universeId);
     }
@@ -307,27 +324,17 @@ contract MultiverseForkTest is MultiverseFixtures {
     /* ============================================== END-TO-END ============================================== */
 
     /// @dev The minimal-flow gate: fork -> lazy spawn (children Active from birth) -> nested
-    ///      fork -> migration voting -> root-first resolution -> canonical forwarding.
+    ///      fork -> migration voting -> root-first resolution -> canonical outcome lookup
+    ///      through the heir.
     function test_EndToEnd_MinimalForkFlow() public {
-        // Fork the genesis on a 3-outcome query; the fork fires inside the threshold report.
-        (uint256 forkQueryId,) = _forkGenesis();
+        // Fork the genesis on a 3-outcome query (the fork fires inside the threshold report); two
+        // of four possible children spawn lazily and the votes make child2 lead 400 to 320.
+        (uint256 forkQueryId, uint248 child1, uint248 child2) = _forkGenesisWithTwoChildren();
         assertEq(uint8(_universeState(GENESIS_UID)), uint8(Multiverse.UniverseState.Migration));
 
-        // Two of four possible children spawn lazily; each answers the forking query its own way.
-        vm.prank(bystander);
-        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
-        vm.prank(bystander);
-        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_B);
-        uint248 child1 = _childId(GENESIS_UID, OUTCOME_A);
-        uint248 child2 = _childId(GENESIS_UID, OUTCOME_B);
+        // Each child answers the forking query its own way.
         assertEq(multiverse.getOutcome(child1, forkQueryId), OUTCOME_A);
         assertEq(multiverse.getOutcome(child2, forkQueryId), OUTCOME_B);
-
-        // Migration votes: child2 leads 400 to 320.
-        vm.prank(user);
-        multiverse.migrate(GENESIS_UID, OUTCOME_A, 320 ether);
-        vm.prank(challenger);
-        multiverse.migrate(GENESIS_UID, OUTCOME_B, 400 ether);
         (,,,,, uint248 favoriteChild,,,,,) = multiverse.universes(GENESIS_UID);
         assertEq(favoriteChild, child2);
 
@@ -371,20 +378,59 @@ contract MultiverseForkTest is MultiverseFixtures {
         assertEq(uint8(_universeState(child1)), uint8(Multiverse.UniverseState.PostFork));
         assertEq(uint8(_universeState(grandchild)), uint8(Multiverse.UniverseState.Active));
         assertEq(multiverse.canonicalHeir(), child2);
+    }
 
-        // Query creation targeting the archived genesis forwards along the canonical timeline.
-        ILituusRep child2Rep = multiverse.repTokenOf(child2);
-        vm.startPrank(challenger);
-        child2Rep.approve(address(multiverse), type(uint256).max);
-        uint256 forwardedQueryId = multiverse.queryCount();
-        multiverse.createQuery(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
+    /// @dev Non-canonical outcome forwarding: a query pending when its universe forks is later
+    ///      resolved in a descendant; a lookup keyed to the stale parent universe finds it through
+    ///      the settled favoriteChild line. The canonical line never sees it.
+    function test_GetOutcome_NonCanonicalWalksForwardAlongFavoriteChildLine() public {
+        // Genesis forks; child1 loses the canonical vote to child2, so child1's line is
+        // non-canonical.
+        (, uint248 child1,) = _forkGenesisWithTwoChildren();
+        // The bystander's extra vote funds the later nested-fork migration with child1 REP.
+        vm.prank(bystander);
+        multiverse.migrate(GENESIS_UID, OUTCOME_A, 50 ether);
+
+        // A query is created in child1 and left pending while a second query forks child1.
+        ILituusRep child1Rep = multiverse.repTokenOf(child1);
+        vm.startPrank(user);
+        child1Rep.approve(address(multiverse), type(uint256).max);
+        uint256 pendingQueryId = multiverse.queryCount();
+        multiverse.createQuery(child1, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
+        uint256 nestedQueryId = multiverse.queryCount();
+        multiverse.createQuery(child1, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
         vm.stopPrank();
-        (, uint248 originUniverse,,) = multiverse.queries(forwardedQueryId);
-        assertEq(originUniverse, child2);
+        _escalateToFork(child1, nestedQueryId, user, user);
 
-        // The forwarded query is a normal query in the winner universe.
-        vm.prank(challenger);
-        multiverse.report(child2, forwardedQueryId, OUTCOME_A);
-        assertEq(multiverse.getStakes(child2, forwardedQueryId).length, 1);
+        // The grandchild spawns and receives child1's only migration vote.
+        vm.prank(bystander);
+        multiverse.spawnChildUniverse(child1, OUTCOME_A);
+        uint248 grandchild = _childId(child1, OUTCOME_A);
+        vm.prank(bystander);
+        multiverse.migrate(child1, OUTCOME_A, 40 ether);
+
+        // While child1's fork is still migrating, its favoriteChild is a running max and is not
+        // followed: the leader's recorded answer stays invisible until the fork settles.
+        assertEq(multiverse.getOutcome(grandchild, nestedQueryId), OUTCOME_A);
+        assertEq(multiverse.getOutcome(child1, nestedQueryId), 0);
+
+        // Both forks settle root-first; the grandchild is child1's settled favoriteChild.
+        vm.warp(vm.getBlockTimestamp() + multiverse.SIXTY_DAYS());
+        multiverse.advanceForkState(GENESIS_UID);
+        multiverse.advanceForkState(child1);
+        (,,,,, uint248 favoriteChild,,,,,) = multiverse.universes(child1);
+        assertEq(favoriteChild, grandchild);
+
+        // The forking query never resolves in child1 itself; a lookup keyed to the stale
+        // non-canonical universe follows the settled favoriteChild line forward to the winner's
+        // answer, recorded in the grandchild at spawn.
+        assertEq(multiverse.getOutcome(child1, nestedQueryId), OUTCOME_A);
+        // The pending query resolved nowhere: the full walk — forward to the end of the line,
+        // then up the parent chain — comes back empty. From the grandchild the backward leg
+        // stops at the query's origin universe (child1).
+        assertEq(multiverse.getOutcome(child1, pendingQueryId), 0);
+        assertEq(multiverse.getOutcome(grandchild, pendingQueryId), 0);
+        // The canonical line never crosses into child1's branch: unresolved from the genesis.
+        assertEq(multiverse.getOutcome(GENESIS_UID, nestedQueryId), 0);
     }
 }
