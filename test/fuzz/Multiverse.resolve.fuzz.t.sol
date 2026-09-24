@@ -22,8 +22,7 @@ contract MultiverseResolveFuzzTest is MultiverseFuzzFixtures {
         vm.prank(user);
         multiverse.resolve(GENESIS_UID, queryId);
 
-        (, uint8 outcome,,) = multiverse.queryResolutions(GENESIS_UID, queryId);
-        assertEq(outcome, multiverse.INVALID());
+        assertEq(_resolution(queryId).outcome, multiverse.INVALID());
 
         uint256 expectedPay = pastDeadline >= multiverse.THREE_DAYS()
             ? DEFAULT_FEE
@@ -93,8 +92,7 @@ contract MultiverseResolveFuzzTest is MultiverseFuzzFixtures {
         vm.prank(resolver);
         multiverse.resolve(GENESIS_UID, queryId);
 
-        (, uint8 resolvedOutcome,,) = multiverse.queryResolutions(GENESIS_UID, queryId);
-        assertEq(resolvedOutcome, outcome);
+        assertEq(_resolution(queryId).outcome, outcome);
         assertEq(multiverse.getOutcome(GENESIS_UID, queryId), outcome);
 
         // The creator's fee is spent for good; the reporter's bond (== fee) came back with the
@@ -106,10 +104,9 @@ contract MultiverseResolveFuzzTest is MultiverseFuzzFixtures {
         assertEq(genesisRep.balanceOf(resolver), 0);
         assertEq(genesisRep.balanceOf(address(multiverse)), 0);
 
-        // The sole stake is settled at resolution (amount zeroed), nothing left to claim.
-        Multiverse.Stake[] memory stakes = multiverse.getStakes(GENESIS_UID, queryId);
-        assertEq(stakes.length, 1);
-        assertEq(stakes[0].amount, 0);
+        // The sole stake is settled at resolution (zeroed), nothing left to claim.
+        assertEq(_resolution(queryId).stakeCount, 1);
+        assertEq(multiverse.getUserStake(GENESIS_UID, queryId, reporter, outcome), 0);
     }
 
     /// @dev Property: a reported query is never resolvable up to and including the appeal deadline

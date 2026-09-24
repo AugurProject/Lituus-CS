@@ -16,10 +16,10 @@ import { MultiverseHandler } from "./handlers/MultiverseHandler.sol";
 contract MultiverseInvariantTest is MultiverseDeployFixture {
     // Per-account balance pinned so the TOTAL underlying supply is exactly the contract's
     // documented REP domain (100M * 1e18 = 1e26, see the uint96 note on QueryResolution in
-    // src/Multiverse.sol): 4 funded accounts (handler + 3 actors) x 2.5e25. MockZoltar's fork
-    // threshold is supply / 20 = 5e24 and stakes clamp at threshold / 2, so a query's total
-    // staked stays below supply / 10 = 1e25 — orders of magnitude under the uint96 max
-    // (~7.9e28), keeping the contract's totalDistributable/winnerStaked downcasts lossless.
+    // src/Multiverse.sol): 4 funded accounts (handler + 3 actors) x 2.5e25. Each outcome's stakes
+    // are capped at 1% of the supply (1e24) and a fork triggers once two outcomes reach it, so a
+    // query's total staked stays orders of magnitude under the uint96 max (~7.9e28), keeping the
+    // contract's uint96 stake fields lossless.
     uint256 internal constant HANDLER_REP_BALANCE = 2.5e25;
     uint256 internal constant ACTOR_COUNT = 3;
 
@@ -85,45 +85,85 @@ contract MultiverseInvariantTest is MultiverseDeployFixture {
         }
     }
 
-    /// @dev The escalation ladder is deterministic: the first stake equals the query fee, every
-    ///      escalation doubles the previous stake, and no landed stake ever reaches the fork
-    ///      threshold (fork-level stakes are guarded out until forking is implemented). Ladder
-    ///      arithmetic is checked on the ghost amounts; the live amount must equal its ghost, or
-    ///      be zero exactly when the stake has settled.
-    function invariant_LadderDeterministic() public view {
+    /// @dev The escalation ladder respects the per-outcome cap and its live totals match the
+    ///      ghosts: every landed stake is at most the cap and so is every outcome's total, each
+    ///      outcome's total is the sum of the ghost stakes placed on it, the query total is the sum
+    ///      of all of them, and a staker's
+    ///      live balance on an outcome equals their ghost stakes on it, or zero exactly when those
+    ///      stakes have settled.
+    function invariant_LadderTotalsMatchGhosts() public view {
         uint256 count = multiverse.queryCount();
-        uint256 forkThreshold = _forkThresholdWrep();
         for (uint256 i = 0; i < count; ++i) {
-            Multiverse.Stake[] memory stakes = multiverse.getStakes(GENESIS_UID, i);
-            (,, uint256 fee,) = multiverse.queries(i);
-            for (uint256 j = 0; j < stakes.length; ++j) {
+            uint256 stakeCount = handler.ghostStakeCount(i);
+            if (stakeCount == 0) continue;
+            ResolutionView memory r = _resolution(i);
+            uint256 totalStaked;
+            for (uint256 j = 0; j < stakeCount; ++j) {
                 uint256 ghostAmount = handler.ghostStakeAmount(i, j);
-                assertEq(ghostAmount, j == 0 ? fee : handler.ghostStakeAmount(i, j - 1) * 2);
-                assertLt(ghostAmount, forkThreshold);
-                if (handler.ghostClaimed(i, j)) {
-                    assertEq(stakes[j].amount, 0);
-                } else {
-                    assertEq(stakes[j].amount, ghostAmount);
+                assertLe(ghostAmount, r.cap);
+                totalStaked += ghostAmount;
+
+                // The staker's live balance on this outcome: the sum of their unsettled ghost stakes on it.
+                address owner = handler.ghostStakeReporter(i, j);
+                uint8 outcome = handler.ghostStakeOutcome(i, j);
+                uint256 expectedUserStake;
+                for (uint256 k = 0; k < stakeCount; ++k) {
+                    if (handler.ghostStakeReporter(i, k) != owner || handler.ghostStakeOutcome(i, k) != outcome) {
+                        continue;
+                    }
+                    if (!handler.ghostClaimed(i, k)) expectedUserStake += handler.ghostStakeAmount(i, k);
                 }
+                assertEq(multiverse.getUserStake(GENESIS_UID, i, owner, outcome), expectedUserStake);
             }
+            assertEq(r.totalStaked, totalStaked);
+
+            // Per-outcome totals: the sum of the ghost stakes placed on each outcome.
+            for (uint256 j = 0; j < stakeCount; ++j) {
+                uint8 outcome = handler.ghostStakeOutcome(i, j);
+                uint256 expectedOutcomeStaked;
+                for (uint256 k = 0; k < stakeCount; ++k) {
+                    if (handler.ghostStakeOutcome(i, k) == outcome) {
+                        expectedOutcomeStaked += handler.ghostStakeAmount(i, k);
+                    }
+                }
+                assertEq(multiverse.getOutcomeStakes(GENESIS_UID, i, outcome).totalOutcomeStaked, expectedOutcomeStaked);
+                assertLe(expectedOutcomeStaked, r.cap);
+            }
+        }
+    }
+
+    /// @dev Every stake after the first one leaves the outcome it backed holding exactly twice the
+    ///      total of every other outcome, or sitting at the per-outcome cap when twice the rest would
+    ///      have exceeded it. This is what prices an appeal, so it holds after any sequence of
+    ///      reports the handler produces.
+    function invariant_LatestOutcomeHoldsTwiceTheRestOrSitsAtCap() public view {
+        uint256 count = multiverse.queryCount();
+        for (uint256 i = 0; i < count; ++i) {
+            ResolutionView memory r = _resolution(i);
+            if (r.stakeCount < 2) continue;
+            uint256 onLatest = multiverse.getOutcomeStakes(GENESIS_UID, i, r.lastReportedOutcome).totalOutcomeStaked;
+            uint256 onTheRest = uint256(r.totalStaked) - onLatest;
+            assertTrue(onLatest == 2 * onTheRest || onLatest == r.cap);
         }
     }
 
     /// @dev Stake times never decrease (same-block stakes are legal, amounts still differ) and
     ///      every stake landed inside its window: the first within THREE_DAYS of the query's
-    ///      creation in this universe, each escalation within ONE_DAY of the previous stake.
+    ///      creation in this universe, each escalation within ONE_DAY of the previous stake. The
+    ///      live head time is the ghost time of the latest stake.
     function invariant_StakeTimesMonotonicAndInWindow() public view {
         uint256 count = multiverse.queryCount();
         for (uint256 i = 0; i < count; ++i) {
-            Multiverse.Stake[] memory stakes = multiverse.getStakes(GENESIS_UID, i);
-            if (stakes.length == 0) continue;
-            (uint48 queryCreateTime,,,) = multiverse.queryResolutions(GENESIS_UID, i);
-            assertGe(stakes[0].time, queryCreateTime);
-            assertLe(stakes[0].time, uint256(queryCreateTime) + multiverse.THREE_DAYS());
-            for (uint256 j = 1; j < stakes.length; ++j) {
-                assertGe(stakes[j].time, stakes[j - 1].time);
-                assertLe(stakes[j].time, uint256(stakes[j - 1].time) + multiverse.ONE_DAY());
+            uint256 stakeCount = handler.ghostStakeCount(i);
+            if (stakeCount == 0) continue;
+            ResolutionView memory r = _resolution(i);
+            assertGe(handler.ghostStakeTime(i, 0), r.queryCreateTime);
+            assertLe(handler.ghostStakeTime(i, 0), uint256(r.queryCreateTime) + multiverse.THREE_DAYS());
+            for (uint256 j = 1; j < stakeCount; ++j) {
+                assertGe(handler.ghostStakeTime(i, j), handler.ghostStakeTime(i, j - 1));
+                assertLe(handler.ghostStakeTime(i, j), handler.ghostStakeTime(i, j - 1) + multiverse.ONE_DAY());
             }
+            assertEq(r.lastStakeTime, handler.ghostStakeTime(i, stakeCount - 1));
         }
     }
 
@@ -133,69 +173,46 @@ contract MultiverseInvariantTest is MultiverseDeployFixture {
     function invariant_ResolutionMatchesGhosts() public view {
         uint256 count = multiverse.queryCount();
         for (uint256 i = 0; i < count; ++i) {
-            (uint48 queryCreateTime, uint8 outcome,,) = multiverse.queryResolutions(GENESIS_UID, i);
+            ResolutionView memory r = _resolution(i);
             if (handler.ghostResolved(i)) {
-                assertEq(outcome, handler.ghostResolvedOutcome(i));
-                assertTrue(outcome != multiverse.UNRESOLVED());
+                assertEq(r.outcome, handler.ghostResolvedOutcome(i));
+                assertTrue(r.outcome != multiverse.UNRESOLVED());
             } else {
-                assertEq(outcome, multiverse.UNRESOLVED());
+                assertEq(r.outcome, multiverse.UNRESOLVED());
             }
-            assertEq(queryCreateTime, handler.ghostQueryCreateTime(i));
+            assertEq(r.queryCreateTime, handler.ghostQueryCreateTime(i));
         }
     }
 
-    /// @dev Every stake record is well-formed and matches the ghosts: valid reported outcome
-    ///      (one of the query's outcomes or INVALID), consecutive outcomes differ, and the
-    ///      per-query stake count / last outcome / per-stake owner and outcome agree with the
-    ///      handler.
+    /// @dev The escalation records match the ghosts: every ghost stake carries a valid outcome (one
+    ///      of the query's outcomes or INVALID), consecutive ghost outcomes differ, the stake count
+    ///      and latest outcome agree with the handler, and each outcome's first reporter is the
+    ///      reporter of the first ghost stake placed on it.
     function invariant_StakeRecordsMatchGhosts() public view {
         uint256 count = multiverse.queryCount();
         for (uint256 i = 0; i < count; ++i) {
-            Multiverse.Stake[] memory stakes = multiverse.getStakes(GENESIS_UID, i);
-            (uint8 numberOfOutcomes,,,) = multiverse.queries(i);
-            for (uint256 j = 0; j < stakes.length; ++j) {
-                uint8 outcome = stakes[j].reportedOutcome;
-                assertTrue((outcome >= 1 && outcome <= numberOfOutcomes) || outcome == multiverse.INVALID());
-                if (j > 0) assertTrue(outcome != stakes[j - 1].reportedOutcome);
-                assertEq(outcome, handler.ghostStakeOutcome(i, j));
-                assertEq(stakes[j].reporter, handler.ghostStakeReporter(i, j));
-            }
-            assertEq(stakes.length, handler.ghostStakeCount(i));
-            if (stakes.length > 0) {
-                assertEq(stakes[stakes.length - 1].reportedOutcome, handler.ghostLastOutcome(i));
-            }
-        }
-    }
-
-    /// @dev The totals frozen at resolution are consistent with the ladder that produced them:
-    ///      winnerStaked is the sum of the original amounts staked on the winning outcome, and
-    ///      totalDistributable is the losers' total minus the burn cut. Unresolved queries keep
-    ///      both at zero.
-    function invariant_SettlementTotalsConsistent() public view {
-        uint256 count = multiverse.queryCount();
-        for (uint256 i = 0; i < count; ++i) {
-            (,, uint96 totalDistributable, uint96 winnerStaked) = multiverse.queryResolutions(GENESIS_UID, i);
             uint256 stakeCount = handler.ghostStakeCount(i);
-            if (!handler.ghostResolved(i) || stakeCount == 0) {
-                assertEq(totalDistributable, 0);
-                assertEq(winnerStaked, 0);
-                continue;
-            }
-
-            Multiverse.Stake[] memory stakes = multiverse.getStakes(GENESIS_UID, i);
-            uint8 winnerOutcome = handler.ghostResolvedOutcome(i);
-            uint256 expectedWinnerStaked;
-            uint256 totalStaked;
+            (uint8 numberOfOutcomes,,,) = multiverse.queries(i);
+            ResolutionView memory r = _resolution(i);
+            assertEq(r.stakeCount, stakeCount);
             for (uint256 j = 0; j < stakeCount; ++j) {
-                uint256 ghostAmount = handler.ghostStakeAmount(i, j);
-                totalStaked += ghostAmount;
-                if (stakes[j].reportedOutcome == winnerOutcome) expectedWinnerStaked += ghostAmount;
+                uint8 outcome = handler.ghostStakeOutcome(i, j);
+                assertTrue((outcome >= 1 && outcome <= numberOfOutcomes) || outcome == multiverse.INVALID());
+                if (j > 0) assertTrue(outcome != handler.ghostStakeOutcome(i, j - 1));
+
+                bool firstOnOutcome = true;
+                for (uint256 k = 0; k < j; ++k) {
+                    if (handler.ghostStakeOutcome(i, k) == outcome) firstOnOutcome = false;
+                }
+                if (firstOnOutcome) {
+                    Multiverse.OutcomeStakes memory outcomeStakes = multiverse.getOutcomeStakes(GENESIS_UID, i, outcome);
+                    assertEq(outcomeStakes.firstReporter, handler.ghostStakeReporter(i, j));
+                    assertEq(outcomeStakes.firstReportTime, handler.ghostStakeTime(i, j));
+                }
             }
-            uint256 losers = totalStaked - expectedWinnerStaked;
-            assertEq(winnerStaked, expectedWinnerStaked);
-            // Literal on purpose (BURN_DIVIDER = 5): recomputing with the contract's own constant
-            // would pass even if the constant were changed to a wrong value.
-            assertEq(totalDistributable, losers - losers / 5);
+            if (stakeCount > 0) {
+                assertEq(r.lastReportedOutcome, handler.ghostLastOutcome(i));
+            }
         }
     }
 
@@ -206,12 +223,10 @@ contract MultiverseInvariantTest is MultiverseDeployFixture {
         uint256 count = multiverse.queryCount();
         for (uint256 i = 0; i < count; ++i) {
             uint256 stakeCount = handler.ghostStakeCount(i);
-            if (stakeCount == 0) continue;
-            Multiverse.Stake[] memory stakes = multiverse.getStakes(GENESIS_UID, i);
             for (uint256 j = 0; j < stakeCount; ++j) {
                 if (!handler.ghostClaimed(i, j)) continue;
                 assertTrue(handler.ghostResolved(i));
-                assertEq(stakes[j].reportedOutcome, handler.ghostResolvedOutcome(i));
+                assertEq(handler.ghostStakeOutcome(i, j), handler.ghostResolvedOutcome(i));
             }
         }
     }
