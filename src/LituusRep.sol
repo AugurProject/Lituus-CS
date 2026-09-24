@@ -118,6 +118,18 @@ contract LituusRep is ERC20, Ownable, ReentrancyGuard, ILituusRep {
         emit Unwrapped(sender, shares, assets);
     }
 
+    /// @inheritdoc ILituusRep
+    function migrateOut(address from, uint256 shares) external onlyOwner nonReentrant returns (uint256 assets) {
+        assets = convertToAssets(shares);
+        if (assets == 0) revert ZeroAssets();
+
+        _burn(from, shares);
+        totalAssets -= assets;
+        UNDERLYING_TOKEN.safeTransfer(msg.sender, assets);
+
+        emit Unwrapped(from, shares, assets);
+    }
+
     /* ============================================== BURN FUNCTIONS ============================================= */
 
     /// @inheritdoc ILituusRep

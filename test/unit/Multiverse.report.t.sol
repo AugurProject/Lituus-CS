@@ -578,7 +578,10 @@ contract MultiverseReportTest is MultiverseFixtures {
         (uint256 queryId, uint256 cap) = _createLadderToCap();
         assertEq(_resolution(queryId).noOfOutcomesAtCap, 1);
 
-        _report(challenger, queryId, OUTCOME_A);
+        // The final stake forks the universe inside report() and parks the whole pot, so it is
+        // placed raw rather than through the balance-asserting _report fixture.
+        vm.prank(challenger);
+        multiverse.report(GENESIS_UID, queryId, OUTCOME_A);
 
         ResolutionView memory r = _resolution(queryId);
         assertEq(multiverse.getOutcomeStakes(GENESIS_UID, queryId, OUTCOME_A).totalOutcomeStaked, cap);
@@ -589,6 +592,10 @@ contract MultiverseReportTest is MultiverseFixtures {
         // The pot is exactly two per-outcome caps, i.e. 2% of the universe's REP supply.
         assertEq(r.totalStaked, 2 * cap);
         assertEq(r.totalStaked, 2 * zoltar.getUniverseTheoreticalSupply(GENESIS_UID) / 100);
+
+        // Two outcomes at the cap means the fork level: the same report forked the universe.
+        (, Multiverse.UniverseState state,,,,,,,,,,,) = multiverse.universes(GENESIS_UID);
+        assertEq(uint8(state), uint8(Multiverse.UniverseState.Migration));
     }
 
     function test_Report_LateOutcomePaysTwiceThePot() public {
@@ -618,10 +625,16 @@ contract MultiverseReportTest is MultiverseFixtures {
         uint256 requiredStake = multiverse.getNextRequiredStake(GENESIS_UID, queryId, OUTCOME_C);
         assertEq(requiredStake, cap);
 
-        _report(challenger, queryId, OUTCOME_C);
+        // The final stake forks the universe inside report() and parks the whole pot, so it is
+        // placed raw rather than through the balance-asserting _report fixture.
+        vm.prank(challenger);
+        multiverse.report(GENESIS_UID, queryId, OUTCOME_C);
 
         assertEq(multiverse.getOutcomeStakes(GENESIS_UID, queryId, OUTCOME_C).totalOutcomeStaked, cap);
         assertEq(_resolution(queryId).noOfOutcomesAtCap, 2);
+        // The universe is forked because two outcomes are at the cap
+        (, Multiverse.UniverseState state,,,,,,,,,,,) = multiverse.universes(GENESIS_UID);
+        assertEq(uint8(state), uint8(Multiverse.UniverseState.Migration));
     }
 
     /*//////////////////////////////////////////////////////////////
