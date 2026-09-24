@@ -4,6 +4,7 @@ pragma solidity ^0.8.35;
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import { IZoltar, IZoltarQuestionData } from "./interfaces/IZoltar.sol";
 import { ILituusRep } from "./interfaces/ILituusRep.sol";
@@ -37,6 +38,10 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     // This is the divider for the burn depending on losingStakes on a query.
     // If burn ratio is 20% (1/5), then BURN_DIVIDER is 5.
     uint256 public constant BURN_DIVIDER = 5;
+    /// @notice Divisor of the universe's REP supply that sets the per-outcome stake cap (1%).
+    uint256 public constant CAP_DIVISOR = 100;
+    /// @notice Divisor of the cap that bounds the first stake, so no ladder starts closer than two rounds to it.
+    uint256 public constant FIRST_STAKE_CAP_DIVISOR = 4;
 
     uint256 public constant SCALE = 1 ether;
     // The volume for a three day window that needs to get booted in (when we need to calculate pre genesis).
@@ -68,34 +73,56 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     }
 
     /* ================================================= STRUCTS ================================================= */
-    struct Stake {
-        address reporter;
-        uint48 time;
-        uint8 reportedOutcome;
-        uint256 amount;
-    }
-
     struct Query {
+        // Number of reportable outcomes, numbered 1..numberOfOutcomes. UNRESOLVED and INVALID are not counted.
         uint8 numberOfOutcomes;
+        // The universe the query was created in. It is reportable there and in that universe's descendants.
         uint248 originUniverse;
+        // The query fee in wREP, fixed at creation. Funds the reporter reward; the unpaid remainder is burned.
         uint256 fee;
+        // The question text together with its possible answers.
         string question;
     }
 
+    /// @dev One outcome's side of an escalation ladder. `totalOutcomeStaked` is written on every stake placed
+    ///      on the outcome; the reporter fields are written once, at the outcome's first stake.
+    struct OutcomeStakes {
+        // Total wREP staked on this outcome.
+        uint96 totalOutcomeStaked;
+        // The first account to stake on this outcome. Earns the time-based fee share if the outcome wins.
+        address firstReporter;
+        // When the outcome was first staked on. Drives the fee ramp paid to `firstReporter`.
+        uint48 firstReportTime;
+    }
+
+    /// @dev Escalation state of a query in one universe. The first six fields share a storage slot and are
+    ///      all touched by every report; `cap` and `noOfOutcomesAtCap` share the next slot and are written at
+    ///      the first report and when an outcome reaches the cap only. wREP amounts are bounded by the REP
+    ///      max supply (100M * 1e18), comfortably within uint96.
     struct QueryResolution {
         // The time the query first became reportable in this universe.
         // Set on createQuery in the origin universe and lazily on the first report() in heir universes
         // (to the parent's forkTime — the fork moment that created the universe).
         uint48 queryCreateTime;
-        // if this is 0, then UNRESOLVED, otherwise it is RESOLVED.
+        // The resolved outcome. 0 means UNRESOLVED.
         uint8 outcome;
-        // Escalation settlement totals, frozen at resolution, so claim() computes each payout in O(1).
-        // totalDistributable is the losers' pool minus the burn cut, computed once at resolution.
-        // REP amounts are bounded by max supply (100M * 1e18), comfortably within uint96.
-        uint96 totalDistributable;
-        uint96 winnerStaked;
-        // The stakes for this query.
-        Stake[] stakes;
+        // When the latest stake was placed. Each stake reopens the appeal window from this time.
+        uint48 lastStakeTime;
+        // The outcome of the latest stake. Wins the query if the appeal window lapses unchallenged.
+        uint8 lastReportedOutcome;
+        // Number of stakes placed so far.
+        uint16 stakeCount;
+        // Total wREP staked across all outcomes.
+        uint96 totalStaked;
+        // Per-outcome stake ceiling: 1% of the universe's REP supply, converted to wREP shares and frozen at
+        // the first report so the whole ladder is measured against one grid.
+        uint96 cap;
+        // Number of outcomes whose total has reached `cap`. The second one triggers the fork.
+        uint8 noOfOutcomesAtCap;
+        // Stake totals and first reporter per outcome.
+        mapping(uint8 outcome => OutcomeStakes) outcomes;
+        // Each staker's total per outcome; zeroed when claimed or settled.
+        mapping(address staker => mapping(uint8 outcome => uint96)) userStakes;
     }
 
     struct Universe {
@@ -187,13 +214,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         uint256 stakeAmount
     );
     event QueryResolved(address indexed resolver, uint248 indexed universeId, uint256 indexed queryId, uint8 outcome);
-    event StakeClaimed(
-        address indexed reporter,
-        uint248 indexed universeId,
-        uint256 indexed queryId,
-        uint256 stakeIndex,
-        uint256 payout
-    );
+    event StakeClaimed(address indexed reporter, uint248 indexed universeId, uint256 indexed queryId, uint256 payout);
     // The first correct reporter's share of the query fee, paid when the escalation game resolves.
     event ReporterRewardPaid(
         address indexed reporter, uint248 indexed universeId, uint256 indexed queryId, uint256 amount
@@ -209,7 +230,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     error InvalidNumberOfOutcomes();
     error InvalidQuery();
     error InvalidOutcome();
-    error OutcomeSameAsPrevious();
+    error CannotStakeOnOutcome();
     error QueryAlreadyResolved();
     error QueryNotReadyToResolve();
     error QueryExpired();
@@ -221,7 +242,6 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     error InvalidZoltarQuestion();
     error QueryTooLong();
     error ZeroFee();
-    error ZeroStakeAmount();
     error ExactlyOneAmountRequired();
     error QueryNotInherited();
     error SpawnWindowClosed();
@@ -229,11 +249,8 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     error MigrationWindowNotClosed();
     error ParentForkNotResolved();
     error QueryNotResolved();
-    error StakeAlreadyClaimed();
-    error NotAWinningStake();
-    error NotStakeOwner();
+    error NothingToClaim();
     error InvalidClaimBatch();
-    error InvalidStakeIndex();
     error OnlyQueryTokenizer();
 
     /* =============================================== CONSTRUCTOR =============================================== */
@@ -352,6 +369,12 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         return repToken.convertToShares(ZOLTAR.getForkThreshold(universeId));
     }
 
+    /// @dev The per-outcome stake cap in wREP shares: 1% of the universe's REP supply at the vault's current rate.
+    ///      Read once, at a query's first report, and frozen in `QueryResolution.cap`.
+    function _capShares(ILituusRep repToken, uint248 universeId) internal view returns (uint256) {
+        return repToken.convertToShares(ZOLTAR.getUniverseTheoreticalSupply(universeId) / CAP_DIVISOR);
+    }
+
     /* ============================================= WRAP FUNCTIONS ============================================== */
     /**
      * @notice Wraps a universe's underlying Zoltar REP into its Lituus REP (wREP) for the caller.
@@ -425,11 +448,10 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * @notice Creates a query in a universe, charging the dynamic fee and recording it as demand volume.
      * @dev Fee = controller base fee times the short-term demand modifier (see _calculateFeeAndApplyVolume).
      *      The query is counted in the current 3-day volume bucket only after its own fee is computed.
-     *      The fee must be nonzero and is capped at half the universe's fork threshold — the first
-     *      report's stake equals the query fee, and the report path clamps any first stake down to half
-     *      the threshold.
-     *      At the cap, the first report is an ordinary stake and the fork level can only be reached by
-     *      escalating (the second report lands on the threshold).
+     *      The fee must be nonzero and is capped at half the universe's fork threshold. The fee only
+     *      derives the first report's stake: report() bounds it to a quarter of the per-outcome stake cap
+     *      and rounds it to a step of that cap, so even a fee at its own cap needs two more escalations
+     *      before an outcome can reach that cap.
      * @param universeId The universe to create the query in (must be Active).
      * @param question The question text alongside the possible answers (to be checked).
      * @param numberOfOutcomes The number of reportable outcomes (UNRESOLVED and INVALID are always available
@@ -454,8 +476,8 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         // calculate the fee depending on previous volume and update the volume
         uint256 fee = _calculateFeeAndApplyVolume(universeId, baseFee);
         if (fee == 0) revert ZeroFee();
-        // The first report's stake equals the query fee, clamped down to half the fork threshold by
-        // _requiredStakeAmountAndForkThreshold.
+        // The first report's stake is derived from the query fee, bounded to a fraction of the per-outcome cap
+        // by _requiredStake.
         uint256 queryFeeCap = _queryFeeCap(universe.repToken, universeId);
         if (fee >= queryFeeCap) fee = queryFeeCap;
         // transfer the query fee amount of REP token
@@ -546,10 +568,10 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      *      Rejects reports on queries already resolved
      *      here or in an ancestor lineage. A query created in another universe is reportable here only
      *      if it was inherited through a fork, i.e. this universe descends from the query's origin.
-     *      The first report must fall within THREE_DAYS of the query
-     *      becoming reportable; each subsequent report must differ from the previous outcome and land
-     *      within the ONE_DAY appeal window. The required stake doubles each escalation; reaching the
-     *      fork threshold is meant to trigger a fork.
+     *      The first report must fall within THREE_DAYS of the query becoming reportable and freezes the
+     *      per-outcome cap (1% of the REP supply, in wREP shares). Each later report must land within the
+     *      ONE_DAY appeal window and contest the latest outcome; its stake brings the outcome to twice the
+     *      total of every other outcome, bounded by the cap. When two outcomes reach the cap the query forks.
      * @param universeId The universe to report in.
      * @param queryId The query being reported on.
      * @param outcome The reported outcome (1..numberOfOutcomes, or INVALID).
@@ -564,11 +586,11 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
 
         QueryResolution storage resolution = queryResolutions[universeId][queryId];
         if (resolution.outcome != UNRESOLVED) revert QueryAlreadyResolved();
-        uint256 numberOfStakes = resolution.stakes.length;
+        uint16 stakeCount = resolution.stakeCount;
         // A query resolved in an ancestor universe is inherited by this lineage (via getOutcome), so it
         // cannot be reported on again here. The ancestor set is fixed per lineage, so this only needs to
         // be checked on the first report; later stakes in the same escalation are already covered.
-        if (numberOfStakes == 0 && _findResolution(universeId, queryId) != UNRESOLVED) {
+        if (stakeCount == 0 && _findResolution(universeId, queryId) != UNRESOLVED) {
             revert QueryAlreadyResolved();
         }
 
@@ -579,42 +601,47 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         uint48 queryCreateTime = _getAndUpdateQueryCreateTime(universeId, queryId);
 
         // check that the reporting window for the query is not over yet
-        if (numberOfStakes == 0 && queryCreateTime + THREE_DAYS < block.timestamp) revert QueryExpired();
+        if (stakeCount == 0 && queryCreateTime + THREE_DAYS < block.timestamp) revert QueryExpired();
 
-        // Check that the last outcome is not the same as the current outcome, and the appeal period hasn't expired.
-        if (numberOfStakes > 0) {
-            Stake storage lastStake = resolution.stakes[numberOfStakes - 1];
-            if (lastStake.reportedOutcome == outcome) revert OutcomeSameAsPrevious();
-            if (lastStake.time + ONE_DAY < block.timestamp) revert AppealPeriodOver();
+        if (stakeCount == 0) {
+            // Freeze the per-outcome cap: the whole ladder is measured against this one value.
+            // a fraction of the REP supply, bounded by max supply (100M * 1e18), within uint96
+            // forge-lint: disable-next-line(unsafe-typecast)
+            resolution.cap = uint96(_capShares(universe.repToken, universeId));
+        } else if (resolution.lastStakeTime + ONE_DAY < block.timestamp) {
+            revert AppealPeriodOver();
         }
 
-        (uint256 requiredStakeAmount, uint256 forkThreshold) =
-            _requiredStakeAmountAndForkThreshold(universeId, queryId, universe.repToken);
-        // a zero stake would allow free reports and an escalation ladder stuck at 0.
-        if (requiredStakeAmount == 0) revert ZeroStakeAmount();
+        uint256 stake = _requiredStake(resolution, query.fee, outcome);
+        universe.repToken.safeTransferFrom(msg.sender, address(this), stake);
 
-        // transfer the stake
-        universe.repToken.safeTransferFrom(msg.sender, address(this), requiredStakeAmount);
+        // bounded by the cap, itself a uint96
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint96 stakeAmount = uint96(stake);
+        OutcomeStakes storage outcomeStakes = resolution.outcomes[outcome];
+        uint96 totalOutcomeStaked = outcomeStakes.totalOutcomeStaked;
+        if (totalOutcomeStaked == 0) {
+            outcomeStakes.firstReporter = msg.sender;
+            outcomeStakes.firstReportTime = uint48(block.timestamp);
+        }
+        totalOutcomeStaked += stakeAmount;
+        outcomeStakes.totalOutcomeStaked = totalOutcomeStaked;
+        resolution.userStakes[msg.sender][outcome] += stakeAmount;
 
-        // Update the resolution record for the universe. A fork-level stake is recorded at its full
-        // amount.
-        Stake[] storage stakes = resolution.stakes;
-        stakes.push();
+        resolution.totalStaked += stakeAmount;
+        resolution.lastStakeTime = uint48(block.timestamp);
+        resolution.lastReportedOutcome = outcome;
+        resolution.stakeCount = stakeCount + 1;
 
-        Stake storage newStake = stakes[numberOfStakes];
-        newStake.reporter = msg.sender;
-        newStake.time = uint48(block.timestamp);
-        newStake.reportedOutcome = outcome;
-        newStake.amount = requiredStakeAmount;
+        emit QueryReported(msg.sender, universeId, queryId, outcome, stake);
 
-        emit QueryReported(msg.sender, universeId, queryId, outcome, requiredStakeAmount);
-
-        // A stake reaching the fork threshold forks the universe in the same tx — together with
-        // placing the stake. Works from any Active universe — including a child whose parent's fork
-        // is still unresolved (forks during forks are allowed). Ordering is enforced downstream
-        // instead: advanceForkState requires the parent's fork resolved first.
-        if (requiredStakeAmount >= forkThreshold) {
-            _forkLituusUniverse(universeId, queryId);
+        if (totalOutcomeStaked == resolution.cap) {
+            uint8 outcomesAtCap = resolution.noOfOutcomesAtCap + 1;
+            resolution.noOfOutcomesAtCap = outcomesAtCap;
+            // The second outcome at the cap means two sides each hold 1% of the supply: the query forks.
+            if (outcomesAtCap == 2) {
+                _forkLituusUniverse(universeId, queryId);
+            }
         }
     }
 
@@ -643,7 +670,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
 
         uint48 queryCreateTime = _getAndUpdateQueryCreateTime(universeId, queryId);
 
-        if (resolution.stakes.length == 0 && queryCreateTime + THREE_DAYS < block.timestamp) {
+        if (resolution.stakeCount == 0 && queryCreateTime + THREE_DAYS < block.timestamp) {
             // No report ever landed here, so the ancestor check was never run by report(): a query
             // resolved in an ancestor is inherited by this lineage (via getOutcome) and must not be
             // resolved again. The stakes branch below is already covered by report()'s first-stake check.
@@ -668,8 +695,8 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
             _applyProfit(universeId, profit);
 
             emit QueryResolved(msg.sender, universeId, queryId, INVALID);
-        } else if (resolution.stakes.length > 0) {
-            if (resolution.stakes[resolution.stakes.length - 1].time + ONE_DAY < block.timestamp) {
+        } else if (resolution.stakeCount > 0) {
+            if (resolution.lastStakeTime + ONE_DAY < block.timestamp) {
                 // If there are stakes and the appeal period has passed then resolve the query with the last outcome
                 // TODO: Unless the query is 1 step from fork threshold, then we should wait for the fork to finish
                 uint8 outcome = _calculateOutcomeAndEscalationPayoffs(universeId, queryId);
@@ -694,50 +721,44 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     }
 
     /**
-     * @notice Claims a winning stake's payout from a resolved query: the stake back plus its pro-rata
-     *         share of the losing stakes (after the burn cut).
-     * @dev Payouts are computed from the totals frozen at resolution, never by looping stakes. A stake's
-     *      amount is zeroed on settlement, so amount == 0 also applies as the claimed flag.
+     * @notice Claims the caller's payout from a resolved query: the caller's stake on the winning outcome
+     *         back, plus its pro-rata share of the losing stakes after the burn cut.
+     * @dev Payouts are computed from the resolution's per-outcome totals, never by looping stakes. The
+     *      caller's stake on the winning outcome is zeroed on settlement, so a second claim finds nothing.
      * @param universeId The universe the query was resolved in.
      * @param queryId The resolved query.
-     * @param stakeIndex The index of the stake being claimed.
      */
-    function claim(uint248 universeId, uint256 queryId, uint256 stakeIndex) external nonReentrant {
+    function claim(uint248 universeId, uint256 queryId) external nonReentrant {
         // Only while the universe is Active: once it forks, the whole pot is parked in the Zoltar
         // migration balance and claims become claim-and-migrate into a child.
         Universe storage universe = _checkUniverseState(universeId);
-        uint256 payout = _claim(universeId, queryId, stakeIndex);
+        uint256 payout = _claim(universeId, queryId);
 
         universe.repToken.safeTransfer(msg.sender, payout);
 
-        emit StakeClaimed(msg.sender, universeId, queryId, stakeIndex, payout);
+        emit StakeClaimed(msg.sender, universeId, queryId, payout);
     }
 
     /**
-     * @notice Claims multiple winning stakes of the caller across queries of one universe, in a single
+     * @notice Claims the caller's payouts across several resolved queries of one universe, in a single
      *         transfer.
-     * @dev Entry i claims stakeIndices[i] on queryIds[i]; the two arrays must align and be non-empty.
-     *      Same guards per stake as claim(). A repeated (queryId, stakeIndex) pair reverts on its second
-     *      occurrence (amount == 0), failing the whole batch.
+     * @dev Same guards per query as claim(). A repeated queryId reverts on its second occurrence (the stake
+     *      is already zeroed), failing the whole batch.
      * @param universeId The universe the queries were resolved in.
      * @param queryIds The resolved queries being claimed from.
-     * @param stakeIndices The indices of the caller's stakes in the matching queries.
      */
-    function claimMultiple(uint248 universeId, uint256[] calldata queryIds, uint256[] calldata stakeIndices)
-        external
-        nonReentrant
-    {
+    function claimMultiple(uint248 universeId, uint256[] calldata queryIds) external nonReentrant {
         uint256 length = queryIds.length;
-        if (length == 0 || length != stakeIndices.length) revert InvalidClaimBatch();
-        // Same gate as claim(): parent-side payouts end at the fork.
+        if (length == 0) revert InvalidClaimBatch();
+
         _checkUniverseState(universeId);
 
         uint256 totalPayout;
         for (uint256 i = 0; i < length;) {
-            uint256 payout = _claim(universeId, queryIds[i], stakeIndices[i]);
+            uint256 payout = _claim(universeId, queryIds[i]);
             totalPayout += payout;
 
-            emit StakeClaimed(msg.sender, universeId, queryIds[i], stakeIndices[i], payout);
+            emit StakeClaimed(msg.sender, universeId, queryIds[i], payout);
 
             unchecked {
                 i += 1;
@@ -748,31 +769,26 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     }
 
     /**
-     * @notice Validates and settles a single stake for the caller, returning its payout.
-     * @dev Only the stake's reporter can claim it. Zeroes the amount (the settled flag) before any
-     *      transfer happens in the callers.
+     * @notice Settles the caller's stake on a resolved query's winning outcome, returning its payout.
+     * @dev Only the caller's own stake on the winning outcome can be claimed. Zeroes it (the settled flag)
+     *      before any transfer happens in the callers.
      * @param universeId The universe the query was resolved in.
-     * @param queryId The resolved query the stake belongs to.
-     * @param stakeIndex The index of the stake being claimed.
+     * @param queryId The resolved query.
      * @return payout The stake amount plus its pro-rata share of the distributable losing stakes.
      */
-    function _claim(uint248 universeId, uint256 queryId, uint256 stakeIndex) internal returns (uint256 payout) {
+    function _claim(uint248 universeId, uint256 queryId) internal returns (uint256 payout) {
         QueryResolution storage resolution = queryResolutions[universeId][queryId];
-        if (resolution.outcome == UNRESOLVED) revert QueryNotResolved();
+        uint8 outcome = resolution.outcome;
+        if (outcome == UNRESOLVED) revert QueryNotResolved();
 
-        if (stakeIndex >= resolution.stakes.length) revert InvalidStakeIndex();
-        Stake storage stake = resolution.stakes[stakeIndex];
-        if (stake.reporter != msg.sender) revert NotStakeOwner();
+        uint256 amount = resolution.userStakes[msg.sender][outcome];
+        if (amount == 0) revert NothingToClaim();
+        // Zeroed is the settled flag, set before any transfer happens in the callers.
+        resolution.userStakes[msg.sender][outcome] = 0;
 
-        uint256 amount = stake.amount;
-        if (amount == 0) revert StakeAlreadyClaimed();
-        if (stake.reportedOutcome != resolution.outcome) revert NotAWinningStake();
-
-        // amount == 0 is the settled flag, which should be set before the transfer.
-        stake.amount = 0;
-
-        uint256 winnerStaked = uint256(resolution.winnerStaked);
-        uint256 totalDistributable = uint256(resolution.totalDistributable);
+        uint256 winnerStaked = resolution.outcomes[outcome].totalOutcomeStaked;
+        uint256 totalLoserStakes = resolution.totalStaked - winnerStaked;
+        uint256 totalDistributable = totalLoserStakes - totalLoserStakes / BURN_DIVIDER;
         payout = amount + amount * totalDistributable / winnerStaked;
     }
 
@@ -1092,18 +1108,17 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * @notice Resolves the escalation game for a reported query: pays the query fee reward to the
      *         first correct reporter, computes the protocol profit, records the universe's revenue
      *         and profit, and returns the winning outcome.
-     * @dev Delegates total/winner extraction to `_extractWinnerOutcomeAndTotals`, which reverts if
-     *      the query has no stakes; callers MUST guarantee the query is reported before calling.
+     * @dev Reads the winner (the latest reported outcome) and its totals from the resolution record;
+     *      callers MUST guarantee the query is reported before calling.
      *
      *      `reporterPay` accrues linearly over the reporting window as
      *      `fee * (reportingTimestamp - queryCreateTime) / THREE_DAYS`, capped at the full `fee`: the
      *      winning report can land after escalation has begun and thus past the 3-day window, so
      *      the cap prevents paying out more than the fee.
      *
-     *      `profit` is the REP removed from circulation: 20% of the losing stakes
+     *      `profit` is the wREP removed from circulation: 20% of the losing stakes
      *      (`totalLoserStakes / BURN_DIVIDER`) plus the unpaid fee remainder (`fee - reporterPay`).
-     *      The reporter reward is pushed here via `safeTransfer`; burning `profit` is still pending
-     *      the Lituus wrap/unwrap path (TODO).
+     *      The reporter reward is pushed here via `safeTransfer`.
      *
      *      Winner stake refunds and their proportional share of the remaining 80% of losing stakes
      *      are NOT settled here — those are claimed separately through claim() (except the case of
@@ -1113,18 +1128,18 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * @return winnerOutcome The winning outcome of the resolved query.
      */
     function _calculateOutcomeAndEscalationPayoffs(uint248 universeId, uint256 queryId) internal returns (uint8) {
-        (
-            uint256 totalStaked,
-            uint256 winnerOutcomeStaked,
-            uint8 winnerOutcome,
-            address reporter,
-            uint48 reportingTimestamp
-        ) = _extractWinnerOutcomeAndTotals(universeId, queryId);
+        QueryResolution storage resolution = queryResolutions[universeId][queryId];
+        uint8 winnerOutcome = resolution.lastReportedOutcome;
+        OutcomeStakes storage winnerStakes = resolution.outcomes[winnerOutcome];
+        uint256 totalStaked = resolution.totalStaked;
+        uint256 winnerOutcomeStaked = winnerStakes.totalOutcomeStaked;
+        address reporter = winnerStakes.firstReporter;
+        uint48 reportingTimestamp = winnerStakes.firstReportTime;
 
         uint256 queryFee = queries[queryId].fee;
         // Per-universe queryCreateTime: createQuery sets it for the origin universe and report()
         // lazily sets it to the parent's forkTime for heir universes on first report.
-        uint48 queryCreateTime = queryResolutions[universeId][queryId].queryCreateTime;
+        uint48 queryCreateTime = resolution.queryCreateTime;
 
         uint256 totalLoserStakes = totalStaked - winnerOutcomeStaked;
         // Ramps to the full fee over the reporting window; a first correct report after day 3 earns it whole.
@@ -1137,21 +1152,13 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
 
         ILituusRep repToken = universes[universeId].repToken;
 
-        QueryResolution storage resolution = queryResolutions[universeId][queryId];
-        // Store the escalation totals so claim() can compute each winner's payout without looping again.
-        // Both are REP amounts bounded by max supply (100M * 1e18), within uint96.
-        // forge-lint: disable-next-line(unsafe-typecast)
-        resolution.totalDistributable = uint96(totalLoserStakes - loserBurn);
-        // forge-lint: disable-next-line(unsafe-typecast)
-        resolution.winnerStaked = uint96(winnerOutcomeStaked);
-
         emit ReporterRewardPaid(reporter, universeId, queryId, reporterPay);
         // Consecutive reports must differ, so no-losers <=> exactly one stake: settle the sole winner
         // here in one transfer (bond refund + reporter reward) instead of requiring a claim() call.
         // The two events stay separate so StakeClaimed payouts don't include a fee reward.
-        if (resolution.stakes.length == 1) {
-            resolution.stakes[0].amount = 0; // amount == 0 marks the stake settled
-            emit StakeClaimed(reporter, universeId, queryId, 0, totalStaked);
+        if (resolution.stakeCount == 1) {
+            resolution.userStakes[reporter][winnerOutcome] = 0; // zeroed marks the stake settled
+            emit StakeClaimed(reporter, universeId, queryId, totalStaked);
             repToken.safeTransfer(reporter, reporterPay + totalStaked);
         }
         // with more than one stake, even the rewarded reporter must claim their bond separately
@@ -1204,80 +1211,6 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         return elapsed >= THREE_DAYS ? fee : fee * elapsed / THREE_DAYS;
     }
 
-    /**
-     * @notice Computes the staking totals and the winning outcome for a reported query, and
-     *         identifies the reporter entitled to the query fee reward.
-     * @dev MUST be called only for a reported query (`stakes.length > 0`); otherwise the
-     *      `stakes[length - 1]` access underflows and reverts. The no-report / invalid path
-     *      must be handled before calling this.
-     *
-     *      The winning outcome is always the last reported outcome (the last stake in the
-     *      escalation chain), so the last stake is read before the loop to establish it; the
-     *      loop then runs only when there is more than one stake.
-     *
-     *      `reporter` and `reportingTimestamp` correspond to the FIRST stake placed on the
-     *      winning outcome (the earliest in the chain), since the query fee reward is paid to
-     *      whoever first reported the eventually-winning outcome. Computed in a single pass.
-     * @param universeId The id of the universe the query is being resolved in.
-     * @param queryId The id of the query being resolved.
-     * @return totalStaked The total staked amount for the whole query.
-     * @return winnerOutcomeStaked The total staked amount on the winner outcome.
-     * @return winnerOutcome The winner outcome.
-     * @return reporter The reporter acquiring the query fee reward.
-     * @return reportingTimestamp The timestamp when the stake acquiring the query fee reward occurred.
-     */
-    function _extractWinnerOutcomeAndTotals(uint248 universeId, uint256 queryId)
-        internal
-        view
-        returns (
-            uint256 totalStaked,
-            uint256 winnerOutcomeStaked,
-            uint8 winnerOutcome,
-            address reporter,
-            uint48 reportingTimestamp
-        )
-    {
-        Stake[] storage stakes = queryResolutions[universeId][queryId].stakes;
-        uint256 length = stakes.length;
-
-        // The winner outcome comes always from the last stake in resolution, so extracting last stake before for loop
-        // helps us identify it and then for loop only if array's length is greater than 1.
-        Stake storage stake = stakes[length - 1];
-        totalStaked += stake.amount;
-        winnerOutcomeStaked += stake.amount;
-        winnerOutcome = stake.reportedOutcome;
-        // Those two are set temporarily, in case last stake was the only one reported the winnerOutcome.
-        reporter = stake.reporter;
-        reportingTimestamp = stake.time;
-
-        if (length > 1) {
-            // Extracted here, so as not to spend gas everytime for subtracting operation.
-            length = length - 1;
-
-            // Used to identify the first reporter for winnerOutcome. If true, first already exists, so skipping.
-            bool isReporterSet;
-            for (uint256 i = 0; i < length;) {
-                stake = stakes[i];
-
-                totalStaked += stake.amount;
-
-                if (stake.reportedOutcome == winnerOutcome) {
-                    winnerOutcomeStaked += stake.amount;
-
-                    if (!isReporterSet) {
-                        reporter = stake.reporter;
-                        reportingTimestamp = stake.time;
-                        isReporterSet = true;
-                    }
-                }
-
-                unchecked {
-                    i += 1;
-                }
-            }
-        }
-    }
-
     /* ========================================== PUBLIC VIEW FUNCTIONS ========================================== */
     /**
      * @notice Returns the outcome of a query as seen from a given universe.
@@ -1303,41 +1236,67 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     }
 
     /**
-     * @notice Returns the stakes placed on a query in a universe.
-     * @dev Rejects a nonexistent query; an existing query with no stakes in the given universe
-     *      returns an empty array. Reads the raw per-universe record and does NOT forward to the
-     *      heir — pass the universe the stakes were placed in. The escalation chain is short
-     *      (stakes double towards the fork threshold), so returning the full array is safe.
+     * @notice Returns one outcome's side of a query's escalation in a given universe: its stake total and
+     *         first reporter.
+     * @dev Reads the record of the given universe as-is, without forwarding to the universe's heir. Pass
+     *      the universe the stakes were placed in.
      * @param universeId The universe whose resolution record to read.
      * @param queryId The query whose stakes to read.
-     * @return The stakes placed on the query in that universe, in reporting order.
+     * @param outcome The outcome whose side to read.
+     * @return The outcome's stake total, first reporter and first report time.
      */
-    function getStakes(uint248 universeId, uint256 queryId) external view returns (Stake[] memory) {
+    function getOutcomeStakes(uint248 universeId, uint256 queryId, uint8 outcome)
+        external
+        view
+        returns (OutcomeStakes memory)
+    {
         if (queries[queryId].numberOfOutcomes == 0) revert InvalidQuery();
-        return queryResolutions[universeId][queryId].stakes;
+        return queryResolutions[universeId][queryId].outcomes[outcome];
     }
 
     /**
-     * @notice Returns the stake the next report on a query must post, and the universe's fork threshold.
-     * @dev Rejects a nonexistent query or universe. Applies the same universe gating as report()
-     *      (exists and Active, no heir forwarding), so `requiredStakeAmount` is the amount
-     *      report() would pull from the caller.
-     *      A required stake at or above `forkThreshold` means the next report triggers the fork path.
-     *      The FIRST stake is clamped down to half the fork threshold when the query fee exceeds it,
-     *      so an opening report is never itself fork-level (see _requiredStakeAmountAndForkThreshold).
-     * @param universeId The universe to report in.
-     * @param queryId The query to report on.
-     * @return requiredStakeAmount The stake the next reporter must post.
-     * @return forkThreshold The stake level at which posting triggers a fork.
+     * @notice Returns a staker's total stake on one outcome of a query in a given universe. Zero once
+     *         claimed or settled.
+     * @dev Reads the record of the given universe as-is, without forwarding to the universe's heir.
+     * @param universeId The universe whose resolution record to read.
+     * @param queryId The query whose stakes to read.
+     * @param staker The staker whose stake to read.
+     * @param outcome The outcome the stake was placed on.
+     * @return The staker's stake on the outcome.
      */
-    function getNextRequiredStake(uint248 universeId, uint256 queryId)
+    function getUserStake(uint248 universeId, uint256 queryId, address staker, uint8 outcome)
         external
         view
-        returns (uint256 requiredStakeAmount, uint256 forkThreshold)
+        returns (uint96)
+    {
+        if (queries[queryId].numberOfOutcomes == 0) revert InvalidQuery();
+        return queryResolutions[universeId][queryId].userStakes[staker][outcome];
+    }
+
+    /**
+     * @notice The stake the next report on `outcome` must place for `queryId` in `universeId`.
+     * @dev Before the first report the cap is not frozen yet, so the estimate uses the live cap and can shift with
+     *      the vault rate until the first stake lands. Forwards to the universe's heir like report().
+     * @param universeId The universe to report in.
+     * @param queryId The query to report on.
+     * @param outcome The outcome the next report would stake on.
+     * @return requiredStake The stake the next reporter must post.
+     */
+    function getNextRequiredStake(uint248 universeId, uint256 queryId, uint8 outcome)
+        external
+        view
+        returns (uint256 requiredStake)
     {
         if (queries[queryId].numberOfOutcomes == 0) revert InvalidQuery();
         Universe storage universe = _checkUniverseState(universeId);
-        return _requiredStakeAmountAndForkThreshold(universeId, queryId, universe.repToken);
+        QueryResolution storage resolution = queryResolutions[universeId][queryId];
+        uint256 fee = queries[queryId].fee;
+        if (resolution.stakeCount == 0) {
+            uint256 cap = _capShares(universe.repToken, universeId);
+            uint256 firstStakeCap = cap / FIRST_STAKE_CAP_DIVISOR;
+            return _roundToPowerOfTwoStep(fee > firstStakeCap ? firstStakeCap : fee, cap);
+        }
+        return _requiredStake(resolution, fee, outcome);
     }
 
     /* ========================================= ANCESTRY FUNCTIONS =========================================== */
@@ -1426,49 +1385,42 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         }
     }
 
-    // TODO: the fork threshold logic will be rewritten together with the new escalation game algorithm
-    /**
-     * @notice Computes the stake required for the report on a query and the universe's fork threshold.
-     * @dev The next stake is the query fee for the first report and double the previous stake for each
-     *      subsequent report. The first stake is clamped down to half the fork threshold when the fee
-     *      exceeds it (a tokenizer redemption records the pool average verbatim, and the threshold can
-     *      shrink between creation and reporting), so an opening report is never itself fork-level.
-     *      Escalation stakes are instead clamped up: once a doubling exceeds half the fork threshold
-     *      it becomes the full fork threshold (a fork-level stake); a stake of exactly half is left
-     *      untouched — its own doubling lands exactly on the threshold.
-     * @param universeId The (current) universe the query lives in.
-     * @param queryId The query being reported on.
-     * @param repToken The universe's wREP token, already loaded by the caller.
-     * @return requiredStakeAmount The stake the reporter must post.
-     * @return forkThreshold The stake level at which posting triggers a fork.
-     */
-    function _requiredStakeAmountAndForkThreshold(uint248 universeId, uint256 queryId, ILituusRep repToken)
+    /// @dev Rounds `amount` to the nearest step of the halving sequence cap, cap/2, cap/4, ... in log space:
+    ///      the chosen step is never more than a factor of sqrt(2) away from `amount`. A first stake on a step keeps
+    ///      every later stake on a step, so the leading outcomes land exactly on the cap. Requires `amount <= cap`.
+    function _roundToPowerOfTwoStep(uint256 amount, uint256 cap) internal pure returns (uint256 step) {
+        step = cap >> Math.log2(cap / amount);
+        if (step > amount) step >>= 1; // log2 floors, so the step can land one halving above `amount`
+        // Move up when `amount` is above the geometric mean of the two steps, i.e. amount > step * sqrt(2).
+        if (amount * amount > 2 * step * step) step <<= 1;
+    }
+
+    /// @dev The exact stake the next report on `outcome` must place.
+    ///      First stake: the query fee, bounded to `cap / FIRST_STAKE_CAP_DIVISOR` and rounded to a step.
+    ///      Later stakes: the amount that brings the outcome to exactly twice the total of every other outcome,
+    ///      bounded by the cap. An outcome that already holds that share cannot be staked on: it is the
+    ///      outcome the last report backed.
+    function _requiredStake(QueryResolution storage resolution, uint256 fee, uint8 outcome)
         internal
         view
-        returns (uint256 requiredStakeAmount, uint256 forkThreshold)
+        returns (uint256 stake)
     {
-        forkThreshold = _forkThreshold(repToken, universeId);
-        uint256 halfForkThreshold = forkThreshold / 2;
-
-        Stake[] storage stakes = queryResolutions[universeId][queryId].stakes;
-        uint256 numberOfStakes = stakes.length;
-
-        // The first report's stake is the query fee (clamped below); each escalation doubles the
-        // previous stake.
-        uint256 nextStakeAmount;
-        if (numberOfStakes == 0) {
-            uint256 fee = queries[queryId].fee;
-            // Clamp the first stake down so the opening report is never itself a fork trigger.
-            nextStakeAmount = fee > halfForkThreshold ? halfForkThreshold : fee;
-        } else {
-            uint256 lastStakeAmount = stakes[numberOfStakes - 1].amount;
-            nextStakeAmount = lastStakeAmount * 2;
+        uint256 cap = resolution.cap;
+        if (resolution.stakeCount == 0) {
+            uint256 firstStakeCap = cap / FIRST_STAKE_CAP_DIVISOR;
+            return _roundToPowerOfTwoStep(fee > firstStakeCap ? firstStakeCap : fee, cap);
         }
-
-        // Once the next stake exceeds half the fork threshold, clamp it to the full threshold so the
-        // escalation ends exactly at the fork level instead of overshooting it on the next doubling.
-        bool reachesForkLevel = nextStakeAmount > halfForkThreshold;
-        requiredStakeAmount = reachesForkLevel ? forkThreshold : nextStakeAmount;
+        uint256 totalStaked = resolution.totalStaked;
+        uint256 totalOutcomeStaked = resolution.outcomes[outcome].totalOutcomeStaked;
+        // An appeal contests the latest report, so restating its outcome is not one. The second condition keeps
+        // the subtraction below safe; it never holds for an outcome other than the latest.
+        if (outcome == resolution.lastReportedOutcome || 3 * totalOutcomeStaked >= 2 * totalStaked) {
+            revert CannotStakeOnOutcome();
+        }
+        uint256 amountToReachDoubleTheRest = 2 * totalStaked - 3 * totalOutcomeStaked;
+        uint256 amountToReachCap = cap - totalOutcomeStaked;
+        stake = amountToReachDoubleTheRest < amountToReachCap ? amountToReachDoubleTheRest : amountToReachCap;
+        // A zero stake is unreachable and doesn't need a check.
     }
 
     /* ==================================== TOKEN SUPPLY MANAGEMENT FUNCTIONS ==================================== */

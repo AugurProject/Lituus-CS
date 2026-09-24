@@ -11,6 +11,20 @@ import { MultiverseFixtures } from "./Multiverse.fixtures.sol";
 ///      constants: if a constant or a formula in the code is wrong, a test recomputing with the
 ///      same inputs would be wrong in the same way and still pass.
 contract MultiverseResolveTest is MultiverseFixtures {
+    /// @dev The settlement totals of a query as claim() derives them: the winning outcome's stake total
+    ///      and the losing stakes minus the burn cut. Both zero while the query is unresolved.
+    function _settlementTotals(uint256 queryId)
+        internal
+        view
+        returns (uint256 totalDistributable, uint256 winnerStaked)
+    {
+        ResolutionView memory r = _resolution(queryId);
+        if (r.outcome == multiverse.UNRESOLVED()) return (0, 0);
+        winnerStaked = multiverse.getOutcomeStakes(GENESIS_UID, queryId, r.outcome).totalOutcomeStaked;
+        uint256 totalLoserStakes = uint256(r.totalStaked) - winnerStaked;
+        totalDistributable = totalLoserStakes - totalLoserStakes / multiverse.BURN_DIVIDER();
+    }
+
     /*//////////////////////////////////////////////////////////////
                     RESOLVE - INVALID (NO-REPORT) PATH
     //////////////////////////////////////////////////////////////*/
@@ -132,7 +146,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
         _resolve(user, queryId);
 
         // No stakes ever landed, so nothing is claimable: the escalation totals stay zero.
-        (,, uint96 totalDistributable, uint96 winnerStaked) = multiverse.queryResolutions(GENESIS_UID, queryId);
+        (uint256 totalDistributable, uint256 winnerStaked) = _settlementTotals(queryId);
         assertEq(totalDistributable, 0);
         assertEq(winnerStaked, 0);
     }
@@ -178,9 +192,8 @@ contract MultiverseResolveTest is MultiverseFixtures {
         uint8 outcome = _resolve(bystander, queryId);
         assertEq(outcome, OUTCOME_A);
 
-        // The sole stake is auto-settled at resolution (amount == 0 is the settled flag).
-        Multiverse.Stake[] memory stakes = multiverse.getStakes(GENESIS_UID, queryId);
-        assertEq(stakes[0].amount, 0);
+        // The sole stake is auto-settled at resolution (the staker's balance zeroed is the settled flag).
+        assertEq(multiverse.getUserStake(GENESIS_UID, queryId, user, OUTCOME_A), 0);
 
         // reporterPay is half the query fee (half of the time passed)
         // reporterPay = fee * elapsed / THREE_DAYS = 1e18 * 129600 / 259200 = 0.5e18;
@@ -202,7 +215,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
         vm.expectEmit(true, true, true, true, address(multiverse));
         emit Multiverse.ReporterRewardPaid(user, GENESIS_UID, queryId, 0.5 ether);
         vm.expectEmit(true, true, true, true, address(multiverse));
-        emit Multiverse.StakeClaimed(user, GENESIS_UID, queryId, 0, 1 ether);
+        emit Multiverse.StakeClaimed(user, GENESIS_UID, queryId, 1 ether);
         vm.expectEmit(true, true, true, true, address(multiverse));
         emit Multiverse.QueryResolved(bystander, GENESIS_UID, queryId, OUTCOME_A);
 
@@ -224,7 +237,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
         uint8 outcome = _resolve(bystander, queryId);
 
         assertEq(outcome, 255);
-        assertEq(multiverse.getStakes(GENESIS_UID, queryId)[0].amount, 0);
+        assertEq(multiverse.getUserStake(GENESIS_UID, queryId, user, multiverse.INVALID()), 0);
         // Reported after creation, so reporterPay = 0.5 ether; the reporter gets the stake back too.
         assertEq(genesisRep.balanceOf(user), userBalanceBefore + 1.5 ether);
         assertEq(genesisRep.balanceOf(bystander), bystanderBalanceBefore);
@@ -234,7 +247,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
         uint256 queryId = _createResolvableReportedQuery(OUTCOME_A);
         _resolve(user, queryId);
 
-        (,, uint96 totalDistributable, uint96 winnerStaked) = multiverse.queryResolutions(GENESIS_UID, queryId);
+        (uint256 totalDistributable, uint256 winnerStaked) = _settlementTotals(queryId);
         // The single stake equals the query fee (1 ether); there are no losing stakes.
         assertEq(winnerStaked, 1 ether);
         assertEq(totalDistributable, 0);
@@ -316,7 +329,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
         uint8 outcome = _resolve(challenger, queryId);
         assertEq(outcome, OUTCOME_B);
 
-        (,, uint96 totalDistributable, uint96 winnerStaked) = multiverse.queryResolutions(GENESIS_UID, queryId);
+        (uint256 totalDistributable, uint256 winnerStaked) = _settlementTotals(queryId);
         // Only the 2 ether escalation stake is on the winning outcome.
         assertEq(winnerStaked, 2 ether);
         // Losers staked 1 ether, BURN_DIVIDER = 5 (20% burn): 1e18 - 1e18 / 5 = 0.8e18
@@ -333,10 +346,9 @@ contract MultiverseResolveTest is MultiverseFixtures {
 
         // Claim winning stake (index 1): 2 ether stake + 0.8 ether distributable losers share.
         vm.prank(bystander);
-        multiverse.claim(GENESIS_UID, queryId, 1);
+        multiverse.claim(GENESIS_UID, queryId);
 
-        Multiverse.Stake[] memory stakes = multiverse.getStakes(GENESIS_UID, queryId);
-        assertEq(stakes[1].amount, 0);
+        assertEq(multiverse.getUserStake(GENESIS_UID, queryId, bystander, OUTCOME_B), 0);
         assertEq(genesisRep.balanceOf(bystander), bystanderBalanceBeforeClaim + 2.8 ether);
         assertEq(genesisRep.balanceOf(address(multiverse)), multiverseBalanceBeforeClaim - 2.8 ether);
     }
@@ -348,7 +360,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
         vm.warp(START_TIME + 30 hours);
         _report(bystander, queryId, OUTCOME_B); // stake 1: 2 ether
         vm.warp(START_TIME + 42 hours);
-        _report(challenger, queryId, OUTCOME_A); // stake 2: 4 ether
+        _report(challenger, queryId, OUTCOME_A); // stake 2: 3 ether, A now holds twice B
         _warpPastAppealWindow(queryId);
 
         // The fee reward goes to the FIRST reporter of the winning outcome (user, not challenger),
@@ -362,9 +374,9 @@ contract MultiverseResolveTest is MultiverseFixtures {
         uint8 outcome = _resolve(bystander, queryId);
         assertEq(outcome, OUTCOME_A);
 
-        (,, uint96 totalDistributable, uint96 winnerStaked) = multiverse.queryResolutions(GENESIS_UID, queryId);
-        // Stakes on the winning outcome: 1 + 4 ether.
-        assertEq(winnerStaked, 5 ether);
+        (uint256 totalDistributable, uint256 winnerStaked) = _settlementTotals(queryId);
+        // Stakes on the winning outcome: 1 + 3 ether.
+        assertEq(winnerStaked, 4 ether);
         // Losers staked 2 ether, BURN_DIVIDER = 5: 2e18 - 2e18 / 5 = 1.6e18
         assertEq(totalDistributable, 1.6 ether);
 
@@ -377,26 +389,24 @@ contract MultiverseResolveTest is MultiverseFixtures {
         uint256 userBalanceBeforeClaim = genesisRep.balanceOf(user);
         uint256 multiverseBalanceBeforeUserClaim = genesisRep.balanceOf(address(multiverse));
 
-        // User claims winning stake index 0: 1 ether + (1/5 * 1.6 ether) = 1.32 ether.
+        // User claims their winning stake: 1 ether + (1/4 * 1.6 ether) = 1.4 ether.
         vm.prank(user);
-        multiverse.claim(GENESIS_UID, queryId, 0);
+        multiverse.claim(GENESIS_UID, queryId);
 
-        Multiverse.Stake[] memory stakes = multiverse.getStakes(GENESIS_UID, queryId);
-        assertEq(stakes[0].amount, 0);
-        assertEq(genesisRep.balanceOf(user), userBalanceBeforeClaim + 1.32 ether);
-        assertEq(genesisRep.balanceOf(address(multiverse)), multiverseBalanceBeforeUserClaim - 1.32 ether);
+        assertEq(multiverse.getUserStake(GENESIS_UID, queryId, user, OUTCOME_A), 0);
+        assertEq(genesisRep.balanceOf(user), userBalanceBeforeClaim + 1.4 ether);
+        assertEq(genesisRep.balanceOf(address(multiverse)), multiverseBalanceBeforeUserClaim - 1.4 ether);
 
         uint256 challengerBalanceBeforeClaim = genesisRep.balanceOf(challenger);
         uint256 multiverseBalanceBeforeChallengerClaim = genesisRep.balanceOf(address(multiverse));
 
-        // Challenger claims winning stake index 2: 4 ether + (4/5 * 1.6 ether) = 5.28 ether.
+        // Challenger claims their winning stake: 3 ether + (3/4 * 1.6 ether) = 4.2 ether.
         vm.prank(challenger);
-        multiverse.claim(GENESIS_UID, queryId, 2);
+        multiverse.claim(GENESIS_UID, queryId);
 
-        stakes = multiverse.getStakes(GENESIS_UID, queryId);
-        assertEq(stakes[2].amount, 0);
-        assertEq(genesisRep.balanceOf(challenger), challengerBalanceBeforeClaim + 5.28 ether);
-        assertEq(genesisRep.balanceOf(address(multiverse)), multiverseBalanceBeforeChallengerClaim - 5.28 ether);
+        assertEq(multiverse.getUserStake(GENESIS_UID, queryId, challenger, OUTCOME_A), 0);
+        assertEq(genesisRep.balanceOf(challenger), challengerBalanceBeforeClaim + 4.2 ether);
+        assertEq(genesisRep.balanceOf(address(multiverse)), multiverseBalanceBeforeChallengerClaim - 4.2 ether);
     }
 
     function test_Resolve_Ladder_RewardGoesToEarliestOfManyWinningStakes() public {
@@ -406,11 +416,11 @@ contract MultiverseResolveTest is MultiverseFixtures {
         vm.warp(START_TIME + 30 hours);
         _report(bystander, queryId, OUTCOME_B); // stake 1: 2 ether
         vm.warp(START_TIME + 42 hours);
-        _report(challenger, queryId, OUTCOME_A); // stake 2: 4 ether — repeats the winning outcome
+        _report(challenger, queryId, OUTCOME_A); // stake 2: 3 ether — repeats the winning outcome
         vm.warp(START_TIME + 54 hours);
-        _report(bystander, queryId, OUTCOME_B); // stake 3: 8 ether
+        _report(bystander, queryId, OUTCOME_B); // stake 3: 6 ether
         vm.warp(START_TIME + 66 hours);
-        _report(user, queryId, OUTCOME_A); // stake 4: 16 ether — the winning last stake
+        _report(user, queryId, OUTCOME_A); // stake 4: 12 ether — the winning last stake
         _warpPastAppealWindow(queryId);
 
         // Three stakes placed on the winning outcome (indices 0, 2, 4). The fee reward must go to the
@@ -424,11 +434,11 @@ contract MultiverseResolveTest is MultiverseFixtures {
         uint8 outcome = _resolve(bystander, queryId);
         assertEq(outcome, OUTCOME_A);
 
-        (,, uint96 totalDistributable, uint96 winnerStaked) = multiverse.queryResolutions(GENESIS_UID, queryId);
-        // Stakes on the winning outcome: 1 + 4 + 16 ether.
-        assertEq(winnerStaked, 21 ether);
-        // Losers staked 2 + 8 = 10 ether, BURN_DIVIDER = 5 (20% burn): 10e18 - 10e18 / 5 = 8e18
-        assertEq(totalDistributable, 8 ether);
+        (uint256 totalDistributable, uint256 winnerStaked) = _settlementTotals(queryId);
+        // Stakes on the winning outcome: 1 + 3 + 12 ether.
+        assertEq(winnerStaked, 16 ether);
+        // Losers staked 2 + 6 = 8 ether, BURN_DIVIDER = 5 (20% burn): 8e18 - 8e18 / 5 = 6.4e18
+        assertEq(totalDistributable, 6.4 ether);
     }
 
     function test_Resolve_Ladder_PayoutsScaleWithFee() public {
@@ -451,7 +461,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
         uint8 outcome = _resolve(challenger, queryId);
         assertEq(outcome, OUTCOME_B);
 
-        (,, uint96 totalDistributable, uint96 winnerStaked) = multiverse.queryResolutions(GENESIS_UID, queryId);
+        (uint256 totalDistributable, uint256 winnerStaked) = _settlementTotals(queryId);
         // Only the 8 ether escalation stake is on the winning outcome.
         assertEq(winnerStaked, 8 ether);
         // Losers staked 4 ether, BURN_DIVIDER = 5 (20% burn): 4e18 - 4e18 / 5 = 3.2e18
@@ -483,7 +493,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
         uint8 outcome = _resolve(user, queryId);
         assertEq(outcome, 255);
 
-        (,, uint96 totalDistributable, uint96 winnerStaked) = multiverse.queryResolutions(GENESIS_UID, queryId);
+        (uint256 totalDistributable, uint256 winnerStaked) = _settlementTotals(queryId);
         // Only the 2 ether INVALID stake won; losers staked 1 ether: 1e18 - 1e18 / 5 = 0.8e18
         assertEq(winnerStaked, 2 ether);
         assertEq(totalDistributable, 0.8 ether);
@@ -497,9 +507,8 @@ contract MultiverseResolveTest is MultiverseFixtures {
         _resolve(user, queryId);
 
         // With more than one stake nothing is auto-settled: every amount is untouched until claim().
-        Multiverse.Stake[] memory stakes = multiverse.getStakes(GENESIS_UID, queryId);
-        assertEq(stakes[0].amount, 1 ether);
-        assertEq(stakes[1].amount, 2 ether);
+        assertEq(multiverse.getUserStake(GENESIS_UID, queryId, user, OUTCOME_A), 1 ether);
+        assertEq(multiverse.getUserStake(GENESIS_UID, queryId, bystander, OUTCOME_B), 2 ether);
     }
 
     function test_Resolve_Ladder_EmitsEvents() public {
@@ -547,31 +556,85 @@ contract MultiverseResolveTest is MultiverseFixtures {
         assertEq(genesisRep.totalSupply(), supplyBefore - 0.95 ether);
     }
 
-    function test_Resolve_NearThresholdLadder() public {
-        // A ladder that stopped one step from the fork level (its last stake is exactly half the
-        // fork threshold; the next report would be the fork trigger) is still an ordinary
-        // escalation once the appeal window passes: the fork threshold was never met, so the
-        // query resolves to the last outcome and winners settle through claim() as usual.
-        (uint256 queryId, uint256 forkThreshold) = _createNearThresholdLadder();
+    function test_Resolve_LadderAtCap() public {
+        // A ladder with one outcome sitting at the per-outcome cap is still an ordinary escalation once
+        // the appeal window passes: only a second outcome reaching the cap forks, so the query resolves
+        // to the last outcome and winners settle through claim() as usual.
+        (uint256 queryId, uint256 cap) = _createLadderToCap();
         _warpPastAppealWindow(queryId);
 
         uint8 outcome = _resolve(challenger, queryId);
-        assertEq(outcome, OUTCOME_A);
+        assertEq(outcome, OUTCOME_B);
 
-        // Hand-computed literals: fixture supply = 3000e18 (three actors x 1000e18), so the
-        // threshold t = 3000e18 / 20 = 150e18 and the ladder is t/8 (user, A) = 18.75e18,
-        // t/4 (challenger, B) = 37.5e18, t/2 (bystander, A) = 75e18. Losers = 37.5e18,
-        // burn = 37.5e18 / 5 = 7.5e18, distributable = 30e18; winnerStaked = 93.75e18.
-        assertEq(forkThreshold, 150 ether);
-        (,, uint96 totalDistributable, uint96 winnerStaked) = multiverse.queryResolutions(GENESIS_UID, queryId);
-        assertEq(winnerStaked, 93.75 ether);
-        assertEq(totalDistributable, 30 ether);
+        // Hand-computed literals (cap 32 ether, fee 1 ether): the ladder is A 1, B 2, A 3, B 6, A 12,
+        // B 24, so B holds 32 (the cap) and A 16. Losers = 16, burn = 16 / 5 = 3.2, distributable = 12.8.
+        assertEq(cap, 32 ether);
+        (uint256 totalDistributable, uint256 winnerStaked) = _settlementTotals(queryId);
+        assertEq(winnerStaked, 32 ether);
+        assertEq(totalDistributable, 12.8 ether);
 
-        // Both winning stakes settle normally:
-        // payout(stake 0) = 18.75e18 + 18.75e18 * 30e18 / 93.75e18 = 24.75e18
-        // payout(stake 2) = 75e18 + 75e18 * 30e18 / 93.75e18 = 99e18
-        assertEq(_claim(user, queryId, 0), 24.75 ether);
-        assertEq(_claim(bystander, queryId, 2), 99 ether);
+        // Every B staker settles normally, pro-rata on the 12.8 ether:
+        // challenger 2 + 2 * 12.8 / 32 = 2.8, user 6 + 6 * 12.8 / 32 = 8.4, bystander 24 + 24 * 12.8 / 32 = 33.6
+        assertEq(_claim(challenger, queryId), 2.8 ether);
+        assertEq(_claim(user, queryId), 8.4 ether);
+        assertEq(_claim(bystander, queryId), 33.6 ether);
+    }
+
+    function test_Resolve_Ladder_FeeRewardGoesToWinningOutcomeFirstReporter() public {
+        // The fee reward belongs to whoever first backed the winning outcome, not to the query's first
+        // reporter: user opens on A, challenger answers B and B wins. The ramp is measured from
+        // challenger's own report, 36h in, so the reward is half the fee.
+        uint256 queryId = _createDefaultQuery();
+
+        vm.warp(START_TIME + 18 hours);
+        _report(user, queryId, OUTCOME_A); // 1 ether
+        vm.warp(START_TIME + 36 hours);
+        _report(challenger, queryId, OUTCOME_B); // 2 ether
+        _warpPastAppealWindow(queryId);
+
+        uint256 userBalanceBefore = genesisRep.balanceOf(user);
+        uint256 challengerBalanceBefore = genesisRep.balanceOf(challenger);
+
+        vm.expectEmit(true, true, true, true, address(multiverse));
+        emit Multiverse.ReporterRewardPaid(challenger, GENESIS_UID, queryId, 0.5 ether);
+        assertEq(_resolve(bystander, queryId), OUTCOME_B);
+
+        // The reward is pushed at resolve; user reported first but on the losing side and gets nothing.
+        assertEq(genesisRep.balanceOf(challenger), challengerBalanceBefore + 0.5 ether);
+        assertEq(genesisRep.balanceOf(user), userBalanceBefore);
+
+        // Losers staked 1 ether: 0.2 burned, 0.8 to the winners. challenger: 2 + 2 * 0.8 / 2 = 2.8
+        assertEq(_claim(challenger, queryId), 2.8 ether);
+        vm.expectRevert(Multiverse.NothingToClaim.selector);
+        vm.prank(user);
+        multiverse.claim(GENESIS_UID, queryId);
+    }
+
+    function test_Resolve_Ladder_LateWinningOutcomeEarnsWholeFee() public {
+        // An outcome can first be backed after the reporting window, as an appeal. If it wins, its first
+        // reporter's ramp runs past THREE_DAYS and pays the whole fee. Ladder: A 1, B 2, A 3, then C
+        // enters at 78h with twice the pot (12) and wins.
+        uint256 queryId = _createDefaultQuery();
+
+        vm.warp(START_TIME + 12 hours);
+        _report(user, queryId, OUTCOME_A); // 1 ether
+        vm.warp(START_TIME + 34 hours);
+        _report(challenger, queryId, OUTCOME_B); // 2 ether
+        vm.warp(START_TIME + 56 hours);
+        _report(user, queryId, OUTCOME_A); // 3 ether, A holds 4
+        vm.warp(START_TIME + 78 hours);
+        _report(bystander, queryId, OUTCOME_C); // 12 ether
+        _warpPastAppealWindow(queryId);
+
+        uint256 bystanderBalanceBefore = genesisRep.balanceOf(bystander);
+
+        vm.expectEmit(true, true, true, true, address(multiverse));
+        emit Multiverse.ReporterRewardPaid(bystander, GENESIS_UID, queryId, DEFAULT_FEE);
+        assertEq(_resolve(challenger, queryId), OUTCOME_C);
+        assertEq(genesisRep.balanceOf(bystander), bystanderBalanceBefore + DEFAULT_FEE);
+
+        // Losers staked 4 + 2 = 6 ether: 1.2 burned, 4.8 to the winner. bystander: 12 + 4.8 = 16.8
+        assertEq(_claim(bystander, queryId), 16.8 ether);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -639,8 +702,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
         _resolve(bystander, queryId0);
 
         // The second query is untouched: unresolved and still reportable (its 3-day window is open).
-        (, uint8 outcome1,,) = multiverse.queryResolutions(GENESIS_UID, queryId1);
-        assertEq(outcome1, multiverse.UNRESOLVED());
+        assertEq(_resolution(queryId1).outcome, multiverse.UNRESOLVED());
         assertEq(multiverse.getOutcome(GENESIS_UID, queryId1), multiverse.UNRESOLVED());
         vm.expectEmit(true, true, true, false, address(multiverse));
         emit Multiverse.QueryReported(challenger, GENESIS_UID, queryId1, OUTCOME_B, 0);

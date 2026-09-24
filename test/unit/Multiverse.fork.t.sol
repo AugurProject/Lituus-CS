@@ -9,27 +9,30 @@ import { MultiverseFixtures } from "./Multiverse.fixtures.sol";
 /// @dev Runs against MockZoltar (unique keccak child ids, per-child REP, credit-only migration
 ///      stubs). Payouts, refunds, and SupplyRestoration are later phases and not tested here.
 contract MultiverseForkTest is MultiverseFixtures {
-    uint8 internal constant OUTCOME_C = 3;
     uint8 internal constant INVALID_OUTCOME = 255;
 
-    /// @dev Escalates a query in `universeId` until the fork-level report fires, alternating
-    ///      OUTCOME_A/OUTCOME_B from `reporterA`/`reporterB`. Returns the trigger stake (the full
-    ///      fork threshold, recorded like any rung).
+    /// @dev Escalates a query in `universeId` until the fork fires (the second outcome reaches the
+    ///      per-outcome cap inside report()), alternating OUTCOME_A/OUTCOME_B from
+    ///      `reporterA`/`reporterB`. Returns the trigger stake (the stake that landed the second
+    ///      outcome on the cap, recorded in full like any other).
     function _escalateToFork(uint248 universeId, uint256 queryId, address reporterA, address reporterB)
         internal
         returns (uint256 triggerStake)
     {
         uint256 i = 0;
         while (true) {
-            (uint256 required, uint256 threshold) = multiverse.getNextRequiredStake(universeId, queryId);
+            uint8 outcome = i % 2 == 0 ? OUTCOME_A : OUTCOME_B;
+            triggerStake = multiverse.getNextRequiredStake(universeId, queryId, outcome);
             vm.prank(i % 2 == 0 ? reporterA : reporterB);
-            multiverse.report(universeId, queryId, i % 2 == 0 ? OUTCOME_A : OUTCOME_B);
-            if (required >= threshold) return required;
+            multiverse.report(universeId, queryId, outcome);
+            if (_universeState(universeId) == Multiverse.UniverseState.Migration) return triggerStake;
             i++;
         }
     }
 
     /// @dev Forks the genesis universe on a fresh default query and returns (queryId, triggerStake).
+    ///      On the fixture grid (cap = 32*fee) the ladder is 1, 2, 3, 6, 12, 24 (B at the cap),
+    ///      then the 16*fee rung on A triggers.
     function _forkGenesis() internal returns (uint256 queryId, uint256 triggerStake) {
         queryId = _createDefaultQuery();
         triggerStake = _escalateToFork(GENESIS_UID, queryId, user, challenger);
@@ -62,7 +65,7 @@ contract MultiverseForkTest is MultiverseFixtures {
 
     /* ============================================= FORK TRIGGER ============================================= */
 
-    function test_Fork_TriggersAtThresholdInsideReport() public {
+    function test_Fork_TriggersAtSecondOutcomeAtCapInsideReport() public {
         (uint256 queryId, uint256 triggerStake) = _forkGenesis();
 
         // The forking universe enters Migration with its split moment recorded in forkTime.
@@ -72,10 +75,10 @@ contract MultiverseForkTest is MultiverseFixtures {
             uint48 forkTime,,,
             uint248 favoriteChild,
             bool isLituusFork,,,
-            uint256 forkQuery,
-            uint256 totalMigratedOut,
-            uint256 totalQueryFees,
-            uint256 unmigratedSupply
+            uint128 forkQuery,
+            uint128 totalMigratedOut,
+            uint128 totalQueryFees,
+            uint128 unmigratedSupply
         ) = multiverse.universes(GENESIS_UID);
         assertEq(uint8(universeState), uint8(Multiverse.UniverseState.Migration));
         assertEq(forkTime, uint48(vm.getBlockTimestamp()));
@@ -85,10 +88,16 @@ contract MultiverseForkTest is MultiverseFixtures {
         // The electorate is a live outflow counter, not a trigger snapshot (post-fork wrappers can
         // still enter and migrate): zero until migration begins.
         assertEq(totalMigratedOut, 0);
-        // The trigger stake is recorded at its FULL amount, like any other rung.
-        Multiverse.Stake[] memory stakes = multiverse.getStakes(GENESIS_UID, queryId);
-        assertEq(stakes[stakes.length - 1].amount, triggerStake);
-        assertEq(triggerStake, genesisRep.convertToShares(zoltar.getForkThreshold(GENESIS_UID)));
+        // The fork fired on the SECOND outcome reaching the per-outcome cap; the trigger stake is
+        // recorded at its full amount, like any other rung. On the fixture grid the pre-trigger
+        // A total is cap/2, so the trigger rung is exactly cap/2.
+        ResolutionView memory r = _resolution(queryId);
+        assertEq(r.noOfOutcomesAtCap, 2);
+        assertEq(r.cap, _capWrep());
+        assertEq(multiverse.getOutcomeStakes(GENESIS_UID, queryId, OUTCOME_A).totalOutcomeStaked, r.cap);
+        assertEq(multiverse.getOutcomeStakes(GENESIS_UID, queryId, OUTCOME_B).totalOutcomeStaked, r.cap);
+        assertEq(r.totalStaked, 2 * r.cap);
+        assertEq(triggerStake, r.cap / 2);
         // The forked vault is unwrap-paused PERMANENTLY: wrapped capital exits only through the
         // counted Lituus migration/claim lanes. Zoltar-side fork started in the same tx.
         assertTrue(genesisRep.unwrapPaused());
@@ -99,12 +108,8 @@ contract MultiverseForkTest is MultiverseFixtures {
         // The whole pot parked: the contract's entire wREP holding (the forking query's fee + all
         // its stakes; rate is 1 here so assets == shares) moved into the Zoltar migration balance
         // and is recorded as unmigratedSupply. Parent-side value is no longer withdrawable.
-        uint256 totalStakes;
-        for (uint256 i = 0; i < stakes.length; i++) {
-            totalStakes += stakes[i].amount;
-        }
         assertEq(genesisRep.balanceOf(address(multiverse)), 0);
-        assertEq(unmigratedSupply, totalStakes + DEFAULT_FEE);
+        assertEq(unmigratedSupply, r.totalStaked + DEFAULT_FEE);
         assertEq(zoltar.getMigrationRepBalance(address(multiverse), GENESIS_UID), unmigratedSupply);
         // The forking query's own fee is excluded from the fee aggregate (no payoff path ever
         // consumes it in a child — its resolution is pre-written at spawn); it stays parked.
@@ -112,25 +117,15 @@ contract MultiverseForkTest is MultiverseFixtures {
     }
 
     function test_Fork_RevertsWhenZoltarUniverseAlreadyForking() public {
-        // The Zoltar counterpart forked natively (fork-once per universe in Zoltar) but the fork was
-        // not mirrored yet. A Lituus fork-level report must revert cleanly instead of hitting
-        // Zoltar's own revert.
-        uint256 queryId = _createDefaultQuery();
+        // The Zoltar counterpart forked natively (fork-once per universe in Zoltar) but the fork
+        // was not mirrored yet. The Lituus fork-trigger report — the one that would land the
+        // second outcome on the cap — must revert cleanly instead of hitting Zoltar's own revert.
+        (uint256 queryId,) = _createLadderToCap();
         zoltar.forkUniverse(GENESIS_UID, 424_242);
 
-        uint256 i = 0;
-        while (true) {
-            (uint256 required, uint256 threshold) = multiverse.getNextRequiredStake(GENESIS_UID, queryId);
-            vm.prank(i % 2 == 0 ? user : challenger);
-            if (required >= threshold) {
-                break;
-            }
-            multiverse.report(GENESIS_UID, queryId, i % 2 == 0 ? OUTCOME_A : OUTCOME_B);
-            i++;
-        }
-
+        vm.prank(user);
         vm.expectRevert(Multiverse.ZoltarUniverseAlreadyForking.selector);
-        multiverse.report(GENESIS_UID, queryId, i % 2 == 0 ? OUTCOME_A : OUTCOME_B);
+        multiverse.report(GENESIS_UID, queryId, OUTCOME_A);
     }
 
     function test_Fork_ParentIsLookupOnlyDuringMigration() public {
@@ -169,8 +164,8 @@ contract MultiverseForkTest is MultiverseFixtures {
             uint48 forkTime,
             bool isCanonical,
             uint248 parent,,,,,
-            uint256 forkQuery,,
-            uint256 childQueryFees,
+            uint128 forkQuery,,
+            uint128 childQueryFees,
         ) = multiverse.universes(child1);
         // Children spawn Active: fully functional immediately, no activation step.
         assertEq(uint8(universeState), uint8(Multiverse.UniverseState.Active));
@@ -201,7 +196,7 @@ contract MultiverseForkTest is MultiverseFixtures {
     /* ============================================ POT MIGRATION ============================================ */
 
     /// @dev A helper for the query-fee read (field 12 of the Universe struct).
-    function _totalQueryFees(uint248 universeId) internal view returns (uint256 fees) {
+    function _totalQueryFees(uint248 universeId) internal view returns (uint128 fees) {
         (,,,,,,,,,,, fees,) = multiverse.universes(universeId);
     }
 
@@ -220,7 +215,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         assertEq(_totalQueryFees(child1), DEFAULT_FEE);
         assertEq(_totalQueryFees(child2), DEFAULT_FEE);
         assertEq(multiverse.repTokenOf(child1).totalAssets(), DEFAULT_FEE);
-        (,,,,,,, uint128 totalIn,,, uint256 totalOut,,) = multiverse.universes(GENESIS_UID);
+        (,,,,,,, uint128 totalIn,,, uint128 totalOut,,) = multiverse.universes(GENESIS_UID);
         assertEq(totalIn, 0);
         assertEq(totalOut, 0);
 
@@ -253,14 +248,12 @@ contract MultiverseForkTest is MultiverseFixtures {
         // into a child is still TODO).
         vm.prank(challenger);
         vm.expectRevert(Multiverse.InvalidUniverseState.selector);
-        multiverse.claim(GENESIS_UID, resolvedQueryId, 1);
+        multiverse.claim(GENESIS_UID, resolvedQueryId);
         uint256[] memory queryIds = new uint256[](1);
         queryIds[0] = resolvedQueryId;
-        uint256[] memory stakeIndices = new uint256[](1);
-        stakeIndices[0] = 1;
         vm.prank(challenger);
         vm.expectRevert(Multiverse.InvalidUniverseState.selector);
-        multiverse.claimMultiple(GENESIS_UID, queryIds, stakeIndices);
+        multiverse.claimMultiple(GENESIS_UID, queryIds);
     }
 
     function test_PotMigration_FeePotCarriesThroughNestedForks() public {
@@ -367,7 +360,7 @@ contract MultiverseForkTest is MultiverseFixtures {
 
         // The parent's outflow counter accumulates every migration: the live electorate measure
         // (the 2/3 denominator and the SR max supply, read at the end of migration).
-        (,,,,,,,,,, uint256 totalMigratedOut,,) = multiverse.universes(GENESIS_UID);
+        (,,,,,,,,,, uint128 totalMigratedOut,,) = multiverse.universes(GENESIS_UID);
         assertEq(totalMigratedOut, 301 ether);
     }
 
@@ -439,8 +432,9 @@ contract MultiverseForkTest is MultiverseFixtures {
     ///      fork -> migration voting -> root-first resolution -> canonical outcome lookup
     ///      through the heir.
     function test_EndToEnd_MinimalForkFlow() public {
-        // Fork the genesis on a 3-outcome query (the fork fires inside the threshold report); two
-        // of four possible children spawn lazily and the votes make child2 lead 400 to 320.
+        // Fork the genesis on a 3-outcome query (the fork fires inside the report that lands the
+        // second outcome on the cap); two of four possible children spawn lazily and the votes
+        // make child2 lead 400 to 320.
         (uint256 forkQueryId, uint248 child1, uint248 child2) = _forkGenesisWithTwoChildren();
         assertEq(uint8(_universeState(GENESIS_UID)), uint8(Multiverse.UniverseState.Migration));
 
