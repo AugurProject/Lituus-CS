@@ -20,15 +20,16 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     using SafeERC20 for ILituusRep;
 
     /* ========================================== CONSTANTS/IMMUTABLES =========================================== */
-    // Query outcomes:
+    // Query outcomes live in one uint256 domain, shared with Zoltar's answer space:
     // 0 - UNRESOLVED
-    // 1..numberOfOutcomes - valid outcomes (a query has 2..254 of them; 1 is YES and 2 is NO for a binary query)
-    // 255 - INVALID
+    // 1..numberOfOutcomes - valid categorical outcomes (a query has 2..254 of them)
+    // type(uint256).max - INVALID
     uint8 public constant MAX_OUTCOMES = 254; // number of outcomes for a query (not including UNRESOLVED and INVALID)
     uint8 public constant MIN_OUTCOMES = 2; // minimum number of valid outcomes for a query
-    uint8 public constant UNRESOLVED = 0; // the query is not resolved yet
-    uint8 public constant INVALID = 255; // an invalid outcome value used for reporting an invalid fork outcome during
-    // fork resolution. It is outside the valid outcome range [1, MAX_OUTCOMES]
+    uint256 public constant UNRESOLVED = 0; // the query is not resolved yet
+    // The invalid outcome: reportable on any query, and the outcome of an expired one.
+    // TODO: map to Zoltar's INVALID
+    uint256 public constant INVALID = type(uint256).max;
     // TODO: determine the max query length based on gas costs
     uint16 public constant MAX_QUERY_LENGTH = 2058; // maximum length of a query string
 
@@ -110,34 +111,36 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         uint48 firstReportTime;
     }
 
-    /// @dev Escalation state of a query in one universe. The first six fields share a storage slot and are
-    ///      all touched by every report; `cap` and `noOfOutcomesAtCap` share the next slot and are written at
-    ///      the first report and when an outcome reaches the cap only. wREP amounts are bounded by the REP
-    ///      max supply (100M * 1e18), comfortably within uint96.
+    /// @dev Escalation state of a query in one universe. The first five fields share a storage slot: every
+    ///      report touches it (`noOfOutcomesAtCap` only when an outcome reaches the cap). `cap` takes the next
+    ///      slot and is written at the first report only. Outcomes are full words — categorical outcomes and
+    ///      Zoltar's packed scalar answers share one uint256 domain — so `outcome` and `lastReportedOutcome`
+    ///      take a slot each; a report writes `lastReportedOutcome` and the shared slot. wREP amounts are
+    ///      bounded by the REP max supply (100M * 1e18), comfortably within uint96.
     struct QueryResolution {
         // The time the query first became reportable in this universe.
         // Set on createQuery in the origin universe and lazily on the first report() in heir universes
         // (to the parent's forkTime — the fork moment that created the universe).
         uint48 queryCreateTime;
-        // The resolved outcome. 0 means UNRESOLVED.
-        uint8 outcome;
         // When the latest stake was placed. Each stake reopens the appeal window from this time.
         uint48 lastStakeTime;
-        // The outcome of the latest stake. Wins the query if the appeal window lapses unchallenged.
-        uint8 lastReportedOutcome;
         // Number of stakes placed so far.
         uint16 stakeCount;
         // Total wREP staked across all outcomes.
         uint96 totalStaked;
+        // Number of outcomes whose total has reached `cap`. The second one triggers the fork.
+        uint8 noOfOutcomesAtCap;
         // Per-outcome stake ceiling: 1% of the universe's REP supply, converted to wREP shares and frozen at
         // the first report so the whole ladder is measured against one grid.
         uint96 cap;
-        // Number of outcomes whose total has reached `cap`. The second one triggers the fork.
-        uint8 noOfOutcomesAtCap;
+        // The resolved outcome. 0 means UNRESOLVED.
+        uint256 outcome;
+        // The outcome of the latest stake. Wins the query if the appeal window lapses unchallenged.
+        uint256 lastReportedOutcome;
         // Stake totals and first reporter per outcome.
-        mapping(uint8 outcome => OutcomeStakes) outcomes;
+        mapping(uint256 outcome => OutcomeStakes) outcomes;
         // Each staker's total per outcome; zeroed when claimed or settled.
-        mapping(address staker => mapping(uint8 outcome => uint96)) userStakes;
+        mapping(address staker => mapping(uint256 outcome => uint96)) userStakes;
     }
 
     struct Universe {
@@ -225,10 +228,10 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         address indexed reporter,
         uint248 indexed universeId,
         uint256 indexed queryId,
-        uint8 outcome,
+        uint256 outcome,
         uint256 stakeAmount
     );
-    event QueryResolved(address indexed resolver, uint248 indexed universeId, uint256 indexed queryId, uint8 outcome);
+    event QueryResolved(address indexed resolver, uint248 indexed universeId, uint256 indexed queryId, uint256 outcome);
     event StakeClaimed(address indexed reporter, uint248 indexed universeId, uint256 indexed queryId, uint256 payout);
     // The first correct reporter's share of the query fee, paid when the escalation game resolves.
     event ReporterRewardPaid(
@@ -594,7 +597,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * @param queryId The query being reported on.
      * @param outcome The reported outcome (1..numberOfOutcomes, or INVALID).
      */
-    function report(uint248 universeId, uint256 queryId, uint8 outcome) external nonReentrant {
+    function report(uint248 universeId, uint256 queryId, uint256 outcome) external nonReentrant {
         // Check all conditions (universe exists, query exists, outcome is valid, report is within time, etc.)
         // Reports can only be placed in an existing and active universe.
         Universe storage universe = _checkUniverseState(universeId);
@@ -700,7 +703,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         uint48 queryCreateTime = resolution.queryCreateTime;
         // Stays Fresh for a record that already exists here: the live window rules below apply as-is.
         InheritedQueryKind kind = InheritedQueryKind.Fresh;
-        uint8 frozenOutcome;
+        uint256 frozenOutcome;
         uint248 recordUniverseId;
         if (queryCreateTime == 0) {
             // First touch of an inherited query here: classify it against the lineage's frozen history
@@ -769,7 +772,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         } else if (resolution.stakeCount > 0) {
             if (resolution.lastStakeTime + ONE_DAY < block.timestamp) {
                 // If there are stakes and the appeal period has passed then resolve the query with the last outcome
-                uint8 outcome = _calculateOutcomeAndEscalationPayoffs(universeId, queryId);
+                uint256 outcome = _calculateOutcomeAndEscalationPayoffs(universeId, queryId);
                 resolution.outcome = outcome;
                 emit QueryResolved(msg.sender, universeId, queryId, outcome);
             } else {
@@ -848,7 +851,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      */
     function _claim(uint248 universeId, uint256 queryId) internal returns (uint256 payout) {
         QueryResolution storage resolution = queryResolutions[universeId][queryId];
-        uint8 outcome = resolution.outcome;
+        uint256 outcome = resolution.outcome;
         if (outcome == UNRESOLVED) revert QueryNotResolved();
 
         uint256 amount = resolution.userStakes[msg.sender][outcome];
@@ -1197,9 +1200,9 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * @param queryId The id of the query being resolved.
      * @return winnerOutcome The winning outcome of the resolved query.
      */
-    function _calculateOutcomeAndEscalationPayoffs(uint248 universeId, uint256 queryId) internal returns (uint8) {
+    function _calculateOutcomeAndEscalationPayoffs(uint248 universeId, uint256 queryId) internal returns (uint256) {
         QueryResolution storage resolution = queryResolutions[universeId][queryId];
-        uint8 winnerOutcome = resolution.lastReportedOutcome;
+        uint256 winnerOutcome = resolution.lastReportedOutcome;
         OutcomeStakes storage winnerStakes = resolution.outcomes[winnerOutcome];
         uint256 totalStaked = resolution.totalStaked;
         uint256 winnerOutcomeStaked = winnerStakes.totalOutcomeStaked;
@@ -1298,7 +1301,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * @param queryId The query to read.
      * @return The resolved outcome, or UNRESOLVED if none applies to this universe.
      */
-    function getOutcome(uint248 universeId, uint256 queryId) external view returns (uint8) {
+    function getOutcome(uint248 universeId, uint256 queryId) external view returns (uint256) {
         if (universes[universeId].universeState == UniverseState.NotExisting) revert InvalidUniverse();
         // The walk checks this universe itself first, then inherits from an ancestor or a
         // favorite-child descendant, if any.
@@ -1316,7 +1319,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * @param outcome The outcome whose side to read.
      * @return The outcome's stake total, first reporter and first report time.
      */
-    function getOutcomeStakes(uint248 universeId, uint256 queryId, uint8 outcome)
+    function getOutcomeStakes(uint248 universeId, uint256 queryId, uint256 outcome)
         external
         view
         returns (OutcomeStakes memory)
@@ -1335,7 +1338,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * @param outcome The outcome the stake was placed on.
      * @return The staker's stake on the outcome.
      */
-    function getUserStake(uint248 universeId, uint256 queryId, address staker, uint8 outcome)
+    function getUserStake(uint248 universeId, uint256 queryId, address staker, uint256 outcome)
         external
         view
         returns (uint96)
@@ -1355,7 +1358,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * @param outcome The outcome the next report would stake on.
      * @return requiredStake The stake the next reporter must post.
      */
-    function getNextRequiredStake(uint248 universeId, uint256 queryId, uint8 outcome)
+    function getNextRequiredStake(uint248 universeId, uint256 queryId, uint256 outcome)
         external
         view
         returns (uint256 requiredStake)
@@ -1402,9 +1405,9 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      *      A query is resolved at most once along any single lineage, so the first match is enough.
      *      Returns UNRESOLVED if no universe on the lineage has resolved the query.
      */
-    function _findResolution(uint248 universeId, uint256 queryId) internal view returns (uint8 resolvedOutcome) {
+    function _findResolution(uint248 universeId, uint256 queryId) internal view returns (uint256 resolvedOutcome) {
         // Check the universe itself first.
-        uint8 outcome = queryResolutions[universeId][queryId].outcome;
+        uint256 outcome = queryResolutions[universeId][queryId].outcome;
         if (outcome != UNRESOLVED) {
             return outcome;
         }
@@ -1486,7 +1489,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     ///      Later stakes: the amount that brings the outcome to exactly twice the total of every other outcome,
     ///      bounded by the cap. An outcome that already holds that share cannot be staked on: it is the
     ///      outcome the last report backed.
-    function _requiredStake(QueryResolution storage resolution, uint256 fee, uint8 outcome)
+    function _requiredStake(QueryResolution storage resolution, uint256 fee, uint256 outcome)
         internal
         view
         returns (uint256 stake)
@@ -1608,7 +1611,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * @param universeId The forking universe (must be in Migration).
      * @param outcome The forking query's outcome this child stands for.
      */
-    function spawnChildUniverse(uint248 universeId, uint8 outcome) external nonReentrant {
+    function spawnChildUniverse(uint248 universeId, uint256 outcome) external nonReentrant {
         Universe storage universe = universes[universeId];
         if (universe.universeState != UniverseState.Migration) revert InvalidUniverseState();
         // The spawn window is the migration window, self-enforced by clock.
@@ -1635,7 +1638,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * index the child is keyed by (identity mapping).
      * TODO: have same outcome IDs for Zoltar and Lituus
      */
-    function _spawnChildUniverse(uint248 universeId, uint256 queryId, uint8 outcome) internal {
+    function _spawnChildUniverse(uint248 universeId, uint256 queryId, uint256 outcome) internal {
         uint248 childUniverseId = ZOLTAR.getChildUniverseId(universeId, outcome);
         if (childUniverseId == 0) revert InvalidUniverse();
         // Never overwrite an existing universe.
@@ -1720,7 +1723,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * @param outcome The forking query's outcome whose child to migrate into.
      * @param shares The amount of the caller's parent wREP shares to migrate.
      */
-    function migrate(uint248 universeId, uint8 outcome, uint256 shares) external nonReentrant {
+    function migrate(uint248 universeId, uint256 outcome, uint256 shares) external nonReentrant {
         Universe storage universe = universes[universeId];
         if (universe.universeState != UniverseState.Migration) revert InvalidUniverseState();
 
@@ -1907,7 +1910,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     function _classifyInheritedQuery(uint248 universeId, uint256 queryId)
         internal
         view
-        returns (InheritedQueryKind kind, uint48 anchorCreateTime, uint8 frozenOutcome, uint248 recordUniverseId)
+        returns (InheritedQueryKind kind, uint48 anchorCreateTime, uint256 frozenOutcome, uint248 recordUniverseId)
     {
         // The genesis inherits from nowhere.
         if (universeId == GENESIS_UNIVERSE_ID) revert QueryNotInherited();

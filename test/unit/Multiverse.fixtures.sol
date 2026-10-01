@@ -26,9 +26,9 @@ abstract contract MultiverseDeployFixture is Test {
     uint128 internal constant USER_REP_BALANCE = 1000 ether;
     uint8 internal constant DEFAULT_NUMBER_OF_OUTCOMES = 3;
     // Readable outcomes for escalation ping-pong (all valid for the default query).
-    uint8 internal constant OUTCOME_A = 1;
-    uint8 internal constant OUTCOME_B = 2;
-    uint8 internal constant OUTCOME_C = 3;
+    uint256 internal constant OUTCOME_A = 1;
+    uint256 internal constant OUTCOME_B = 2;
+    uint256 internal constant OUTCOME_C = 3;
     string internal constant DEFAULT_QUESTION = "John Doe's pet?[CAT,DOG,SHARK]";
     // Fixed timestamp so queryCreateTime / forkTime assertions are deterministic.
     uint256 internal constant START_TIME = 1_000_000;
@@ -69,25 +69,25 @@ abstract contract MultiverseDeployFixture is Test {
     ///      per-outcome and per-staker mappings are read through getOutcomeStakes / getUserStake.
     struct ResolutionView {
         uint48 queryCreateTime;
-        uint8 outcome;
         uint48 lastStakeTime;
-        uint8 lastReportedOutcome;
         uint16 stakeCount;
         uint96 totalStaked;
-        uint96 cap;
         uint8 noOfOutcomesAtCap;
+        uint96 cap;
+        uint256 outcome;
+        uint256 lastReportedOutcome;
     }
 
     function _resolution(uint256 queryId) internal view returns (ResolutionView memory r) {
         (
             r.queryCreateTime,
-            r.outcome,
             r.lastStakeTime,
-            r.lastReportedOutcome,
             r.stakeCount,
             r.totalStaked,
+            r.noOfOutcomesAtCap,
             r.cap,
-            r.noOfOutcomesAtCap
+            r.outcome,
+            r.lastReportedOutcome
         ) = multiverse.queryResolutions(GENESIS_UID, queryId);
     }
 
@@ -195,7 +195,7 @@ abstract contract MultiverseFixtures is MultiverseDeployFixture {
     ///      the required stake, the head fields move to this report, a first stake on the outcome records
     ///      its reporter) and the REP movement (reporter pays exactly the required stake, the multiverse
     ///      receives it).
-    function _report(address reporter, uint256 queryId, uint8 outcome) internal {
+    function _report(address reporter, uint256 queryId, uint256 outcome) internal {
         uint256 requiredStake = multiverse.getNextRequiredStake(GENESIS_UID, queryId, outcome);
         uint256 reporterBalanceBefore = genesisRep.balanceOf(reporter);
         uint256 multiverseBalanceBefore = genesisRep.balanceOf(address(multiverse));
@@ -224,7 +224,7 @@ abstract contract MultiverseFixtures is MultiverseDeployFixture {
 
     /// @dev Reported query fixture: `user` creates a default query and places the first report on it.
     /// @return queryId The id of the created and reported query.
-    function _createReportedQuery(uint8 outcome) internal returns (uint256 queryId) {
+    function _createReportedQuery(uint256 outcome) internal returns (uint256 queryId) {
         queryId = _createDefaultQuery();
         _report(user, queryId, outcome);
     }
@@ -252,7 +252,7 @@ abstract contract MultiverseFixtures is MultiverseDeployFixture {
     /// @dev Resolvable reported query fixture: `user` creates a default query, places the first
     ///      report on it, and time passes the appeal window, so it is resolvable to `outcome`.
     /// @return queryId The id of the created, reported, and resolvable query.
-    function _createResolvableReportedQuery(uint8 outcome) internal returns (uint256 queryId) {
+    function _createResolvableReportedQuery(uint256 outcome) internal returns (uint256 queryId) {
         queryId = _createReportedQuery(outcome);
         _warpPastAppealWindow(queryId);
     }
@@ -260,7 +260,7 @@ abstract contract MultiverseFixtures is MultiverseDeployFixture {
     /// @dev Resolve fixture: `resolver` resolves `queryId` in the genesis universe, asserting the
     ///      resolution record left UNRESOLVED and that getOutcome agrees with it.
     /// @return outcome The outcome the query resolved to.
-    function _resolve(address resolver, uint256 queryId) internal returns (uint8 outcome) {
+    function _resolve(address resolver, uint256 queryId) internal returns (uint256 outcome) {
         vm.prank(resolver);
         multiverse.resolve(GENESIS_UID, queryId);
 
@@ -271,7 +271,7 @@ abstract contract MultiverseFixtures is MultiverseDeployFixture {
 
     /// @dev Escalation ladder fixture: each reporter in turn reports their outcome on `queryId`,
     ///      12 hours after the previous step — within the first-report window and every appeal window.
-    function _escalateChain(uint256 queryId, address[] memory reporters, uint8[] memory outcomes) internal {
+    function _escalateChain(uint256 queryId, address[] memory reporters, uint256[] memory outcomes) internal {
         assertEq(reporters.length, outcomes.length, "escalateChain: length mismatch");
         for (uint256 i = 0; i < reporters.length; i++) {
             vm.warp(vm.getBlockTimestamp() + 12 hours);

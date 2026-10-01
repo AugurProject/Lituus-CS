@@ -59,15 +59,15 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
     mapping(uint256 queryId => uint256) public ghostQueryFee;
     mapping(uint256 queryId => uint256) public ghostStakeCount;
     mapping(uint256 queryId => uint256) public ghostQueryStaked;
-    mapping(uint256 queryId => uint8) public ghostLastOutcome;
+    mapping(uint256 queryId => uint256) public ghostLastOutcome;
     // Per-stake records, written at report time (storage amounts zero on settlement, so the
     // original amount, owner, and outcome must survive here).
     mapping(uint256 queryId => mapping(uint256 stakeIndex => uint256)) public ghostStakeAmount;
     mapping(uint256 queryId => mapping(uint256 stakeIndex => address)) public ghostStakeReporter;
-    mapping(uint256 queryId => mapping(uint256 stakeIndex => uint8)) public ghostStakeOutcome;
+    mapping(uint256 queryId => mapping(uint256 stakeIndex => uint256)) public ghostStakeOutcome;
     mapping(uint256 queryId => mapping(uint256 stakeIndex => uint256)) public ghostStakeTime;
     mapping(uint256 queryId => bool) public ghostResolved;
-    mapping(uint256 queryId => uint8) public ghostResolvedOutcome;
+    mapping(uint256 queryId => uint256) public ghostResolvedOutcome;
     mapping(uint256 queryId => mapping(uint256 stakeIndex => bool)) public ghostClaimed;
     mapping(address actor => uint256) public ghostActorStaked;
     mapping(address actor => uint256) public ghostActorReceived;
@@ -113,7 +113,7 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
 
     /// @dev The time of the latest stake on a query, read off the resolution record.
     function _lastStakeTime(uint256 queryId) internal view returns (uint256 lastStakeTime) {
-        (,, lastStakeTime,,,,,) = MULTIVERSE.queryResolutions(GENESIS_UID, queryId);
+        (, lastStakeTime,,,,,,) = MULTIVERSE.queryResolutions(GENESIS_UID, queryId);
     }
 
     /// @notice Report on an existing query as a random actor, with a valid outcome that differs
@@ -138,10 +138,10 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
         // least 3 members, so one shift always suffices).
         (uint8 numberOfOutcomes,,,) = MULTIVERSE.queries(queryId);
         uint256 pick = bound(outcomeSeed, 1, uint256(numberOfOutcomes) + 1);
-        uint8 outcome = pick == uint256(numberOfOutcomes) + 1 ? MULTIVERSE.INVALID() : uint8(pick);
+        uint256 outcome = pick == uint256(numberOfOutcomes) + 1 ? MULTIVERSE.INVALID() : pick;
         if (stakeCount != 0 && outcome == ghostLastOutcome[queryId]) {
             pick = pick % (uint256(numberOfOutcomes) + 1) + 1;
-            outcome = pick == uint256(numberOfOutcomes) + 1 ? MULTIVERSE.INVALID() : uint8(pick);
+            outcome = pick == uint256(numberOfOutcomes) + 1 ? MULTIVERSE.INVALID() : pick;
         }
 
         // The stake the contract requires for this outcome; an outcome that cannot be staked on
@@ -196,7 +196,7 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
             if (ghostNow <= _lastStakeTime(queryId) + MULTIVERSE.ONE_DAY()) return;
         }
 
-        uint8 winnerOutcome = stakeCount == 0 ? MULTIVERSE.INVALID() : ghostLastOutcome[queryId];
+        uint256 winnerOutcome = stakeCount == 0 ? MULTIVERSE.INVALID() : ghostLastOutcome[queryId];
         // The expected reward recipient: the protocol pays the fee reward to whoever FIRST
         // reported the eventually-winning outcome; an unreported query pays the resolver instead.
         address resolver = actors[bound(actorSeed, 0, actors.length - 1)];
@@ -285,7 +285,7 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
 
         // Scan the per-stake ghosts for a winning, unclaimed stake, starting from a random
         // offset for coverage; its reporter claims, settling all their stakes on the outcome.
-        uint8 winnerOutcome = ghostResolvedOutcome[queryId];
+        uint256 winnerOutcome = ghostResolvedOutcome[queryId];
         uint256 offset = bound(stakeSeed, 0, stakeCount - 1);
         for (uint256 i = 0; i < stakeCount; ++i) {
             uint256 stakeIndex = (offset + i) % stakeCount;

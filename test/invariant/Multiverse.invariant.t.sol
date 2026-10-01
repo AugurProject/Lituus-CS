@@ -105,7 +105,7 @@ contract MultiverseInvariantTest is MultiverseDeployFixture {
 
                 // The staker's live balance on this outcome: the sum of their unsettled ghost stakes on it.
                 address owner = handler.ghostStakeReporter(i, j);
-                uint8 outcome = handler.ghostStakeOutcome(i, j);
+                uint256 outcome = handler.ghostStakeOutcome(i, j);
                 uint256 expectedUserStake;
                 for (uint256 k = 0; k < stakeCount; ++k) {
                     if (handler.ghostStakeReporter(i, k) != owner || handler.ghostStakeOutcome(i, k) != outcome) {
@@ -119,7 +119,7 @@ contract MultiverseInvariantTest is MultiverseDeployFixture {
 
             // Per-outcome totals: the sum of the ghost stakes placed on each outcome.
             for (uint256 j = 0; j < stakeCount; ++j) {
-                uint8 outcome = handler.ghostStakeOutcome(i, j);
+                uint256 outcome = handler.ghostStakeOutcome(i, j);
                 uint256 expectedOutcomeStaked;
                 for (uint256 k = 0; k < stakeCount; ++k) {
                     if (handler.ghostStakeOutcome(i, k) == outcome) {
@@ -196,7 +196,7 @@ contract MultiverseInvariantTest is MultiverseDeployFixture {
             ResolutionView memory r = _resolution(i);
             assertEq(r.stakeCount, stakeCount);
             for (uint256 j = 0; j < stakeCount; ++j) {
-                uint8 outcome = handler.ghostStakeOutcome(i, j);
+                uint256 outcome = handler.ghostStakeOutcome(i, j);
                 assertTrue((outcome >= 1 && outcome <= numberOfOutcomes) || outcome == multiverse.INVALID());
                 if (j > 0) assertTrue(outcome != handler.ghostStakeOutcome(i, j - 1));
 

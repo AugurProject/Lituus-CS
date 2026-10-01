@@ -83,14 +83,14 @@ contract MultiverseClaimTest is MultiverseFixtures {
     }
 
     function test_Claim_InvalidOutcomeStakeIsClaimable() public {
-        // INVALID (255) is a stakeable outcome like any other: when it wins the escalation, its
+        // INVALID (max-uint) is a stakeable outcome like any other: when it wins the escalation, its
         // stakes settle through claim() with the same formula.
         uint256 queryId = _createDefaultQuery();
 
         address[] memory reporters = new address[](2);
         reporters[0] = user;
         reporters[1] = challenger;
-        uint8[] memory outcomes = new uint8[](2);
+        uint256[] memory outcomes = new uint256[](2);
         outcomes[0] = OUTCOME_A;
         outcomes[1] = multiverse.INVALID();
         _escalateChain(queryId, reporters, outcomes);

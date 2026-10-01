@@ -119,7 +119,7 @@ abstract contract QueryTokenizerFixtures is MultiverseFixtures {
 
         ResolutionView memory r = _resolution(queryId);
         uint48 queryCreateTime = r.queryCreateTime;
-        uint8 outcome = r.outcome;
+        uint256 outcome = r.outcome;
         assertEq(queryCreateTime, uint48(vm.getBlockTimestamp()));
         assertEq(outcome, multiverse.UNRESOLVED());
     }

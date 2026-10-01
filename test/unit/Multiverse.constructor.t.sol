@@ -87,7 +87,7 @@ contract MultiverseConstructorTest is MultiverseFixtures {
         assertEq(multiverse.MAX_OUTCOMES(), 254);
         assertEq(multiverse.MIN_OUTCOMES(), 2);
         assertEq(multiverse.UNRESOLVED(), 0);
-        assertEq(multiverse.INVALID(), 255);
+        assertEq(multiverse.INVALID(), type(uint256).max);
         assertEq(multiverse.THREE_DAYS(), 3 days);
         assertEq(multiverse.ONE_DAY(), 1 days);
         assertEq(multiverse.BURN_DIVIDER(), 5);
