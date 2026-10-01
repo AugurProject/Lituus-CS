@@ -30,46 +30,49 @@ contract MultiverseConstructorTest is MultiverseFixtures {
         Multiverse newMultiverse = new Multiverse(zoltar, GENESIS_UID, feeCtl, queryTokenizerStub);
 
         assertEq(address(newMultiverse.ZOLTAR()), address(zoltar));
+        assertEq(newMultiverse.GENESIS_UNIVERSE_ID(), GENESIS_UID);
         assertEq(address(newMultiverse.QUERY_FEE_CONTROLLER()), address(feeCtl));
         assertEq(newMultiverse.GENESIS_TIMESTAMP(), deployTime);
         assertEq(address(newMultiverse.QUERY_TOKENIZER()), address(queryTokenizerStub));
     }
 
     function test_Constructor_InitializesGenesisUniverse() public {
-        // supplyBeforeFork is captured at deploy time from the theoretical supply. Deploy a
-        // new instance so the captured value equals the current live reading.
-        uint256 expectedSupply = zoltar.getUniverseTheoreticalSupply(GENESIS_UID);
         Multiverse newMultiverse = new Multiverse(zoltar, GENESIS_UID, feeCtl, queryTokenizerStub);
 
         (
             ILituusRep repToken,
             Multiverse.UniverseState universeState,
             uint48 forkTime,
-            uint16 forkDepth,
             bool isCanonical,
             uint248 parent,
             uint248 favoriteChild,
-            uint248 heir,
-            bytes32 history,
+            bool isLituusFork,
+            uint128 totalMigratedIn,
+            uint128 maxMigratedOut,
             uint256 forkQuery,
-            uint256 supplyBeforeFork,
-            uint8 forkOutcome,
-            bool isLituusFork
+            uint256 totalMigratedOut,
+            uint256 totalQueryFees,
+            uint256 unmigratedSupply
         ) = newMultiverse.universes(GENESIS_UID);
 
         assertTrue(address(repToken) != address(0));
         assertEq(uint8(universeState), uint8(Multiverse.UniverseState.Active));
-        assertEq(forkTime, uint48(block.timestamp));
-        assertEq(forkDepth, 0);
+        // forkTime = the moment the universe's own fork split it; 0 until the genesis forks.
+        assertEq(forkTime, 0);
         assertTrue(isCanonical);
         assertEq(parent, 0);
         assertEq(favoriteChild, 0);
-        assertEq(heir, 0);
-        assertEq(history, bytes32(0));
-        assertEq(forkQuery, 0);
-        assertEq(supplyBeforeFork, expectedSupply);
-        assertEq(forkOutcome, 0);
         assertFalse(isLituusFork);
+        assertEq(totalMigratedIn, 0);
+        assertEq(maxMigratedOut, 0);
+        assertEq(forkQuery, 0);
+        // totalMigratedOut stays 0 until the universe forks and migration begins.
+        assertEq(totalMigratedOut, 0);
+        // No queries yet, no parked pot.
+        assertEq(totalQueryFees, 0);
+        assertEq(unmigratedSupply, 0);
+        // The canonical timeline starts at the genesis.
+        assertEq(newMultiverse.canonicalHeir(), GENESIS_UID);
     }
 
     function test_Constructor_DeploysRepToken() public view {
@@ -83,7 +86,6 @@ contract MultiverseConstructorTest is MultiverseFixtures {
     function test_Constructor_Constants() public view {
         assertEq(multiverse.MAX_OUTCOMES(), 254);
         assertEq(multiverse.MIN_OUTCOMES(), 2);
-        assertEq(multiverse.MAX_FORK_OUTCOMES(), 2);
         assertEq(multiverse.UNRESOLVED(), 0);
         assertEq(multiverse.INVALID(), 255);
         assertEq(multiverse.THREE_DAYS(), 3 days);

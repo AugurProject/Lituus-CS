@@ -22,8 +22,8 @@ abstract contract MultiverseDeployFixture is Test {
     // Nonzero on purpose: Lituus universe ids mirror Zoltar universe ids, and a nonzero genesis
     // catches any code path that wrongly assumes the genesis universe lives at id 0.
     uint248 internal constant GENESIS_UID = 42;
-    uint256 internal constant DEFAULT_FEE = 1 ether;
-    uint256 internal constant USER_REP_BALANCE = 1000 ether;
+    uint128 internal constant DEFAULT_FEE = 1 ether;
+    uint128 internal constant USER_REP_BALANCE = 1000 ether;
     uint8 internal constant DEFAULT_NUMBER_OF_OUTCOMES = 3;
     // Readable outcomes for escalation ping-pong (all valid for the default query).
     uint8 internal constant OUTCOME_A = 1;
@@ -103,7 +103,7 @@ abstract contract MultiverseDeployFixture is Test {
 
         underlying = new MockERC20("Underlying", "U");
         zoltarQuestionData = new MockZoltarQuestionData();
-        zoltar = new MockZoltar(IReputationToken(address(underlying)), zoltarQuestionData);
+        zoltar = new MockZoltar(IReputationToken(address(underlying)), zoltarQuestionData, GENESIS_UID);
         IQueryFeeController controller = _deployFeeController();
         multiverse = _deployMultiverse(controller);
 
