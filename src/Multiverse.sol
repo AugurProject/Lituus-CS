@@ -73,6 +73,21 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     }
 
     /* ================================================= STRUCTS ================================================= */
+    /// @dev How a query with no record yet in a universe relates to its lineage's frozen history
+    ///      (see _classifyInheritedQuery). Determines what report() and resolve() may do with it.
+    enum InheritedQueryKind {
+        // Resolved in an ancestor: the outcome is inherited (via getOutcome).
+        AncestorResolved,
+        // Reporting (re)starts here with a full window; the clock is the parent's forkTime.
+        Fresh,
+        // The reporting window lapsed unreported before some ancestor's fork:
+        // dead everywhere below — resolvable INVALID, never revived.
+        ExpiredAtFork,
+        // The escalation ladder concluded (appeal lapsed) before its universe's fork but was never
+        // resolved: the frozen last outcome applies everywhere below.
+        SettledLadder
+    }
+
     struct Query {
         // Number of reportable outcomes, numbered 1..numberOfOutcomes. UNRESOLVED and INVALID are not counted.
         uint8 numberOfOutcomes;
@@ -232,6 +247,9 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     error InvalidOutcome();
     error CannotStakeOnOutcome();
     error QueryAlreadyResolved();
+    // The query's ladder concluded before a fork froze it: its outcome is predetermined and it can
+    // only be resolved by calling resolve(), never reported on again.
+    error QueryAlreadySettled();
     error QueryNotReadyToResolve();
     error QueryExpired();
     error AppealPeriodOver();
@@ -578,7 +596,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      */
     function report(uint248 universeId, uint256 queryId, uint8 outcome) external nonReentrant {
         // Check all conditions (universe exists, query exists, outcome is valid, report is within time, etc.)
-        // Reports can only be placed in an existing, operating or still-forming universe.
+        // Reports can only be placed in an existing and active universe.
         Universe storage universe = _checkUniverseState(universeId);
 
         Query storage query = queries[queryId];
@@ -587,18 +605,24 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         QueryResolution storage resolution = queryResolutions[universeId][queryId];
         if (resolution.outcome != UNRESOLVED) revert QueryAlreadyResolved();
         uint16 stakeCount = resolution.stakeCount;
-        // A query resolved in an ancestor universe is inherited by this lineage (via getOutcome), so it
-        // cannot be reported on again here. The ancestor set is fixed per lineage, so this only needs to
-        // be checked on the first report; later stakes in the same escalation are already covered.
-        if (stakeCount == 0 && _findResolution(universeId, queryId) != UNRESOLVED) {
-            revert QueryAlreadyResolved();
-        }
 
         // Outcome should be between 1 and numberOfOutcomes unless the query should be reported as INVALID
         if (outcome == UNRESOLVED) revert InvalidOutcome();
         if ((outcome > query.numberOfOutcomes) && (outcome != INVALID)) revert InvalidOutcome();
 
-        uint48 queryCreateTime = _getAndUpdateQueryCreateTime(universeId, queryId);
+        uint48 queryCreateTime = resolution.queryCreateTime;
+        if (queryCreateTime == 0) {
+            // First touch of an inherited query here: classify it against the lineage's frozen history.
+            // Ancestor records are immutable once this universe exists (resolve is gated to Active), so
+            // one classification at record materialization covers the query for good.
+            (InheritedQueryKind kind, uint48 anchorCreateTime,,) = _classifyInheritedQuery(universeId, queryId);
+            if (kind == InheritedQueryKind.AncestorResolved) revert QueryAlreadyResolved();
+            if (kind == InheritedQueryKind.SettledLadder) revert QueryAlreadySettled();
+            // Fresh or ExpiredAtFork: the anchor becomes the local clock; the window check below
+            // rejects the expired case.
+            resolution.queryCreateTime = anchorCreateTime;
+            queryCreateTime = anchorCreateTime;
+        }
 
         // check that the reporting window for the query is not over yet
         if (stakeCount == 0 && queryCreateTime + THREE_DAYS < block.timestamp) revert QueryExpired();
@@ -648,11 +672,16 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     /**
      * @notice Resolves a query whose reporting or appeal window has elapsed, recording its outcome.
      * @dev Acts on the universe as given — no heir forwarding; the universe must exist and be Active.
-     *      Two cases:
+     *      Three cases:
      *      (1) no report ever landed and the THREE_DAYS reporting window passed ->
-     *      resolves INVALID (after the ancestor-inheritance check report() never ran).
-     *      (2) stakes exist and the last one's ONE_DAY appeal window passed
+     *      resolves INVALID (including a query already expired when a fork carried it in);
+     *      (2) an inherited query whose ladder concluded before an ancestor's fork ->
+     *      resolves immediately to the frozen last outcome (no window applies);
+     *      (3) stakes exist and the last one's ONE_DAY appeal window passed
      *      -> resolves to the escalation outcome and settles payoffs; otherwise reverts as not-ready.
+     *      In case 1 the RESOLVER earns the time-ramped fee share; in case 2 the frozen winning
+     *      outcome's FIRST REPORTER earns it (on the ramp a live resolution would have paid), and
+     *      the resolver earns nothing — the reporting work was done pre-fork.
      *
      *      After resolving, if the Zoltar counterpart has started forking, the fork is mirrored here.
      * @param universeId The universe to resolve in.
@@ -668,14 +697,56 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         QueryResolution storage resolution = queryResolutions[universeId][queryId];
         if (resolution.outcome != UNRESOLVED) revert QueryAlreadyResolved();
 
-        uint48 queryCreateTime = _getAndUpdateQueryCreateTime(universeId, queryId);
+        uint48 queryCreateTime = resolution.queryCreateTime;
+        // Stays Fresh for a record that already exists here: the live window rules below apply as-is.
+        InheritedQueryKind kind = InheritedQueryKind.Fresh;
+        uint8 frozenOutcome;
+        uint248 recordUniverseId;
+        if (queryCreateTime == 0) {
+            // First touch of an inherited query here: classify it against the lineage's frozen history
+            // (see report() — ancestor records are immutable once this universe exists).
+            uint48 anchorCreateTime;
+            (kind, anchorCreateTime, frozenOutcome, recordUniverseId) = _classifyInheritedQuery(universeId, queryId);
+            if (kind == InheritedQueryKind.AncestorResolved) revert QueryAlreadyResolved();
+            // The anchor becomes the local clock: the fork-time restart for Fresh, the long-lapsed
+            // window for ExpiredAtFork (the INVALID branch below fires immediately); for SettledLadder
+            // it only marks the record materialized.
+            resolution.queryCreateTime = anchorCreateTime;
+            queryCreateTime = anchorCreateTime;
+        }
 
-        if (resolution.stakeCount == 0 && queryCreateTime + THREE_DAYS < block.timestamp) {
-            // No report ever landed here, so the ancestor check was never run by report(): a query
-            // resolved in an ancestor is inherited by this lineage (via getOutcome) and must not be
-            // resolved again. The stakes branch below is already covered by report()'s first-stake check.
-            if (_findResolution(universeId, queryId) != UNRESOLVED) revert QueryAlreadyResolved();
+        if (kind == InheritedQueryKind.SettledLadder) {
+            // The frozen ladder concluded before the fork: materialize its predetermined outcome
+            // in THIS universe's record (each world settles independently, consuming its own
+            // spawn-funded fee copy; the frozen stakes pay out through the claims lane against the
+            // ancestor's record — no stake transfers here). Resolvable immediately: no window applies.
+            resolution.outcome = frozenOutcome;
+            // The reporting work was done pre-fork: the frozen WINNING outcome's first reporter
+            // earns the fee share, on the same ramp a live resolution would pay them.
+            QueryResolution storage frozenRecord = queryResolutions[recordUniverseId][queryId];
+            OutcomeStakes storage frozenWinner = frozenRecord.outcomes[frozenOutcome];
+            uint256 queryFee = queries[queryId].fee;
+            uint256 reporterPay =
+                _timeBasedFeeShare(queryFee, frozenWinner.firstReportTime - frozenRecord.queryCreateTime);
+            uint256 profit = queryFee - reporterPay;
+            _consumeQueryFee(universe, queryFee);
+            emit ReporterRewardPaid(frozenWinner.firstReporter, universeId, queryId, reporterPay);
+            // TODO: make the reporter reward claimable instead of pushing it
+            universe.repToken.safeTransfer(frozenWinner.firstReporter, reporterPay);
+            // The unpaid fee remainder is the query's profit: recorded for the fee controller and
+            // burned as wREP, the same as on the stakes path.
+            // TODO: burn if the query is inherited?
+            if (profit > 0) {
+                universe.repToken.burnShares(profit);
+            }
+            _applyProfit(universeId, profit);
+            // TODO: implement reward calculation for claiming
+
+            emit QueryResolved(msg.sender, universeId, queryId, frozenOutcome);
+        } else if (resolution.stakeCount == 0 && queryCreateTime + THREE_DAYS < block.timestamp) {
             // if the report period has passed and the query was not reported on then resolve the query as INVALID
+            // This works for a query that was created in this universe and never reported on, or for an inherited
+            // query that was already expired when the fork carried it in.
             resolution.outcome = INVALID;
 
             // The resolver setting this query to INVALID earns a share of the fee
@@ -698,7 +769,6 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         } else if (resolution.stakeCount > 0) {
             if (resolution.lastStakeTime + ONE_DAY < block.timestamp) {
                 // If there are stakes and the appeal period has passed then resolve the query with the last outcome
-                // TODO: Unless the query is 1 step from fork threshold, then we should wait for the fork to finish
                 uint8 outcome = _calculateOutcomeAndEscalationPayoffs(universeId, queryId);
                 resolution.outcome = outcome;
                 emit QueryResolved(msg.sender, universeId, queryId, outcome);
@@ -1156,6 +1226,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         // Consecutive reports must differ, so no-losers <=> exactly one stake: settle the sole winner
         // here in one transfer (bond refund + reporter reward) instead of requiring a claim() call.
         // The two events stay separate so StakeClaimed payouts don't include a fee reward.
+        // TODO: maybe claim the first reporter reward instead of pushing it
         if (resolution.stakeCount == 1) {
             resolution.userStakes[reporter][winnerOutcome] = 0; // zeroed marks the stake settled
             emit StakeClaimed(reporter, universeId, queryId, totalStaked);
@@ -1276,7 +1347,9 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     /**
      * @notice The stake the next report on `outcome` must place for `queryId` in `universeId`.
      * @dev Before the first report the cap is not frozen yet, so the estimate uses the live cap and can shift with
-     *      the vault rate until the first stake lands. Forwards to the universe's heir like report().
+     *      the vault rate until the first stake lands. Applies report()'s gates — resolved here or in an
+     *      ancestor, settled by a fork, expired — so a quote is only returned when report() would accept
+     *      the stake (the appeal-window timing aside).
      * @param universeId The universe to report in.
      * @param queryId The query to report on.
      * @param outcome The outcome the next report would stake on.
@@ -1290,8 +1363,21 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         if (queries[queryId].numberOfOutcomes == 0) revert InvalidQuery();
         Universe storage universe = _checkUniverseState(universeId);
         QueryResolution storage resolution = queryResolutions[universeId][queryId];
+        if (resolution.outcome != UNRESOLVED) revert QueryAlreadyResolved();
+
+        // Mirror report()'s gates so the quote never contradicts it: classify an inherited query
+        // with no local record yet, and never quote a price report() would reject.
+        uint48 queryCreateTime = resolution.queryCreateTime;
+        if (queryCreateTime == 0) {
+            (InheritedQueryKind kind, uint48 anchorCreateTime,,) = _classifyInheritedQuery(universeId, queryId);
+            if (kind == InheritedQueryKind.AncestorResolved) revert QueryAlreadyResolved();
+            if (kind == InheritedQueryKind.SettledLadder) revert QueryAlreadySettled();
+            queryCreateTime = anchorCreateTime;
+        }
+
         uint256 fee = queries[queryId].fee;
         if (resolution.stakeCount == 0) {
+            if (queryCreateTime + THREE_DAYS < block.timestamp) revert QueryExpired();
             uint256 cap = _capShares(universe.repToken, universeId);
             uint256 firstStakeCap = cap / FIRST_STAKE_CAP_DIVISOR;
             return _roundToPowerOfTwoStep(fee > firstStakeCap ? firstStakeCap : fee, cap);
@@ -1789,37 +1875,87 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     }
 
     /**
-     * @notice Returns when a query became reportable in a universe, setting it lazily on first access.
-     * @dev If already set, returns it. Otherwise the query can only be reported on if it was inherited
-     *      through a fork, i.e. its origin universe is an ancestor of this one — enforced by walking the
-     *      parent chain. Its reportable time is then the parent's forkTime (the moment of the fork that
-     *      carried the query in), which is stored and returned.
-     * @param universeId The universe the query is being acted on in.
+     * @notice Classifies an inherited query with no local record yet against its lineage's frozen history,
+     *         in one pass over the ancestor chain.
+     * @dev Walks the parent chain to the NEAREST materialized record R (the origin always has one, so a
+     *      genuinely inherited query always terminates there; reaching the genesis without finding any
+     *      record means the query does not belong to this lineage). Records only materialize while a
+     *      universe is Active, so R's record was frozen as-is by R's own fork at forkTime F:
+     *      - resolved in R (or any ancestor on the way) -> AncestorResolved;
+     *      - stakes with the appeal window lapsed before F -> SettledLadder: the last outcome is
+     *        predetermined for every descendant;
+     *      - no stakes and the reporting window lapsed before F -> ExpiredAtFork, anchored at R's
+     *        createTime;
+     *      - otherwise the game is voided and reporting restarts (Fresh) — UNLESS some untouched
+     *        generation between R and here held the query for more than the reporting window between
+     *        its carry-in fork and its own fork: then it silently expired there (ExpiredAtFork,
+     *        anchored at that generation's carry-in time).
+     *      The Fresh clock is the parent's forkTime — the fork, not this universe's spawn, so a child
+     *      spawned more than the reporting window after the fork receives the query already expired.
+     * @param universeId The universe the query is being acted on in (must have no local record).
      * @param queryId The query in question.
-     * @return queryCreateTime The timestamp the query became reportable in this universe.
+     * @return kind The classification.
+     * @return anchorCreateTime The local reportable-from clock to store: the parent's forkTime for
+     *         Fresh (and SettledLadder, where it only marks the record materialized), or the expired
+     *         generation's carry-in time for ExpiredAtFork. Zero for AncestorResolved.
+     * @return frozenOutcome The predetermined outcome (SettledLadder), or the inherited one
+     *         (AncestorResolved). Zero otherwise.
+     * @return recordUniverseId SettledLadder only: the ancestor holding the frozen ladder's record —
+     *         the winning first reporter and the reward ramp are read from it, and the future claims
+     *         lane settles its stakes.
      */
-    function _getAndUpdateQueryCreateTime(uint248 universeId, uint256 queryId)
+    function _classifyInheritedQuery(uint248 universeId, uint256 queryId)
         internal
-        returns (uint48 queryCreateTime)
+        view
+        returns (InheritedQueryKind kind, uint48 anchorCreateTime, uint8 frozenOutcome, uint248 recordUniverseId)
     {
-        QueryResolution storage resolution = queryResolutions[universeId][queryId];
-        if (resolution.queryCreateTime != 0) {
-            return resolution.queryCreateTime;
-        } else {
-            // TODO: check query flow after forks
-            // If the queryCreateTime is not set, the query was not created in this universe, so it is only
-            // available here if this universe descends from the query's origin universe. New queries cannot
-            // be created in a forked (ancestor) universe, so an origin-is-ancestor match guarantees the
-            // query was genuinely inherited.
-            // TODO: query creation in a parent universe
-            if (!_isSelfOrAncestor(queries[queryId].originUniverse, universeId)) {
-                revert QueryNotInherited();
+        // The genesis inherits from nowhere.
+        if (universeId == GENESIS_UNIVERSE_ID) revert QueryNotInherited();
+
+        uint248 currentParentId = universes[universeId].parent;
+        // Every ancestor of an existing universe has forked, so its forkTime is nonzero.
+        uint48 freshAnchor = universes[currentParentId].forkTime;
+        // The carry-in time of the untouched generation closest to R whose window lapsed, if any.
+        uint48 expiredAnchor = 0;
+        while (true) {
+            QueryResolution storage record = queryResolutions[currentParentId][queryId];
+            if (record.outcome != UNRESOLVED) {
+                return (InheritedQueryKind.AncestorResolved, 0, record.outcome, 0);
             }
-            // The query becomes reportable in this universe at the moment of the fork that carried
-            // it in: the parent's forkTime (this universe's own forkTime is 0 until it forks itself).
-            queryCreateTime = universes[universes[universeId].parent].forkTime;
-            resolution.queryCreateTime = uint48(queryCreateTime);
-            return queryCreateTime;
+            uint48 recordCreateTime = record.queryCreateTime;
+            if (recordCreateTime != 0) {
+                // The nearest materialized record R, frozen by R's own fork.
+                uint48 forkTime = universes[currentParentId].forkTime;
+                if (record.stakeCount > 0) {
+                    if (record.lastStakeTime + ONE_DAY < forkTime) {
+                        return
+                            (InheritedQueryKind.SettledLadder, freshAnchor, record.lastReportedOutcome, currentParentId);
+                    }
+                    // The appeal window was still open at F: the ladder is voided (stakes refundable
+                    // through the claims lane) and reporting restarts below.
+                } else if (recordCreateTime + THREE_DAYS < forkTime) {
+                    return (InheritedQueryKind.ExpiredAtFork, recordCreateTime, 0, 0);
+                }
+                if (expiredAnchor != 0) {
+                    return (InheritedQueryKind.ExpiredAtFork, expiredAnchor, 0, 0);
+                }
+                return (InheritedQueryKind.Fresh, freshAnchor, 0, 0);
+            }
+            // Records exist only in the origin's descendants, and the origin's record always exists:
+            // exhausting the chain without finding one means this universe does not descend from the
+            // query's origin.
+            if (currentParentId == GENESIS_UNIVERSE_ID) revert QueryNotInherited();
+            // An untouched generation: it held the query from its carry-in fork to its own fork. If a
+            // full reporting window fit in that time, the query expired there. Later (higher) finds
+            // overwrite earlier ones, so the anchor ends at the generation closest to R — where the
+            // window truly lapsed first. Finding the first expiration window is used for determining
+            // the reporter pay based on the time ramp.
+            uint248 parentId = universes[currentParentId].parent;
+            uint48 carryInTime = universes[parentId].forkTime;
+            if (carryInTime + THREE_DAYS < universes[currentParentId].forkTime) {
+                expiredAnchor = carryInTime;
+            }
+            currentParentId = parentId;
         }
     }
 
