@@ -102,6 +102,10 @@ contract MultiverseForkTest is MultiverseFixtures {
         // counted Lituus migration/claim lanes. Zoltar-side fork started in the same tx.
         assertTrue(genesisRep.unwrapPaused());
         assertEq(zoltar.getForkTime(GENESIS_UID), vm.getBlockTimestamp());
+        // The forking query is linked to the Zoltar question the fork was submitted on.
+        (,,,, uint256 zoltarQuestionId) = multiverse.queries(queryId);
+        assertTrue(zoltarQuestionId != 0);
+        assertEq(zoltarQuestionId, zoltar.forkQuestionIds(GENESIS_UID));
         // The forking universe itself still reads UNRESOLVED (it never resolves the query locally).
         assertEq(multiverse.getOutcome(GENESIS_UID, queryId), 0);
 
@@ -121,7 +125,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         // was not mirrored yet. The Lituus fork-trigger report — the one that would land the
         // second outcome on the cap — must revert cleanly instead of hitting Zoltar's own revert.
         (uint256 queryId,) = _createLadderToCap();
-        zoltar.forkUniverse(GENESIS_UID, 424_242);
+        _forkZoltarNatively(_createZoltarCategoricalQuestion(2));
 
         vm.prank(user);
         vm.expectRevert(Multiverse.ZoltarUniverseAlreadyForking.selector);

@@ -65,7 +65,7 @@ contract MultiverseTokenizerTest is QueryTokenizerFixtures {
         );
 
         assertEq(multiverse.queryCount(), queryId + 1);
-        (uint8 numberOfOutcomes, uint248 originUniverse, uint256 fee, string memory question) =
+        (uint8 numberOfOutcomes, uint248 originUniverse, uint256 fee, string memory question,) =
             multiverse.queries(queryId);
         assertEq(numberOfOutcomes, DEFAULT_NUMBER_OF_OUTCOMES);
         assertEq(originUniverse, GENESIS_UID);
@@ -88,7 +88,7 @@ contract MultiverseTokenizerTest is QueryTokenizerFixtures {
         vm.prank(address(tokenizer));
         multiverse.createQueryFromTokenizer(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES, fee, user);
 
-        (,, uint256 storedFee,) = multiverse.queries(0);
+        (,, uint256 storedFee,,) = multiverse.queries(0);
         assertEq(storedFee, fee);
     }
 
@@ -105,9 +105,9 @@ contract MultiverseTokenizerTest is QueryTokenizerFixtures {
         multiverse.createQuery(GENESIS_UID, "direct-2", 5);
 
         assertEq(multiverse.queryCount(), 3);
-        (uint8 outcomes0,,, string memory question0) = multiverse.queries(0);
-        (uint8 outcomes1,, uint256 fee1, string memory question1) = multiverse.queries(1);
-        (uint8 outcomes2,,, string memory question2) = multiverse.queries(2);
+        (uint8 outcomes0,,, string memory question0,) = multiverse.queries(0);
+        (uint8 outcomes1,, uint256 fee1, string memory question1,) = multiverse.queries(1);
+        (uint8 outcomes2,,, string memory question2,) = multiverse.queries(2);
         assertEq(question0, "direct-0");
         assertEq(outcomes0, 2);
         assertEq(question1, "tokenizer-1");
@@ -136,7 +136,7 @@ contract MultiverseTokenizerTest is QueryTokenizerFixtures {
         vm.prank(user);
         multiverse.createQuery(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
 
-        (,, uint256 storedFee,) = multiverse.queries(0);
+        (,, uint256 storedFee,,) = multiverse.queries(0);
         assertEq(storedFee, HALF_FORK_THRESHOLD);
     }
 
@@ -150,7 +150,7 @@ contract MultiverseTokenizerTest is QueryTokenizerFixtures {
         vm.prank(user);
         multiverse.createQuery(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
 
-        (,, uint256 chargedFee,) = multiverse.queries(0);
+        (,, uint256 chargedFee,,) = multiverse.queries(0);
         assertEq(chargedFee, preview);
 
         // Idle two windows plus a partial-window offset: the view must catch the 60-day cache up
@@ -160,7 +160,7 @@ contract MultiverseTokenizerTest is QueryTokenizerFixtures {
         preview = _previewUncappedFee();
         vm.prank(user);
         multiverse.createQuery(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
-        (,, chargedFee,) = multiverse.queries(1);
+        (,, chargedFee,,) = multiverse.queries(1);
         assertEq(chargedFee, preview);
 
         // Idle past 20 windows: the cache roll switches to the full recompute branch.
@@ -168,7 +168,7 @@ contract MultiverseTokenizerTest is QueryTokenizerFixtures {
         preview = _previewUncappedFee();
         vm.prank(user);
         multiverse.createQuery(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
-        (,, chargedFee,) = multiverse.queries(2);
+        (,, chargedFee,,) = multiverse.queries(2);
         assertEq(chargedFee, preview);
     }
 

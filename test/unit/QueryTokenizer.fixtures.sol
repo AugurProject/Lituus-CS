@@ -110,7 +110,7 @@ abstract contract QueryTokenizerFixtures is MultiverseFixtures {
         assertEq(genesisRep.balanceOf(address(multiverse)), multiverseRepBefore + price);
 
         assertEq(multiverse.queryCount(), queryId + 1);
-        (uint8 numberOfOutcomes, uint248 originUniverse, uint256 fee, string memory question) =
+        (uint8 numberOfOutcomes, uint248 originUniverse, uint256 fee, string memory question,) =
             multiverse.queries(queryId);
         assertEq(numberOfOutcomes, DEFAULT_NUMBER_OF_OUTCOMES);
         assertEq(originUniverse, GENESIS_UID);

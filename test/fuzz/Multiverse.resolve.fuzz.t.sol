@@ -50,7 +50,7 @@ contract MultiverseResolveFuzzTest is MultiverseFuzzFixtures {
         pastDeadline = bound(pastDeadline, 1, multiverse.THREE_DAYS());
         feeCtl.setFee(fee);
         uint256 queryId = _createQuery();
-        (,, uint256 chargedFee,) = multiverse.queries(queryId);
+        (,, uint256 chargedFee,,) = multiverse.queries(queryId);
 
         vm.warp(vm.getBlockTimestamp() + multiverse.THREE_DAYS() + pastDeadline);
         uint256 resolverBalanceBefore = genesisRep.balanceOf(user);
@@ -133,7 +133,7 @@ contract MultiverseResolveFuzzTest is MultiverseFuzzFixtures {
         uint256 creatorBalanceBefore = genesisRep.balanceOf(user);
         uint256 reporterBalanceBefore = genesisRep.balanceOf(reporter);
         uint256 queryId = _createQuery();
-        (,, uint256 chargedFee,) = multiverse.queries(queryId);
+        (,, uint256 chargedFee,,) = multiverse.queries(queryId);
 
         vm.warp(vm.getBlockTimestamp() + reportDelay);
         vm.prank(reporter);

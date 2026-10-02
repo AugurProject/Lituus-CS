@@ -136,7 +136,7 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
         // Pick from the valid outcome set {1..numberOfOutcomes, INVALID}; when escalating, shift
         // once to the next candidate if the pick repeats the previous outcome (the set has at
         // least 3 members, so one shift always suffices).
-        (uint8 numberOfOutcomes,,,) = MULTIVERSE.queries(queryId);
+        (uint8 numberOfOutcomes,,,,) = MULTIVERSE.queries(queryId);
         uint256 pick = bound(outcomeSeed, 1, uint256(numberOfOutcomes) + 1);
         uint256 outcome = pick == uint256(numberOfOutcomes) + 1 ? MULTIVERSE.INVALID() : pick;
         if (stakeCount != 0 && outcome == ghostLastOutcome[queryId]) {

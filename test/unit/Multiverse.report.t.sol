@@ -291,7 +291,7 @@ contract MultiverseReportTest is MultiverseFixtures {
         // The second query costs more than the first one because the first one already raised
         // the demand modifier, but its slightly higher fee still rounds to the same grid step.
         assertEq(_resolution(queryId1).stakeCount, 0);
-        (,, uint256 fee1,) = multiverse.queries(queryId1);
+        (,, uint256 fee1,,) = multiverse.queries(queryId1);
         uint256 requiredStake = multiverse.getNextRequiredStake(GENESIS_UID, queryId1, OUTCOME_A);
         assertGt(fee1, DEFAULT_FEE);
         assertEq(requiredStake, DEFAULT_FEE);
@@ -396,7 +396,7 @@ contract MultiverseReportTest is MultiverseFixtures {
         // Each query's ladder runs from its own first stake. The second query's fee is higher than
         // the base fee (the first one already raised the demand modifier) but rounds to the same
         // grid step, so both ladders start at DEFAULT_FEE.
-        (,, uint256 fee1,) = multiverse.queries(queryId1);
+        (,, uint256 fee1,,) = multiverse.queries(queryId1);
         assertGt(fee1, DEFAULT_FEE);
         ResolutionView memory r0 = _resolution(queryId0);
         ResolutionView memory r1 = _resolution(queryId1);

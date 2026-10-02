@@ -6,6 +6,7 @@ import { Test } from "forge-std/Test.sol";
 import { Multiverse } from "src/Multiverse.sol";
 import { ILituusRep } from "src/interfaces/ILituusRep.sol";
 import { IReputationToken } from "src/interfaces/IReputationToken.sol";
+import { IZoltarQuestionData } from "src/interfaces/IZoltar.sol";
 import { IQueryFeeController } from "src/interfaces/IQueryFeeController.sol";
 import { MockERC20 } from "src/mock/MockERC20.sol";
 import { MockZoltar } from "src/mock/MockZoltar.sol";
@@ -128,6 +129,34 @@ abstract contract MultiverseDeployFixture is Test {
     ///      harness (e.g. exposing internal views) override this.
     function _deployMultiverse(IQueryFeeController controller) internal virtual returns (Multiverse) {
         return new Multiverse(zoltar, GENESIS_UID, controller, queryTokenizerStub);
+    }
+
+    /// @dev Creates an already-ended categorical Zoltar question with `numberOfLabels` placeholder labels.
+    function _createZoltarCategoricalQuestion(uint8 numberOfLabels) internal returns (uint256 questionId) {
+        string[] memory labels = new string[](numberOfLabels);
+        for (uint256 i = 0; i < numberOfLabels; i++) {
+            labels[i] = vm.toString(i + 1);
+        }
+        return _createZoltarQuestion(labels);
+    }
+
+    /// @dev Creates an already-ended label-less Zoltar question: the mock's scalar placeholder, whose answers
+    ///      are opaque numbers (no encoding is asserted anywhere — the scalar format may still change).
+    function _createZoltarScalarQuestion() internal returns (uint256 questionId) {
+        return _createZoltarQuestion(new string[](0));
+    }
+
+    function _createZoltarQuestion(string[] memory labels) internal returns (uint256 questionId) {
+        IZoltarQuestionData.QuestionData memory data;
+        data.title = "Native Zoltar question";
+        data.startTime = vm.getBlockTimestamp() - 2 days;
+        data.endTime = vm.getBlockTimestamp() - 1 days;
+        return zoltarQuestionData.createQuestion(data, labels);
+    }
+
+    /// @dev Forks the genesis natively, at the Zoltar level and outside Lituus, on `questionId`.
+    function _forkZoltarNatively(uint256 questionId) internal {
+        zoltar.forkUniverse(GENESIS_UID, questionId);
     }
 
     /// @dev Funding tool (not invoked here): mint underlying, wrap into REP, approve the multiverse.

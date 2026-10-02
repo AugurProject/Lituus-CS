@@ -56,7 +56,7 @@ contract MultiverseReportFuzzTest is MultiverseFuzzFixtures {
         feeCtl.setFee(fee);
 
         uint256 queryId = _createQuery();
-        (,, uint256 chargedFee,) = multiverse.queries(queryId);
+        (,, uint256 chargedFee,,) = multiverse.queries(queryId);
         uint256 firstStake = multiverse.getNextRequiredStake(GENESIS_UID, queryId, 1);
 
         // Both directions of the bound, squared to avoid a square root: stake^2 <= 2 * fee^2 and
