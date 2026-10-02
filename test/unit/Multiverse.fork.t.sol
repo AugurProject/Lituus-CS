@@ -9,7 +9,7 @@ import { MultiverseFixtures } from "./Multiverse.fixtures.sol";
 /// @dev Runs against MockZoltar (unique keccak child ids, per-child REP, credit-only migration
 ///      stubs). Payouts, refunds, and SupplyRestoration are later phases and not tested here.
 contract MultiverseForkTest is MultiverseFixtures {
-    uint8 internal constant INVALID_OUTCOME = 255;
+    uint256 internal constant INVALID_OUTCOME = type(uint256).max;
 
     /// @dev Escalates a query in `universeId` until the fork fires (the second outcome reaches the
     ///      per-outcome cap inside report()), alternating OUTCOME_A/OUTCOME_B from
@@ -21,7 +21,7 @@ contract MultiverseForkTest is MultiverseFixtures {
     {
         uint256 i = 0;
         while (true) {
-            uint8 outcome = i % 2 == 0 ? OUTCOME_A : OUTCOME_B;
+            uint256 outcome = i % 2 == 0 ? OUTCOME_A : OUTCOME_B;
             triggerStake = multiverse.getNextRequiredStake(universeId, queryId, outcome);
             vm.prank(i % 2 == 0 ? reporterA : reporterB);
             multiverse.report(universeId, queryId, outcome);
@@ -102,6 +102,10 @@ contract MultiverseForkTest is MultiverseFixtures {
         // counted Lituus migration/claim lanes. Zoltar-side fork started in the same tx.
         assertTrue(genesisRep.unwrapPaused());
         assertEq(zoltar.getForkTime(GENESIS_UID), vm.getBlockTimestamp());
+        // The forking query is linked to the Zoltar question the fork was submitted on.
+        (,,,, uint256 zoltarQuestionId) = multiverse.queries(queryId);
+        assertTrue(zoltarQuestionId != 0);
+        assertEq(zoltarQuestionId, zoltar.forkQuestionIds(GENESIS_UID));
         // The forking universe itself still reads UNRESOLVED (it never resolves the query locally).
         assertEq(multiverse.getOutcome(GENESIS_UID, queryId), 0);
 
@@ -121,7 +125,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         // was not mirrored yet. The Lituus fork-trigger report — the one that would land the
         // second outcome on the cap — must revert cleanly instead of hitting Zoltar's own revert.
         (uint256 queryId,) = _createLadderToCap();
-        zoltar.forkUniverse(GENESIS_UID, 424_242);
+        _forkZoltarNatively(_createZoltarCategoricalQuestion(2));
 
         vm.prank(user);
         vm.expectRevert(Multiverse.ZoltarUniverseAlreadyForking.selector);
@@ -547,13 +551,13 @@ contract MultiverseForkTest is MultiverseFixtures {
     function _resolutionIn(uint248 universeId, uint256 queryId) internal view returns (ResolutionView memory r) {
         (
             r.queryCreateTime,
-            r.outcome,
             r.lastStakeTime,
-            r.lastReportedOutcome,
             r.stakeCount,
             r.totalStaked,
+            r.noOfOutcomesAtCap,
             r.cap,
-            r.noOfOutcomesAtCap
+            r.outcome,
+            r.lastReportedOutcome
         ) = multiverse.queryResolutions(universeId, queryId);
     }
 
@@ -1001,7 +1005,7 @@ contract MultiverseForkTest is MultiverseFixtures {
     }
 
     function test_QueryFlow_SettledLadderWithInvalidOutcome() public {
-        // INVALID (255) is an ordinary frozen outcome: a ladder whose last report was INVALID and
+        // INVALID (max-uint) is an ordinary frozen outcome: a ladder whose last report was INVALID and
         // whose appeal lapsed before the fork settles every child to INVALID.
         uint256 settledQueryId = _createDefaultQuery();
         _report(user, settledQueryId, OUTCOME_A);
