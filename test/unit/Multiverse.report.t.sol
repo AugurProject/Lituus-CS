@@ -578,6 +578,8 @@ contract MultiverseReportTest is MultiverseFixtures {
         // that the fork is sized against.
         (uint256 queryId, uint256 cap) = _createLadderToCap();
         assertEq(_resolution(queryId).noOfOutcomesAtCap, 1);
+        // Read before the trigger: the fork burns parent REP, lowering the supply the cap was sized against.
+        uint256 supplyAtCap = zoltar.getUniverseTheoreticalSupply(GENESIS_UID);
 
         // The final stake forks the universe inside report() and parks the whole pot, so it is
         // placed raw rather than through the balance-asserting _report fixture.
@@ -592,7 +594,7 @@ contract MultiverseReportTest is MultiverseFixtures {
 
         // The pot is exactly two per-outcome caps, i.e. 2% of the universe's REP supply.
         assertEq(r.totalStaked, 2 * cap);
-        assertEq(r.totalStaked, 2 * zoltar.getUniverseTheoreticalSupply(GENESIS_UID) / 100);
+        assertEq(r.totalStaked, 2 * supplyAtCap / 100);
 
         // Two outcomes at the cap means the fork level: the same report forked the universe.
         (, Multiverse.UniverseState state,,,,,,,,,,,) = multiverse.universes(GENESIS_UID);

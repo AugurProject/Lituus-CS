@@ -10,7 +10,7 @@ contract MockZoltar is IZoltar {
     // Reference Zoltar's forkBurnDivisor (its minimum): the fork initiator's whole threshold is
     // burned, and all but this fraction of it is credited back to their migration balance. The
     // net burn is threshold / FORK_BURN_DIVISOR = 1% of the supply atm.
-    uint256 constant FORK_BURN_DIVISOR = 5;
+    uint256 public constant FORK_BURN_DIVISOR = 5;
 
     // mock accessors mirror the interface's lowercase getter names, so keep the non-standard casing
     // forge-lint: disable-next-line(screaming-snake-case-immutable)

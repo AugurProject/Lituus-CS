@@ -90,6 +90,10 @@ contract MultiverseForkTest is MultiverseFixtures {
     /* ============================================= FORK TRIGGER ============================================= */
 
     function test_Fork_TriggersAtSecondOutcomeAtCapInsideReport() public {
+        // Read before the trigger: the fork burn lowers the supply the threshold and the cap derive from.
+        uint256 forkThreshold = zoltar.getForkThreshold(GENESIS_UID);
+        uint256 capBefore = _capWrep();
+        uint256 supplyBefore = underlying.totalSupply();
         (uint256 queryId, uint256 triggerStake) = _forkGenesis();
 
         // The forking universe enters Migration with its split moment recorded in forkTime.
@@ -117,7 +121,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         // A total is cap/2, so the trigger rung is exactly cap/2.
         ResolutionView memory r = _resolution(queryId);
         assertEq(r.noOfOutcomesAtCap, 2);
-        assertEq(r.cap, _capWrep());
+        assertEq(r.cap, capBefore);
         assertEq(multiverse.getOutcomeStakes(GENESIS_UID, queryId, OUTCOME_A).totalOutcomeStaked, r.cap);
         assertEq(multiverse.getOutcomeStakes(GENESIS_UID, queryId, OUTCOME_B).totalOutcomeStaked, r.cap);
         assertEq(r.totalStaked, 2 * r.cap);
@@ -130,11 +134,15 @@ contract MultiverseForkTest is MultiverseFixtures {
         assertEq(multiverse.getOutcome(GENESIS_UID, queryId), 0);
 
         // The whole pot parked: the contract's entire wREP holding (the forking query's fee + all
-        // its stakes; rate is 1 here so assets == shares) moved into the Zoltar migration balance
-        // and is recorded as unmigratedSupply. Parent-side value is no longer withdrawable.
+        // its stakes; rate is 1 here so assets == shares) moved into the Zoltar migration balance,
+        // net of Zoltar's burn haircut on the fork bond, and is recorded as unmigratedSupply.
+        // Parent-side value is no longer withdrawable.
         assertEq(genesisRep.balanceOf(address(multiverse)), 0);
-        assertEq(unmigratedSupply, r.totalStaked + DEFAULT_FEE);
+        assertEq(underlying.balanceOf(address(multiverse)), 0);
+        uint256 haircut = forkThreshold / zoltar.FORK_BURN_DIVISOR();
+        assertEq(unmigratedSupply, r.totalStaked + DEFAULT_FEE - haircut);
         assertEq(zoltar.getMigrationRepBalance(address(multiverse), GENESIS_UID), unmigratedSupply);
+        assertEq(underlying.totalSupply(), supplyBefore - (r.totalStaked + DEFAULT_FEE));
         // The forking query's own fee is excluded from the fee aggregate (no payoff path ever
         // consumes it in a child — its resolution is pre-written at spawn); it stays parked.
         assertEq(totalQueryFees, 0);

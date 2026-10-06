@@ -265,6 +265,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     error ZoltarQueryCreationFailed();
     error ZoltarUniverseIsNotForking();
     error ZoltarUniverseAlreadyForking();
+    error ForkStakesBelowThreshold();
     error InvalidZoltarQuestion();
     error QueryTooLong();
     error ZeroFee();
@@ -1568,7 +1569,13 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         if (zoltarQueryId == 0) revert ZoltarQueryCreationFailed();
 
         // Fork in Zoltar: it burns the fork threshold from this contract's REP and credits it back to our
-        // migration balance net of the burn haircut.
+        // migration balance net of the burn haircut. The bond is unwrapped first, out of the forking query's
+        // stakes (which must cover it): exactly the threshold, read before the burn lowers the supply it is
+        // derived from, in shares rounded up so the REP in hand is never short.
+        uint256 forkThreshold = ZOLTAR.getForkThreshold(universeId);
+        uint256 thresholdShares = universe.repToken.convertToSharesUp(forkThreshold);
+        if (queryResolutions[universeId][queryId].totalStaked < thresholdShares) revert ForkStakesBelowThreshold();
+        uint256 bondRemainder = universe.repToken.migrateOut(address(this), thresholdShares) - forkThreshold;
         ZOLTAR.forkUniverse(universeId, zoltarQueryId);
 
         universe.universeState = UniverseState.Migration;
@@ -1582,7 +1589,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         // The forking query's fee leaves the fee aggregate so the children don't inherit it as a resolution
         // fee. It is paid as the fork's reporter reward when each child spawns (see _payForkReporter).
         _consumeQueryFee(universe, queries[queryId].fee);
-        _addPotToMigrationBalance(universeId, universe);
+        _addPotToMigrationBalance(universeId, universe, bondRemainder);
         // Permanent: wrapped capital in a forked universe exits ONLY through the counted Lituus
         // migration lane (migrate(), and later the claim lanes) — never by unwrapping to the Zoltar
         // level. No code path ever unpauses a forked universe's vault.
@@ -1593,20 +1600,23 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * @notice Parks the contract's entire wREP holding of a forking universe in the Zoltar
      *         migration balance: query fees, the forking query's pot, and all other stakes and
      *         unclaimed winnings. Runs once, in the fork tx.
-     * @dev From here every path to this value is a "second part" of a migration — minting into a
-     *      child universe (fee splits at spawn now; per-stake claims/refunds in the claims phase).
-     *      Nothing is ever withdrawable on the parent side again. The parked total is recorded in
-     *      unmigratedSupply: SR max supply = totalMigratedOut + unmigratedSupply.
+     * @dev `unwrappedAssets` is REP already unwrapped and still held here: what the bond unwrap
+     *      yielded over the threshold (zero for a mirrored fork). From here every path to this
+     *      value is a "second part" of a migration — minting into a child universe (fee splits at
+     *      spawn now; per-stake claims/refunds in the claims phase). Nothing is ever withdrawable
+     *      on the parent side again. The parked total is recorded in unmigratedSupply: SR max
+     *      supply = totalMigratedOut + unmigratedSupply.
      */
-    function _addPotToMigrationBalance(uint248 universeId, Universe storage universe) internal {
+    function _addPotToMigrationBalance(uint248 universeId, Universe storage universe, uint256 unwrappedAssets)
+        internal
+    {
         uint256 potShares = universe.repToken.balanceOf(address(this));
-        if (potShares > 0) {
-            uint256 potAssets = universe.repToken.migrateOut(address(this), potShares);
-            ZOLTAR.addRepToMigrationBalance(universeId, potAssets);
-            // Asset amounts are REP amounts within uint128.
-            // forge-lint: disable-next-line(unsafe-typecast)
-            universe.unmigratedSupply = uint128(potAssets);
-        }
+        if (potShares > 0) unwrappedAssets += universe.repToken.migrateOut(address(this), potShares);
+        if (unwrappedAssets > 0) ZOLTAR.addRepToMigrationBalance(universeId, unwrappedAssets);
+        // Nothing is parked before the fork, so this is the pot net of Zoltar's haircut on the bond.
+        // Asset amounts are REP amounts within uint128.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        universe.unmigratedSupply = uint128(ZOLTAR.getMigrationRepBalance(address(this), universeId));
     }
 
     /// @dev Marks a query's fee consumed in this universe's fee aggregate. Saturating: the
@@ -1971,7 +1981,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
 
         // Park BEFORE the eager spawns: each spawn splits the fee aggregate from the balance the
         // parking fills. (The mirrored query's own fee is 0 — nothing to exclude.)
-        _addPotToMigrationBalance(universeId, universe);
+        _addPotToMigrationBalance(universeId, universe, 0);
 
         // Spawn child universes. Each child resolves the mirrored query to its own outcome, keyed
         // by the same identity mapping migrate/spawn use (real Zoltar's binary indexes are 0-based —
