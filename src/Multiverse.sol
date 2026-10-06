@@ -13,22 +13,21 @@ import { IReputationToken } from "./interfaces/IReputationToken.sol";
 import { IQueryFeeController } from "./interfaces/IQueryFeeController.sol";
 import { IMultiverse } from "./interfaces/IMultiverse.sol";
 
-// TODO: check zoltar forks
-
 contract Multiverse is ReentrancyGuard, IMultiverse {
     using SafeERC20 for IERC20;
     using SafeERC20 for ILituusRep;
 
     /* ========================================== CONSTANTS/IMMUTABLES =========================================== */
-    // Query outcomes:
+    // Query outcomes live in one uint256 domain, shared with Zoltar's answer space:
     // 0 - UNRESOLVED
-    // 1..numberOfOutcomes - valid outcomes (a query has 2..254 of them; 1 is YES and 2 is NO for a binary query)
-    // 255 - INVALID
+    // 1..numberOfOutcomes - valid categorical outcomes (a query has 2..254 of them)
+    // type(uint256).max - INVALID
     uint8 public constant MAX_OUTCOMES = 254; // number of outcomes for a query (not including UNRESOLVED and INVALID)
     uint8 public constant MIN_OUTCOMES = 2; // minimum number of valid outcomes for a query
-    uint8 public constant UNRESOLVED = 0; // the query is not resolved yet
-    uint8 public constant INVALID = 255; // an invalid outcome value used for reporting an invalid fork outcome during
-    // fork resolution. It is outside the valid outcome range [1, MAX_OUTCOMES]
+    uint256 public constant UNRESOLVED = 0; // the query is not resolved yet
+    // The invalid outcome: reportable on any query, and the outcome of an expired one.
+    // TODO: map to Zoltar's INVALID
+    uint256 public constant INVALID = type(uint256).max;
     // TODO: determine the max query length based on gas costs
     uint16 public constant MAX_QUERY_LENGTH = 2058; // maximum length of a query string
 
@@ -97,6 +96,10 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         uint256 fee;
         // The question text together with its possible answers.
         string question;
+        // The query's Zoltar question, if it has one (non-zero): the fork question a Lituus fork submitted, or the
+        // native Zoltar fork question a mirrored fork imported. With numberOfOutcomes == 0 the outcome set is
+        // Zoltar's own — ZoltarQuestionData decides answer validity.
+        uint256 zoltarQuestionId;
     }
 
     /// @dev One outcome's side of an escalation ladder. `totalOutcomeStaked` is written on every stake placed
@@ -110,34 +113,36 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         uint48 firstReportTime;
     }
 
-    /// @dev Escalation state of a query in one universe. The first six fields share a storage slot and are
-    ///      all touched by every report; `cap` and `noOfOutcomesAtCap` share the next slot and are written at
-    ///      the first report and when an outcome reaches the cap only. wREP amounts are bounded by the REP
-    ///      max supply (100M * 1e18), comfortably within uint96.
+    /// @dev Escalation state of a query in one universe. The first five fields share a storage slot: every
+    ///      report touches it (`noOfOutcomesAtCap` only when an outcome reaches the cap). `cap` takes the next
+    ///      slot and is written at the first report only. Outcomes are full words — categorical outcomes and
+    ///      Zoltar's packed scalar answers share one uint256 domain — so `outcome` and `lastReportedOutcome`
+    ///      take a slot each; a report writes `lastReportedOutcome` and the shared slot. wREP amounts are
+    ///      bounded by the REP max supply (100M * 1e18), comfortably within uint96.
     struct QueryResolution {
         // The time the query first became reportable in this universe.
         // Set on createQuery in the origin universe and lazily on the first report() in heir universes
         // (to the parent's forkTime — the fork moment that created the universe).
         uint48 queryCreateTime;
-        // The resolved outcome. 0 means UNRESOLVED.
-        uint8 outcome;
         // When the latest stake was placed. Each stake reopens the appeal window from this time.
         uint48 lastStakeTime;
-        // The outcome of the latest stake. Wins the query if the appeal window lapses unchallenged.
-        uint8 lastReportedOutcome;
         // Number of stakes placed so far.
         uint16 stakeCount;
         // Total wREP staked across all outcomes.
         uint96 totalStaked;
+        // Number of outcomes whose total has reached `cap`. The second one triggers the fork.
+        uint8 noOfOutcomesAtCap;
         // Per-outcome stake ceiling: 1% of the universe's REP supply, converted to wREP shares and frozen at
         // the first report so the whole ladder is measured against one grid.
         uint96 cap;
-        // Number of outcomes whose total has reached `cap`. The second one triggers the fork.
-        uint8 noOfOutcomesAtCap;
+        // The resolved outcome. 0 means UNRESOLVED.
+        uint256 outcome;
+        // The outcome of the latest stake. Wins the query if the appeal window lapses unchallenged.
+        uint256 lastReportedOutcome;
         // Stake totals and first reporter per outcome.
-        mapping(uint8 outcome => OutcomeStakes) outcomes;
+        mapping(uint256 outcome => OutcomeStakes) outcomes;
         // Each staker's total per outcome; zeroed when claimed or settled.
-        mapping(address staker => mapping(uint8 outcome => uint96)) userStakes;
+        mapping(address staker => mapping(uint256 outcome => uint96)) userStakes;
     }
 
     struct Universe {
@@ -225,10 +230,16 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         address indexed reporter,
         uint248 indexed universeId,
         uint256 indexed queryId,
-        uint8 outcome,
+        uint256 outcome,
         uint256 stakeAmount
     );
-    event QueryResolved(address indexed resolver, uint248 indexed universeId, uint256 indexed queryId, uint8 outcome);
+    event QueryResolved(address indexed resolver, uint248 indexed universeId, uint256 indexed queryId, uint256 outcome);
+    /// @notice A universe entered Migration: a Lituus escalation fork, or a mirrored native Zoltar fork.
+    event UniverseForked(
+        uint248 indexed universeId, uint256 indexed forkQuery, uint256 indexed zoltarQuestionId, bool isLituusFork
+    );
+    /// @notice A child universe was spawned for one outcome of a forking universe.
+    event ChildUniverseSpawned(uint248 indexed parentUniverseId, uint248 indexed childUniverseId, uint256 outcome);
     event StakeClaimed(address indexed reporter, uint248 indexed universeId, uint256 indexed queryId, uint256 payout);
     // The first correct reporter's share of the query fee, paid when the escalation game resolves.
     event ReporterRewardPaid(
@@ -265,7 +276,6 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     error ZoltarQueryCreationFailed();
     error ZoltarUniverseIsNotForking();
     error ZoltarUniverseAlreadyForking();
-    error InvalidZoltarQuestion();
     error QueryTooLong();
     error ZeroFee();
     error ExactlyOneAmountRequired();
@@ -603,13 +613,13 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * @param queryId The query being reported on.
      * @param outcome The reported outcome (1..numberOfOutcomes, or INVALID).
      */
-    function report(uint248 universeId, uint256 queryId, uint8 outcome) external nonReentrant {
+    function report(uint248 universeId, uint256 queryId, uint256 outcome) external nonReentrant {
         // Check all conditions (universe exists, query exists, outcome is valid, report is within time, etc.)
         // Reports can only be placed in an existing and active universe.
         Universe storage universe = _checkUniverseState(universeId);
 
         Query storage query = queries[queryId];
-        if (query.numberOfOutcomes == 0) revert InvalidQuery();
+        if (queryId >= queryCount) revert InvalidQuery();
 
         QueryResolution storage resolution = queryResolutions[universeId][queryId];
         if (resolution.outcome != UNRESOLVED) revert QueryAlreadyResolved();
@@ -700,8 +710,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         // Queries can only be resolved in an existing, operating or still-forming universe.
         Universe storage universe = _checkUniverseState(universeId);
 
-        Query storage query = queries[queryId];
-        if (query.numberOfOutcomes == 0) revert InvalidQuery();
+        if (queryId >= queryCount) revert InvalidQuery();
 
         QueryResolution storage resolution = queryResolutions[universeId][queryId];
         if (resolution.outcome != UNRESOLVED) revert QueryAlreadyResolved();
@@ -709,7 +718,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         uint48 queryCreateTime = resolution.queryCreateTime;
         // Stays Fresh for a record that already exists here: the live window rules below apply as-is.
         InheritedQueryKind kind = InheritedQueryKind.Fresh;
-        uint8 frozenOutcome;
+        uint256 frozenOutcome;
         uint248 recordUniverseId;
         if (queryCreateTime == 0) {
             // First touch of an inherited query here: classify it against the lineage's frozen history
@@ -778,7 +787,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         } else if (resolution.stakeCount > 0) {
             if (resolution.lastStakeTime + ONE_DAY < block.timestamp) {
                 // If there are stakes and the appeal period has passed then resolve the query with the last outcome
-                uint8 outcome = _calculateOutcomeAndEscalationPayoffs(universeId, queryId);
+                uint256 outcome = _calculateOutcomeAndEscalationPayoffs(universeId, queryId);
                 resolution.outcome = outcome;
                 emit QueryResolved(msg.sender, universeId, queryId, outcome);
             } else {
@@ -790,13 +799,9 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
             revert QueryNotReadyToResolve();
         }
 
-        if (universe.universeState == UniverseState.Active) {
-            // check if Zoltar universe is forking
-            if (ZOLTAR.getForkTime(universeId) != 0) {
-                // if Zoltar is forking, then we should mirror the fork in this universe
-                _mirrorZoltarFork(universeId);
-            }
-        }
+        // The universe is Active here (_checkUniverseState above). If its Zoltar counterpart has forked
+        // natively in the meantime, mirror that fork now, in this same tx, right after the resolution.
+        if (ZOLTAR.getForkTime(universeId) != 0) _mirrorZoltarFork(universeId);
     }
 
     /**
@@ -857,7 +862,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      */
     function _claim(uint248 universeId, uint256 queryId) internal returns (uint256 payout) {
         QueryResolution storage resolution = queryResolutions[universeId][queryId];
-        uint8 outcome = resolution.outcome;
+        uint256 outcome = resolution.outcome;
         if (outcome == UNRESOLVED) revert QueryNotResolved();
 
         uint256 amount = resolution.userStakes[msg.sender][outcome];
@@ -869,7 +874,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     }
 
     /// @dev A winning stake's payout: the stake itself plus its pro-rata share of the losing stakes after the burn cut.
-    function _winningPayout(QueryResolution storage resolution, uint8 winnerOutcome, uint256 amount)
+    function _winningPayout(QueryResolution storage resolution, uint256 winnerOutcome, uint256 amount)
         internal
         view
         returns (uint256)
@@ -1227,9 +1232,9 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * @param queryId The id of the query being resolved.
      * @return winnerOutcome The winning outcome of the resolved query.
      */
-    function _calculateOutcomeAndEscalationPayoffs(uint248 universeId, uint256 queryId) internal returns (uint8) {
+    function _calculateOutcomeAndEscalationPayoffs(uint248 universeId, uint256 queryId) internal returns (uint256) {
         QueryResolution storage resolution = queryResolutions[universeId][queryId];
-        uint8 winnerOutcome = resolution.lastReportedOutcome;
+        uint256 winnerOutcome = resolution.lastReportedOutcome;
         OutcomeStakes storage winnerStakes = resolution.outcomes[winnerOutcome];
         uint256 totalStaked = resolution.totalStaked;
         uint256 winnerOutcomeStaked = winnerStakes.totalOutcomeStaked;
@@ -1328,11 +1333,11 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * @param queryId The query to read.
      * @return The resolved outcome, or UNRESOLVED if none applies to this universe.
      */
-    function getOutcome(uint248 universeId, uint256 queryId) external view returns (uint8) {
+    function getOutcome(uint248 universeId, uint256 queryId) external view returns (uint256) {
         if (universes[universeId].universeState == UniverseState.NotExisting) revert InvalidUniverse();
         // The walk checks this universe itself first, then inherits from an ancestor or a
         // favorite-child descendant, if any.
-        if (queries[queryId].numberOfOutcomes == 0) revert InvalidQuery();
+        if (queryId >= queryCount) revert InvalidQuery();
         return _findResolution(universeId, queryId);
     }
 
@@ -1346,12 +1351,12 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * @param outcome The outcome whose side to read.
      * @return The outcome's stake total, first reporter and first report time.
      */
-    function getOutcomeStakes(uint248 universeId, uint256 queryId, uint8 outcome)
+    function getOutcomeStakes(uint248 universeId, uint256 queryId, uint256 outcome)
         external
         view
         returns (OutcomeStakes memory)
     {
-        if (queries[queryId].numberOfOutcomes == 0) revert InvalidQuery();
+        if (queryId >= queryCount) revert InvalidQuery();
         return queryResolutions[universeId][queryId].outcomes[outcome];
     }
 
@@ -1365,12 +1370,12 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * @param outcome The outcome the stake was placed on.
      * @return The staker's stake on the outcome.
      */
-    function getUserStake(uint248 universeId, uint256 queryId, address staker, uint8 outcome)
+    function getUserStake(uint248 universeId, uint256 queryId, address staker, uint256 outcome)
         external
         view
         returns (uint96)
     {
-        if (queries[queryId].numberOfOutcomes == 0) revert InvalidQuery();
+        if (queryId >= queryCount) revert InvalidQuery();
         return queryResolutions[universeId][queryId].userStakes[staker][outcome];
     }
 
@@ -1385,12 +1390,12 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * @param outcome The outcome the next report would stake on.
      * @return requiredStake The stake the next reporter must post.
      */
-    function getNextRequiredStake(uint248 universeId, uint256 queryId, uint8 outcome)
+    function getNextRequiredStake(uint248 universeId, uint256 queryId, uint256 outcome)
         external
         view
         returns (uint256 requiredStake)
     {
-        if (queries[queryId].numberOfOutcomes == 0) revert InvalidQuery();
+        if (queryId >= queryCount) revert InvalidQuery();
         Universe storage universe = _checkUniverseState(universeId);
         QueryResolution storage resolution = queryResolutions[universeId][queryId];
         if (resolution.outcome != UNRESOLVED) revert QueryAlreadyResolved();
@@ -1432,9 +1437,9 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      *      A query is resolved at most once along any single lineage, so the first match is enough.
      *      Returns UNRESOLVED if no universe on the lineage has resolved the query.
      */
-    function _findResolution(uint248 universeId, uint256 queryId) internal view returns (uint8 resolvedOutcome) {
+    function _findResolution(uint248 universeId, uint256 queryId) internal view returns (uint256 resolvedOutcome) {
         // Check the universe itself first.
-        uint8 outcome = queryResolutions[universeId][queryId].outcome;
+        uint256 outcome = queryResolutions[universeId][queryId].outcome;
         if (outcome != UNRESOLVED) {
             return outcome;
         }
@@ -1516,7 +1521,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     ///      Later stakes: the amount that brings the outcome to exactly twice the total of every other outcome,
     ///      bounded by the cap. An outcome that already holds that share cannot be staked on: it is the
     ///      outcome the last report backed.
-    function _requiredStake(QueryResolution storage resolution, uint256 fee, uint8 outcome)
+    function _requiredStake(QueryResolution storage resolution, uint256 fee, uint256 outcome)
         internal
         view
         returns (uint256 stake)
@@ -1582,22 +1587,40 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         // Fork in Zoltar. The threshold burn / pot escrow will be added later; the mock is a no-op.
         ZOLTAR.forkUniverse(universeId, zoltarQueryId);
 
-        universe.universeState = UniverseState.Migration;
-        // The moment this universe split: anchors its fork windows (consistent with Zoltar, which
-        // records the same timestamp in forkUniverse above).
-        universe.forkTime = uint48(block.timestamp);
+        Query storage query = queries[queryId];
+        // The Lituus query now has a Zoltar question: the fork question just submitted.
+        query.zoltarQuestionId = zoltarQueryId;
+
         // queryId indexes queries by count, within uint128
         // forge-lint: disable-next-line(unsafe-typecast)
         universe.forkQuery = uint128(queryId);
         universe.isLituusFork = true;
-        // The forking query's fee leaves the fee aggregate so the children don't inherit it as a resolution
-        // fee. It is paid as the fork's reporter reward when each child spawns (see _payForkReporter).
-        _consumeQueryFee(universe, queries[queryId].fee);
+        // The forking query's fee leaves the fee aggregate: every child resolves the query at spawn
+        // by writing the outcome directly, so no payoff path ever consumes this fee in any child.
+        _consumeQueryFee(universe, query.fee);
+        _enterMigration(universeId, universe, queryId, zoltarQueryId);
+    }
+
+    /**
+     * @notice The state transition shared by both fork kinds — a Lituus escalation fork and a mirrored
+     *         native Zoltar fork: the universe enters Migration, its fork clock starts, its whole pot is
+     *         parked in the Zoltar migration balance and its vault is unwrap-paused for good.
+     * @dev forkQuery and isLituusFork are the caller's to set before this runs (they differ per kind).
+     *      forkTime is Lituus time — the tx that forks or mirrors — never Zoltar's own fork time: a late
+     *      mirror must still open a full migration window, or the permanent unwrap pause would strand
+     *      every holder with the window already closed. (For a Lituus fork the two times coincide.)
+     */
+    function _enterMigration(uint248 universeId, Universe storage universe, uint256 queryId, uint256 zoltarQuestionId)
+        internal
+    {
+        universe.universeState = UniverseState.Migration;
+        universe.forkTime = uint48(block.timestamp);
         _addPotToMigrationBalance(universeId, universe);
         // Permanent: wrapped capital in a forked universe exits ONLY through the counted Lituus
         // migration lane (migrate(), and later the claim lanes) — never by unwrapping to the Zoltar
         // level. No code path ever unpauses a forked universe's vault.
         universe.repToken.setUnwrapPaused(true);
+        emit UniverseForked(universeId, queryId, zoltarQuestionId, universe.isLituusFork);
     }
 
     /**
@@ -1633,7 +1656,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     /// @dev Draws `assets` from the parked migration balance of `universeId` into the child for `outcome` and
     ///      wraps them into the child vault. Zoltar lets each child draw up to the whole parked balance, so a
     ///      draw into one child never reduces what another child can draw.
-    function _moveParkedToChild(uint248 universeId, ILituusRep childRepToken, uint8 outcome, uint256 assets)
+    function _moveParkedToChild(uint248 universeId, ILituusRep childRepToken, uint256 outcome, uint256 assets)
         internal
         returns (uint256 childShares)
     {
@@ -1650,7 +1673,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         uint248 childUniverseId,
         ILituusRep childRepToken,
         uint256 queryId,
-        uint8 outcome
+        uint256 outcome
     ) internal {
         QueryResolution storage resolution = queryResolutions[universeId][queryId];
         OutcomeStakes storage winnerStakes = resolution.outcomes[outcome];
@@ -1693,21 +1716,33 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * @notice Spawns the child universe for one outcome of a forking universe. Permissionless.
      * @dev Lazy per-child deployment: only outcomes somebody pays to spawn get a universe, and only
      *      during the 60-day fork window (use-it-or-lose-it). The outcome must be a valid outcome of
-     *      the forking query (1..numberOfOutcomes or INVALID).
+     *      the forking query: 1..numberOfOutcomes or INVALID for a Lituus fork; for a mirrored Zoltar
+     *      fork any answer Zoltar deems well-formed (categorical 0 = Invalid, 1..n; scalar encodings).
      * @param universeId The forking universe (must be in Migration).
-     * @param outcome The forking query's outcome this child stands for.
+     * @param outcome The forking query's outcome this child stands for (a Zoltar answer for a mirrored fork).
      */
-    function spawnChildUniverse(uint248 universeId, uint8 outcome) external nonReentrant {
+    function spawnChildUniverse(uint248 universeId, uint256 outcome) external nonReentrant {
         Universe storage universe = universes[universeId];
         if (universe.universeState != UniverseState.Migration) revert InvalidUniverseState();
         // The spawn window is the migration window, self-enforced by clock.
         if (block.timestamp >= uint256(universe.forkTime) + SIXTY_DAYS) revert SpawnWindowClosed();
 
         uint256 forkQueryId = universe.forkQuery;
-        uint8 numberOfOutcomes = queries[forkQueryId].numberOfOutcomes;
-        if (outcome == UNRESOLVED || (outcome > numberOfOutcomes && outcome != INVALID)) revert InvalidOutcome();
-
         // TODO: map outcomeId to Zoltar outcomes.
+        Query storage forkQuery = queries[forkQueryId];
+        uint8 numberOfOutcomes = forkQuery.numberOfOutcomes;
+        if (numberOfOutcomes != 0) {
+            // A Lituus-defined outcome set: 1..numberOfOutcomes or INVALID, keyed into Zoltar as-is.
+            // TODO (labels/mapping phase): submit real labels and map INVALID to Zoltar's Invalid (0); then
+            // Zoltar's rule below covers this branch too.
+            if (outcome == UNRESOLVED || (outcome > numberOfOutcomes && outcome != INVALID)) revert InvalidOutcome();
+        } else if (ZOLTAR_QUESTION_DATA.isMalformedAnswerOption(forkQuery.zoltarQuestionId, outcome)) {
+            // A Zoltar-defined outcome set (mirrored fork): the outcome is a Zoltar answer and Zoltar's own
+            // rule decides, categorical or scalar alike. Zoltar's deployChild re-checks it; this is only the
+            // clean revert.
+            revert InvalidOutcome();
+        }
+
         _spawnChildUniverse(universeId, forkQueryId, outcome);
     }
 
@@ -1720,11 +1755,11 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      *      Children spawn Active (fully functional immediately) and non-canonical.
      * @param universeId The parent universe forking.
      * @param queryId The forking query.
-     * @param outcome The forking query's outcome this child resolves to, and the Zoltar outcome
-     * index the child is keyed by (identity mapping).
-     * TODO: have same outcome IDs for Zoltar and Lituus
+     * @param outcome The Zoltar outcome index the child is keyed by. For a Lituus fork it is also the forking
+     * query's Lituus outcome (identity keying until the labels/mapping phase); for a mirrored fork it is a
+     * Zoltar answer, recorded as-is except Zoltar's Invalid (0), which is recorded as INVALID for now.
      */
-    function _spawnChildUniverse(uint248 universeId, uint256 queryId, uint8 outcome) internal {
+    function _spawnChildUniverse(uint248 universeId, uint256 queryId, uint256 outcome) internal {
         uint248 childUniverseId = ZOLTAR.getChildUniverseId(universeId, outcome);
         if (childUniverseId == 0) revert InvalidUniverse();
         // Never overwrite an existing universe.
@@ -1788,8 +1823,11 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         // ancestor walk
         QueryResolution storage resolution = queryResolutions[childUniverseId][queryId];
         resolution.queryCreateTime = uint48(block.timestamp);
-        resolution.outcome = outcome;
-        emit QueryResolved(msg.sender, childUniverseId, queryId, outcome);
+        // Only a Zoltar-defined outcome set lets 0 (Zoltar's Invalid) through the spawn validation.
+        // TODO: rework in the labels/mapping phase — temporary Zoltar Invalid (0) -> Lituus INVALID translation.
+        resolution.outcome = outcome == 0 ? INVALID : outcome;
+        emit QueryResolved(msg.sender, childUniverseId, queryId, resolution.outcome);
+        emit ChildUniverseSpawned(universeId, childUniverseId, outcome);
 
         // Only a Lituus fork has a forking query with stakes. Its reporter is paid here, the stakes are
         // claimed through migrateStake.
@@ -1816,20 +1854,20 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      *      child's REP, is wrapped into the child vault, and the child wREP is credited to the
      *      caller. Migration is burn-based and irreversible.
      * @param universeId The forking universe to migrate out of.
-     * @param outcome The forking query's outcome whose child to migrate into.
+     * @param outcome The forking query's outcome whose child to migrate into, as passed to spawnChildUniverse.
      * @param shares The amount of the caller's parent wREP shares to migrate.
      */
-    function migrate(uint248 universeId, uint8 outcome, uint256 shares) external nonReentrant {
+    function migrate(uint248 universeId, uint256 outcome, uint256 shares) external nonReentrant {
         Universe storage universe = universes[universeId];
         if (universe.universeState != UniverseState.Migration) revert InvalidUniverseState();
         if (!_isMigrationWindowOpen(universeId, universe)) revert MigrationWindowClosed();
 
-        // Outcome to universe index mapping (see _forkLituusUniverse).
-        // TODO: finalize the mapping after Zoltar decides on question format.
+        // The child is keyed by the outcome exactly as spawnChildUniverse keyed it.
         uint248 childUniverseId = ZOLTAR.getChildUniverseId(universeId, outcome);
         Universe storage childUniverse = universes[childUniverseId];
         // The target child must exist: spawn it first (permissionless) if this outcome has none yet.
         // TODO: maybe spawn the child universe here if needed
+        // The child is keyed by the outcome exactly as spawnChildUniverse keyed it.
         if (childUniverse.universeState == UniverseState.NotExisting) revert InvalidUniverse();
 
         // Burn the caller's parent wREP and take the underlying (pause-exempt, rate-preserving
@@ -1863,7 +1901,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * @param childOutcome The outcome whose child receives the payout. Must equal `outcome` for the forking
      * query, since no other outcome wins in that child.
      */
-    function migrateStake(uint248 universeId, uint256 queryId, uint8 outcome, uint8 childOutcome)
+    function migrateStake(uint248 universeId, uint256 queryId, uint256 outcome, uint256 childOutcome)
         external
         nonReentrant
     {
@@ -1945,61 +1983,49 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     }
 
     /**
-     * @notice Mirrors an in-progress Zoltar fork into this Multiverse, spawning the matching child universes.
-     * @dev Reentrancy-guarded external wrapper over _mirrorZoltarFork. Reverts unless this universe is
-     *      Active and its Zoltar counterpart is actually forking.
+     * @notice Mirrors a native Zoltar fork of a universe into this Multiverse. Permissionless.
+     * @dev Reentrancy-guarded wrapper over _mirrorZoltarFork; resolve() takes the same path implicitly.
+     *      Reverts unless this universe is Active and its Zoltar counterpart has forked.
      * @param universeId The universe whose Zoltar fork to mirror.
      */
     function mirrorZoltarFork(uint248 universeId) external nonReentrant {
         _mirrorZoltarFork(universeId);
     }
 
-    /// @dev Guard-free internal variant
+    /**
+     * @notice Imports a native Zoltar fork by id: the mirrored fork is a Lituus fork minus the forking-query
+     *         payouts. A Lituus query is created for the Zoltar fork question so getOutcome(child, forkQuery)
+     *         tells which branch any descendant universe stands on, exactly as for a Lituus fork.
+     * @dev The query is Zoltar-defined: numberOfOutcomes stays 0 and zoltarQuestionId is Zoltar's forkQuestionId;
+     *      its title, labels and answer validity live in ZoltarQuestionData and are never copied here. Nothing
+     *      is read from the question at mirror time, so no Zoltar fork — categorical or scalar — can fail to
+     *      mirror. Children spawn lazily through spawnChildUniverse, keyed by Zoltar answer, and each resolves
+     *      the mirrored query to its own answer at spawn. No fee: there is nothing to pay out for this query.
+     */
     function _mirrorZoltarFork(uint248 universeId) internal {
-        // TODO
-        // Check if the universe can fork (state of the universe)
-        Universe storage universe = universes[universeId];
-        if (universe.universeState != UniverseState.Active) revert InvalidUniverseState();
-        // Check if ZOLTAR universe is forking, revert if it's not forking
+        Universe storage universe = _checkUniverseState(universeId);
         if (ZOLTAR.getForkTime(universeId) == 0) revert ZoltarUniverseIsNotForking();
 
-        // Import a ZOLTAR binary fork query
-        uint256 forkQuestionId = ZOLTAR.universes(universeId).forkQuestionId;
-        IZoltarQuestionData.QuestionData memory questionData = ZOLTAR_QUESTION_DATA.questions(forkQuestionId);
-        if (questionData.endTime == 0) revert InvalidZoltarQuestion();
+        uint256 zoltarQuestionId = ZOLTAR.universes(universeId).forkQuestionId;
 
         uint256 queryId = queryCount;
-
         Query storage query = queries[queryId];
-        query.numberOfOutcomes = 2; // 1 is NO, 2 is YES (0 stays UNRESOLVED)
+        // numberOfOutcomes stays 0 (the outcome set is Zoltar's), question stays empty (the title is Zoltar's),
+        // fee stays 0 (nothing is ever paid out for this query).
         query.originUniverse = universeId;
-        query.fee = 0;
-        query.question = questionData.title;
-
-        emit QueryCreated(msg.sender, queryId, universeId, questionData.title, 2);
-
+        query.zoltarQuestionId = zoltarQuestionId;
+        // The origin's record exists from creation, as for every query. Its outcome stays UNRESOLVED: the
+        // forking universe never resolves its own fork question; its children do, each its own way.
+        queryResolutions[universeId][queryId].queryCreateTime = uint48(block.timestamp);
+        emit QueryCreated(msg.sender, queryId, universeId, "", 0);
         queryCount++;
 
-        // Park BEFORE the eager spawns: each spawn splits the fee aggregate from the balance the
-        // parking fills. (The mirrored query's own fee is 0 — nothing to exclude.)
-        _addPotToMigrationBalance(universeId, universe);
-
-        // Spawn child universes. Each child resolves the mirrored query to its own outcome, keyed
-        // by the same identity mapping migrate/spawn use (real Zoltar's binary indexes are 0-based —
-        // reconciling that is the mirror-by-id rework).
-        // TODO: lazy N-way mirror-by-id rework (later phase); binary and eager for now.
-        _spawnChildUniverse(universeId, queryId, 1);
-        _spawnChildUniverse(universeId, queryId, 2);
-        universe.universeState = UniverseState.Migration;
-        // Anchored to Lituus time (the mirror tx), NOT Zoltar's fork time: a late mirror must still
-        // open a full migration window, or the permanent unwrap pause would strand every holder
-        // with the window already closed.
-        universe.forkTime = uint48(block.timestamp);
         // queryId indexes queries by count, within uint128
         // forge-lint: disable-next-line(unsafe-typecast)
         universe.forkQuery = uint128(queryId);
-        // Permanent (see _forkLituusUniverse).
-        universe.repToken.setUnwrapPaused(true);
+        // Explicit for clarity: a mirrored fork pays nothing out for its forking query.
+        universe.isLituusFork = false;
+        _enterMigration(universeId, universe, queryId, zoltarQuestionId);
     }
 
     /* =========================================== INTERNAL HELPERS ============================================== */
@@ -2051,7 +2077,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     function _classifyInheritedQuery(uint248 universeId, uint256 queryId)
         internal
         view
-        returns (InheritedQueryKind kind, uint48 anchorCreateTime, uint8 frozenOutcome, uint248 recordUniverseId)
+        returns (InheritedQueryKind kind, uint48 anchorCreateTime, uint256 frozenOutcome, uint248 recordUniverseId)
     {
         // The genesis inherits from nowhere.
         if (universeId == GENESIS_UNIVERSE_ID) revert QueryNotInherited();

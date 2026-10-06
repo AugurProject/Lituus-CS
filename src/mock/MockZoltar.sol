@@ -27,6 +27,8 @@ contract MockZoltar is IZoltar {
     // Fork start time per universe; zero means not forking.
     mapping(uint248 universeId => uint256) public forkTimes;
     mapping(uint248 universeId => uint256) public forkQuestionIds;
+    mapping(uint248 universeId => uint248) public parentUniverseIds;
+    mapping(uint248 universeId => uint256) public forkingOutcomeIndexes;
     // Caller-keyed migration balances per parent universe (credit-only stub: the parent REP is not
     // actually locked/burned here).
     mapping(address holder => mapping(uint248 universeId => uint256)) public migrationBalances;
@@ -39,6 +41,7 @@ contract MockZoltar is IZoltar {
     error AlreadyForking();
     error InsufficientMigrationBalance();
     error UniverseNotForked();
+    error QuestionDoesNotExist();
 
     constructor(IReputationToken repToken_, IZoltarQuestionData zoltarQuestionData_, uint248 genesisUniverseId_) {
         repToken = repToken_;
@@ -72,26 +75,33 @@ contract MockZoltar is IZoltar {
     function universes(uint248 universeId) external view returns (Universe memory u) {
         u.forkTime = forkTimes[universeId];
         u.forkQuestionId = forkQuestionIds[universeId];
-        u.forkingOutcomeIndex = 0;
+        u.forkingOutcomeIndex = forkingOutcomeIndexes[universeId];
         u.reputationToken = getRepToken(universeId);
-        u.parentUniverseId = 0;
+        u.parentUniverseId = parentUniverseIds[universeId];
     }
 
     /// @dev Fork-once per universe, like real Zoltar: a second fork reverts instead of silently
-    ///      overwriting the in-progress one.
+    ///      overwriting the in-progress one. The question must exist (real Zoltar also requires it to have
+    ///      ended and burns the fork threshold; neither is modelled here).
     function forkUniverse(uint248 universeId, uint256 questionId) external {
         if (forkTimes[universeId] != 0) revert AlreadyForking();
+        if (zoltarQuestionData.questionCreatedTimestamp(questionId) == 0) revert QuestionDoesNotExist();
         forkTimes[universeId] = block.timestamp;
         forkQuestionIds[universeId] = questionId;
     }
 
     /// @dev Reverts if the child already exists, like real Zoltar: callers must check the child's
-    ///      rep token first. The child's theoretical supply snapshots to 95% of the parent's.
+    ///      rep token first. The child's theoretical supply snapshots to 95% of the parent's. No malformed-
+    ///      answer check here (real Zoltar has one): Lituus forks still key INVALID as max-uint until the
+    ///      labels/mapping phase, and the Multiverse enforces Zoltar's rule for mirrored forks itself.
     function deployChild(uint248 universeId, uint256 outcomeIndex) external {
         if (forkTimes[universeId] == 0) revert UniverseNotForked();
         uint248 childUniverseId = getChildUniverseId(universeId, outcomeIndex);
         if (address(childRepTokens[childUniverseId]) != address(0)) revert ChildAlreadyDeployed();
         childRepTokens[childUniverseId] = new MockERC20("Child Reputation", "CREP");
+        parentUniverseIds[childUniverseId] = universeId;
+        forkingOutcomeIndexes[childUniverseId] = outcomeIndex;
+        forkQuestionIds[childUniverseId] = forkQuestionIds[universeId];
         childTheoreticalSupply[childUniverseId] =
             getUniverseTheoreticalSupply(universeId) * CHILD_SUPPLY_NUMERATOR / CHILD_SUPPLY_DENOMINATOR;
     }

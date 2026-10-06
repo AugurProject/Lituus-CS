@@ -37,7 +37,7 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
         vm.prank(actors[0]);
         multiverse.createQuery(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
         address[6] memory reporters = [actors[0], actors[1], actors[2], actors[0], actors[1], actors[0]];
-        uint8[6] memory outcomes = [OUTCOME_A, OUTCOME_B, OUTCOME_C, OUTCOME_A, OUTCOME_B, OUTCOME_A];
+        uint256[6] memory outcomes = [OUTCOME_A, OUTCOME_B, OUTCOME_C, OUTCOME_A, OUTCOME_B, OUTCOME_A];
         for (uint256 i = 0; i < reporters.length; i++) {
             vm.prank(reporters[i]);
             multiverse.report(GENESIS_UID, forkQueryId, outcomes[i]);
@@ -76,7 +76,7 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
         uint256 largest;
         uint256 favoriteInflow;
         for (uint256 i = 0; i < handler.outcomesLength(); ++i) {
-            uint8 outcome = handler.outcomeAt(i);
+            uint256 outcome = handler.outcomeAt(i);
             uint248 childId = handler.childOf(outcome);
             (,,,,,,, uint128 totalIn,,,,,) = multiverse.universes(childId);
             assertEq(totalIn, handler.ghostMigratedInto(outcome));
@@ -117,7 +117,7 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
                 );
             }
         }
-        (,,,,, uint96 totalStaked,,) = multiverse.queryResolutions(GENESIS_UID, forkQueryId);
+        (,,, uint96 totalStaked,,,,) = multiverse.queryResolutions(GENESIS_UID, forkQueryId);
         assertEq(outstanding + handler.ghostPrincipalClaimed(), totalStaked);
     }
 }

@@ -50,7 +50,7 @@ contract MultiverseResolveFuzzTest is MultiverseFuzzFixtures {
         pastDeadline = bound(pastDeadline, 1, multiverse.THREE_DAYS());
         feeCtl.setFee(fee);
         uint256 queryId = _createQuery();
-        (,, uint256 chargedFee,) = multiverse.queries(queryId);
+        (,, uint256 chargedFee,,) = multiverse.queries(queryId);
 
         vm.warp(vm.getBlockTimestamp() + multiverse.THREE_DAYS() + pastDeadline);
         uint256 resolverBalanceBefore = genesisRep.balanceOf(user);
@@ -72,11 +72,11 @@ contract MultiverseResolveFuzzTest is MultiverseFuzzFixtures {
     /// reports, `resolver` resolves. The sole reporter is settled in one transfer (the bond back
     /// plus the reward ramping with the report's delay since creation); the creator's fee is spent
     /// and the resolver earns nothing on this path (unlike the no-report INVALID path).
-    function testFuzz_Resolve_SingleStake_RampAndSettlement(uint8 outcome, uint256 reportDelay, uint256 resolveDelay)
+    function testFuzz_Resolve_SingleStake_RampAndSettlement(uint256 outcome, uint256 reportDelay, uint256 resolveDelay)
         public
     {
-        // 1..3 are the query's outcomes; map the extra bucket to the INVALID marker (255).
-        outcome = uint8(bound(uint256(outcome), 1, 4));
+        // 1..3 are the query's outcomes; map the extra bucket to the INVALID marker (max-uint).
+        outcome = bound(outcome, 1, 4);
         if (outcome == 4) outcome = multiverse.INVALID();
         reportDelay = bound(reportDelay, 0, multiverse.THREE_DAYS());
         resolveDelay = bound(resolveDelay, multiverse.ONE_DAY() + 1, 365 days);
@@ -133,7 +133,7 @@ contract MultiverseResolveFuzzTest is MultiverseFuzzFixtures {
         uint256 creatorBalanceBefore = genesisRep.balanceOf(user);
         uint256 reporterBalanceBefore = genesisRep.balanceOf(reporter);
         uint256 queryId = _createQuery();
-        (,, uint256 chargedFee,) = multiverse.queries(queryId);
+        (,, uint256 chargedFee,,) = multiverse.queries(queryId);
 
         vm.warp(vm.getBlockTimestamp() + reportDelay);
         vm.prank(reporter);

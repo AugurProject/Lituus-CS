@@ -10,7 +10,7 @@ import { MultiverseFixtures } from "./Multiverse.fixtures.sol";
 /// @dev Runs against MockZoltar (unique keccak child ids, per-child REP, credit-only migration
 ///      stubs). Refunds of the other queries and SupplyRestoration are later phases and not tested here.
 contract MultiverseForkTest is MultiverseFixtures {
-    uint8 internal constant INVALID_OUTCOME = 255;
+    uint256 internal constant INVALID_OUTCOME = type(uint256).max;
     // On the fixture ladder the two capped outcomes are the only ones staked, so the losing side of the cap
     // is the other cap: a winner's payout in its own child is its 32 plus 80% of 32.
     uint256 internal constant WINNER_PAYOUT = 32 ether + 32 ether * 4 / 5;
@@ -25,7 +25,7 @@ contract MultiverseForkTest is MultiverseFixtures {
     {
         uint256 i = 0;
         while (true) {
-            uint8 outcome = i % 2 == 0 ? OUTCOME_A : OUTCOME_B;
+            uint256 outcome = i % 2 == 0 ? OUTCOME_A : OUTCOME_B;
             triggerStake = multiverse.getNextRequiredStake(universeId, queryId, outcome);
             vm.prank(i % 2 == 0 ? reporterA : reporterB);
             multiverse.report(universeId, queryId, outcome);
@@ -79,7 +79,7 @@ contract MultiverseForkTest is MultiverseFixtures {
     }
 
     /// @dev How much the mock has minted into `outcome`'s child from the parked balance of `universeId`.
-    function _drawnIntoChild(uint248 universeId, uint8 outcome) internal view returns (uint256) {
+    function _drawnIntoChild(uint248 universeId, uint256 outcome) internal view returns (uint256) {
         return zoltar.splitPerChild(address(multiverse), universeId, outcome);
     }
 
@@ -126,6 +126,10 @@ contract MultiverseForkTest is MultiverseFixtures {
         // counted Lituus migration/claim lanes. Zoltar-side fork started in the same tx.
         assertTrue(genesisRep.unwrapPaused());
         assertEq(zoltar.getForkTime(GENESIS_UID), vm.getBlockTimestamp());
+        // The forking query is linked to the Zoltar question the fork was submitted on.
+        (,,,, uint256 zoltarQuestionId) = multiverse.queries(queryId);
+        assertTrue(zoltarQuestionId != 0);
+        assertEq(zoltarQuestionId, zoltar.forkQuestionIds(GENESIS_UID));
         // The forking universe itself still reads UNRESOLVED (it never resolves the query locally).
         assertEq(multiverse.getOutcome(GENESIS_UID, queryId), 0);
 
@@ -145,7 +149,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         // was not mirrored yet. The Lituus fork-trigger report — the one that would land the
         // second outcome on the cap — must revert cleanly instead of hitting Zoltar's own revert.
         (uint256 queryId,) = _createLadderToCap();
-        zoltar.forkUniverse(GENESIS_UID, 424_242);
+        _forkZoltarNatively(_createZoltarCategoricalQuestion(2));
 
         vm.prank(user);
         vm.expectRevert(Multiverse.ZoltarUniverseAlreadyForking.selector);
@@ -571,13 +575,13 @@ contract MultiverseForkTest is MultiverseFixtures {
     function _resolutionIn(uint248 universeId, uint256 queryId) internal view returns (ResolutionView memory r) {
         (
             r.queryCreateTime,
-            r.outcome,
             r.lastStakeTime,
-            r.lastReportedOutcome,
             r.stakeCount,
             r.totalStaked,
+            r.noOfOutcomesAtCap,
             r.cap,
-            r.noOfOutcomesAtCap
+            r.outcome,
+            r.lastReportedOutcome
         ) = multiverse.queryResolutions(universeId, queryId);
     }
 
@@ -1025,7 +1029,7 @@ contract MultiverseForkTest is MultiverseFixtures {
     }
 
     function test_QueryFlow_SettledLadderWithInvalidOutcome() public {
-        // INVALID (255) is an ordinary frozen outcome: a ladder whose last report was INVALID and
+        // INVALID (max-uint) is an ordinary frozen outcome: a ladder whose last report was INVALID and
         // whose appeal lapsed before the fork settles every child to INVALID.
         uint256 settledQueryId = _createDefaultQuery();
         _report(user, settledQueryId, OUTCOME_A);
@@ -1183,7 +1187,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         // challenger A 16 (A at the cap, fork): user holds 4 on A and 24 on B, challenger 28 on A and 8 on B.
         uint256 queryId = _createDefaultQuery();
         address[7] memory reporters = [user, challenger, user, challenger, challenger, user, challenger];
-        uint8[7] memory outcomes = [OUTCOME_A, OUTCOME_B, OUTCOME_A, OUTCOME_B, OUTCOME_A, OUTCOME_B, OUTCOME_A];
+        uint256[7] memory outcomes = [OUTCOME_A, OUTCOME_B, OUTCOME_A, OUTCOME_B, OUTCOME_A, OUTCOME_B, OUTCOME_A];
         for (uint256 i = 0; i < reporters.length; i++) {
             vm.prank(reporters[i]);
             multiverse.report(GENESIS_UID, queryId, outcomes[i]);
@@ -1216,7 +1220,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         // (A at the cap, fork): C never reached the cap but holds bystander's 6. Total 70.
         uint256 queryId = _createDefaultQuery();
         address[6] memory reporters = [user, challenger, bystander, user, challenger, user];
-        uint8[6] memory outcomes = [OUTCOME_A, OUTCOME_B, OUTCOME_C, OUTCOME_A, OUTCOME_B, OUTCOME_A];
+        uint256[6] memory outcomes = [OUTCOME_A, OUTCOME_B, OUTCOME_C, OUTCOME_A, OUTCOME_B, OUTCOME_A];
         for (uint256 i = 0; i < reporters.length; i++) {
             vm.prank(reporters[i]);
             multiverse.report(GENESIS_UID, queryId, outcomes[i]);

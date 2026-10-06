@@ -19,12 +19,12 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
     uint256 internal constant MAX_LADDER_FEE = 0.1 ether;
     uint256 internal constant MAX_LADDER_STEPS = 256;
     uint256 internal constant EXTRA_REPORTER_BALANCE = 500 ether;
-    uint8 internal constant INVALID_OUTCOME = 255;
+    uint256 internal constant INVALID_OUTCOME = type(uint256).max;
 
     address internal reporterTwo = makeAddr("reporterTwo");
     address[3] internal reporters;
     // The forking query's outcome set: three valid outcomes plus INVALID.
-    uint8[4] internal outcomes;
+    uint256[4] internal outcomes;
 
     function setUp() public override {
         super.setUp();
@@ -40,7 +40,7 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
         outcomes = [1, 2, 3, INVALID_OUTCOME];
     }
 
-    function _childId(uint8 outcome) internal view returns (uint248) {
+    function _childId(uint256 outcome) internal view returns (uint248) {
         return zoltar.getChildUniverseId(GENESIS_UID, outcome);
     }
 
@@ -89,7 +89,7 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
     /// @dev A forking query stake's payout in its child, from the parent record: the stake plus the return
     ///      the capped outcomes get, 80% of everything above the cap over the cap. The same in every child.
     function _expectedChildPayout(uint256 queryId, uint256 amount) internal view returns (uint256) {
-        (,,,,, uint96 totalStaked, uint96 cap,) = multiverse.queryResolutions(GENESIS_UID, queryId);
+        (,,, uint96 totalStaked,, uint96 cap,,) = multiverse.queryResolutions(GENESIS_UID, queryId);
         uint256 losers = uint256(totalStaked) - cap;
         uint256 distributable = losers - losers / multiverse.BURN_DIVIDER();
         return amount + amount * distributable / cap;
@@ -104,7 +104,7 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
         feeCtl.setFee(fee);
 
         (uint256 queryId, uint256[4][3] memory staked) = _buildRandomForkingLadder(seed);
-        (,,,,, uint96 totalStaked,,) = multiverse.queryResolutions(GENESIS_UID, queryId);
+        (,,, uint96 totalStaked,,,,) = multiverse.queryResolutions(GENESIS_UID, queryId);
         uint256 parked = zoltar.getMigrationRepBalance(address(multiverse), GENESIS_UID);
         (,,,,,,,,,,,, uint128 unmigratedBefore) = multiverse.universes(GENESIS_UID);
         assertEq(unmigratedBefore, parked);

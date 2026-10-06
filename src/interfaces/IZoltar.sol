@@ -56,4 +56,8 @@ interface IZoltarQuestionData {
         returns (uint256);
 
     function questions(uint256 questionId) external view returns (QuestionData memory);
+
+    function questionCreatedTimestamp(uint256 questionId) external view returns (uint256);
+
+    function isMalformedAnswerOption(uint256 questionId, uint256 answer) external view returns (bool);
 }
