@@ -1567,7 +1567,8 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         uint256 zoltarQueryId = ZOLTAR_QUESTION_DATA.createQuestion(questionData, outcomes);
         if (zoltarQueryId == 0) revert ZoltarQueryCreationFailed();
 
-        // Fork in Zoltar. The threshold burn / pot escrow will be added later; the mock is a no-op.
+        // Fork in Zoltar: it burns the fork threshold from this contract's REP and credits it back to our
+        // migration balance net of the burn haircut.
         ZOLTAR.forkUniverse(universeId, zoltarQueryId);
 
         universe.universeState = UniverseState.Migration;

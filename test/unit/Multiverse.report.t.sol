@@ -533,11 +533,12 @@ contract MultiverseReportTest is MultiverseFixtures {
     function test_RevertWhen_InsufficientAllowance() public {
         uint256 queryId = _createDefaultQuery();
         address noAllowance = makeAddr("noAllowance");
-        // Fund with REP but do NOT approve the multiverse to spend it.
-        underlying.mint(noAllowance, USER_REP_BALANCE);
+        // Fund with REP from the genesis pool but do NOT approve the multiverse to spend it.
+        uint256 amount = 100 ether;
+        underlying.transfer(noAllowance, amount);
         vm.startPrank(noAllowance);
         underlying.approve(address(genesisRep), type(uint256).max);
-        multiverse.wrap(GENESIS_UID, USER_REP_BALANCE, 0);
+        multiverse.wrap(GENESIS_UID, amount, 0);
         vm.expectRevert();
         multiverse.report(GENESIS_UID, queryId, OUTCOME_A);
         vm.stopPrank();

@@ -20,6 +20,12 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
     uint256 internal forkQueryId;
     uint256 internal parkedAtFork;
 
+    /// @dev 3200 ether (the actors' balances plus a 200 ether pool remainder) so the per-outcome cap is
+    ///      32 ether and the default fee sits on the cap grid, like the functional suites.
+    function _genesisSupply() internal pure override returns (uint256) {
+        return ACTOR_COUNT * ACTOR_REP_BALANCE + 200 ether;
+    }
+
     function setUp() public override {
         super.setUp();
 
@@ -27,9 +33,6 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
             actors.push(makeAddr(string.concat("actor", vm.toString(i))));
             _fundWithRep(actors[i], ACTOR_REP_BALANCE);
         }
-        // Top the supply up to 3200 ether so the per-outcome cap is 32 ether and the default fee sits on
-        // the cap grid, like the functional suites.
-        underlying.mint(address(this), 200 ether);
         assertEq(_capWrep(), 32 * DEFAULT_FEE);
 
         // actor0 and actor1 alternate A and B to the cap, actor2 holds a stake on C that never gets there.

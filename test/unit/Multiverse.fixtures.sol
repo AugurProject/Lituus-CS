@@ -12,12 +12,15 @@ import { MockZoltar } from "src/mock/MockZoltar.sol";
 import { MockZoltarQuestionData } from "src/mock/MockZoltarQuestionData.sol";
 import { MockQueryFeeController } from "src/mock/MockQueryFeeController.sol";
 
-/// @notice Protocol deployment fixture: mocks + Multiverse wired at START_TIME, no funding.
-/// @dev The bottom fixture layer. It deploys the protocol and nothing else — balances are the
+/// @notice Protocol deployment fixture: mocks + Multiverse wired at START_TIME, no actor funding.
+/// @dev The bottom fixture layer. It deploys the protocol and nothing else — actor balances are the
 ///      responsibility of the layers (or suites) above, so a suite's economics can never drift
-///      because an unrelated suite changed the shared funding. Suites that need a different fee
-///      controller override `_deployFeeController` (and `_afterProtocolDeploy` for post-wiring)
-///      instead of rewriting the deployment.
+///      because an unrelated suite changed the shared funding. The one economic input it needs is
+///      the genesis REP supply (`_genesisSupply`), minted to this contract as a pool BEFORE the
+///      Zoltar mock is deployed: like real Zoltar, the mock snapshots the genesis supply once at
+///      construction, and genesis REP is never minted afterwards — actors are funded from the pool.
+///      Suites that need a different fee controller override `_deployFeeController` (and
+///      `_afterProtocolDeploy` for post-wiring) instead of rewriting the deployment.
 abstract contract MultiverseDeployFixture is Test {
     // Nonzero on purpose: Lituus universe ids mirror Zoltar universe ids, and a nonzero genesis
     // catches any code path that wrongly assumes the genesis universe lives at id 0.
@@ -97,11 +100,15 @@ abstract contract MultiverseDeployFixture is Test {
         (fee,,) = multiverse.getMintPricing(GENESIS_UID);
     }
 
-    /// @dev Deploys the protocol at START_TIME. Funds nothing.
+    /// @dev The genesis REP supply the layer pins; every REP an actor ever holds comes out of it.
+    function _genesisSupply() internal view virtual returns (uint256);
+
+    /// @dev Deploys the protocol at START_TIME with the genesis supply pooled here. Funds no actor.
     function setUp() public virtual {
         vm.warp(START_TIME);
 
         underlying = new MockERC20("Underlying", "U");
+        underlying.mint(address(this), _genesisSupply());
         zoltarQuestionData = new MockZoltarQuestionData();
         zoltar = new MockZoltar(IReputationToken(address(underlying)), zoltarQuestionData, GENESIS_UID);
         IQueryFeeController controller = _deployFeeController();
@@ -130,9 +137,10 @@ abstract contract MultiverseDeployFixture is Test {
         return new Multiverse(zoltar, GENESIS_UID, controller, queryTokenizerStub);
     }
 
-    /// @dev Funding tool (not invoked here): mint underlying, wrap into REP, approve the multiverse.
+    /// @dev Funding tool (not invoked here): hand out underlying from the genesis pool, wrap into REP,
+    ///      approve the multiverse.
     function _fundWithRep(address account, uint256 amount) internal {
-        underlying.mint(account, amount);
+        underlying.transfer(account, amount);
         vm.startPrank(account);
         underlying.approve(address(genesisRep), type(uint256).max);
         genesisRep.approve(address(multiverse), type(uint256).max);
@@ -161,16 +169,19 @@ abstract contract MultiverseDeployFixture is Test {
 ///      actors with enough REP; suites with economic assumptions (stress, spikes) must NOT inherit
 ///      this layer — they extend MultiverseDeployFixture and pin their own economy.
 abstract contract MultiverseFixtures is MultiverseDeployFixture {
+    /// @dev 3200 ether: the three actors' balances plus a 200 ether remainder in the pool, so the per-outcome
+    ///      cap is 32 ether = 2^5 * DEFAULT_FEE: the default fee then sits exactly on the cap grid, the first
+    ///      stake equals the fee, and every ladder amount in these suites is a whole multiple of it.
+    function _genesisSupply() internal view virtual override returns (uint256) {
+        return 3 * USER_REP_BALANCE + 200 ether;
+    }
+
     function setUp() public virtual override {
         super.setUp();
 
         _fundWithRep(user, USER_REP_BALANCE);
         _fundWithRep(bystander, USER_REP_BALANCE);
         _fundWithRep(challenger, USER_REP_BALANCE);
-        // Top the supply up to 3200 ether so the per-outcome cap is 32 ether = 2^5 * DEFAULT_FEE: the default
-        // fee then sits exactly on the cap grid, the first stake equals the fee, and every ladder amount in
-        // these suites is a whole multiple of it.
-        underlying.mint(address(this), 200 ether);
         assertEq(_capWrep(), 32 * DEFAULT_FEE, "fixture supply must put the default fee on the cap grid");
     }
 
