@@ -6,7 +6,7 @@ import { IReputationToken } from "../interfaces/IReputationToken.sol";
 import { MockERC20 } from "./MockERC20.sol";
 
 contract MockZoltar is IZoltar {
-    uint256 constant FORK_THRESHOLD_DIVISOR = 20; // 5% of total supply atm
+    uint256 constant FORK_THRESHOLD_DIVISOR = 50; // 2% of total supply atm
     // Reference Zoltar's forkBurnDivisor (its minimum): the fork initiator's whole threshold is
     // burned, and all but this fraction of it is credited back to their migration balance. The
     // net burn is threshold / FORK_BURN_DIVISOR = 1% of the supply atm.
