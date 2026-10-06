@@ -238,6 +238,14 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     event ResolverRewardPaid(
         address indexed resolver, uint248 indexed universeId, uint256 indexed queryId, uint256 amount
     );
+    // A stake claimed out of a forked universe into one of its children, paid in the child's wREP.
+    event StakeMigrated(
+        address indexed staker,
+        uint248 indexed universeId,
+        uint248 indexed childUniverseId,
+        uint256 queryId,
+        uint256 assets
+    );
 
     /* ================================================= ERRORS ================================================== */
     error ZeroAddress();
@@ -268,6 +276,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     error ParentForkNotResolved();
     error QueryNotResolved();
     error NothingToClaim();
+    error NotAWinningOutcome();
     error InvalidClaimBatch();
     error OnlyQueryTokenizer();
 
@@ -800,7 +809,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      */
     function claim(uint248 universeId, uint256 queryId) external nonReentrant {
         // Only while the universe is Active: once it forks, the whole pot is parked in the Zoltar
-        // migration balance and claims become claim-and-migrate into a child.
+        // migration balance and stakes are claimed into a child through migrateStake.
         Universe storage universe = _checkUniverseState(universeId);
         uint256 payout = _claim(universeId, queryId);
 
@@ -856,10 +865,31 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         // Zeroed is the settled flag, set before any transfer happens in the callers.
         resolution.userStakes[msg.sender][outcome] = 0;
 
-        uint256 winnerStaked = resolution.outcomes[outcome].totalOutcomeStaked;
+        payout = _winningPayout(resolution, outcome, amount);
+    }
+
+    /// @dev A winning stake's payout: the stake itself plus its pro-rata share of the losing stakes after the burn cut.
+    function _winningPayout(QueryResolution storage resolution, uint8 winnerOutcome, uint256 amount)
+        internal
+        view
+        returns (uint256)
+    {
+        uint256 winnerStaked = resolution.outcomes[winnerOutcome].totalOutcomeStaked;
         uint256 totalLoserStakes = resolution.totalStaked - winnerStaked;
         uint256 totalDistributable = totalLoserStakes - totalLoserStakes / BURN_DIVIDER;
-        payout = amount + amount * totalDistributable / winnerStaked;
+        return amount + amount * totalDistributable / winnerStaked;
+    }
+
+    /// @dev A forking query stake's payout in the child of its outcome. Every child pays the same return: the
+    ///      one the outcomes at the cap would get, which is the lowest of all. The outcomes at the cap hold
+    ///      exactly `cap` each and nothing holds more, so their losing side is `totalStaked - cap`. A smaller
+    ///      outcome gets the same multiplier instead of the whole of the other outcomes, and the rest of its
+    ///      losing side is never drawn from the parked balance.
+    function _forkPayout(QueryResolution storage resolution, uint256 amount) internal view returns (uint256) {
+        uint256 cap = resolution.cap;
+        uint256 totalLoserStakes = resolution.totalStaked - cap;
+        uint256 totalDistributable = totalLoserStakes - totalLoserStakes / BURN_DIVIDER;
+        return amount + amount * totalDistributable / cap;
     }
 
     /* ========================================== QUERY FEE EXTERNALS ============================================ */
@@ -1560,8 +1590,8 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         // forge-lint: disable-next-line(unsafe-typecast)
         universe.forkQuery = uint128(queryId);
         universe.isLituusFork = true;
-        // The forking query's fee leaves the fee aggregate: every child resolves the query at spawn
-        // by writing the outcome directly, so no payoff path ever consumes this fee in any child.
+        // The forking query's fee leaves the fee aggregate so the children don't inherit it as a resolution
+        // fee. It is paid as the fork's reporter reward when each child spawns (see _payForkReporter).
         _consumeQueryFee(universe, queries[queryId].fee);
         _addPotToMigrationBalance(universeId, universe);
         // Permanent: wrapped capital in a forked universe exits ONLY through the counted Lituus
@@ -1598,6 +1628,65 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         uint128 totalQueryFees = universe.totalQueryFees;
         // forge-lint: disable-next-line(unsafe-typecast)
         universe.totalQueryFees = fee >= totalQueryFees ? 0 : totalQueryFees - uint128(fee);
+    }
+
+    /// @dev Draws `assets` from the parked migration balance of `universeId` into the child for `outcome` and
+    ///      wraps them into the child vault. Zoltar lets each child draw up to the whole parked balance, so a
+    ///      draw into one child never reduces what another child can draw.
+    function _moveParkedToChild(uint248 universeId, ILituusRep childRepToken, uint8 outcome, uint256 assets)
+        internal
+        returns (uint256 childShares)
+    {
+        ZOLTAR.splitMigrationRep(universeId, assets, outcome);
+        childShares = childRepToken.wrap(address(this), assets);
+    }
+
+    /// @dev Pays the forking query's reporter reward in a newly spawned child. The child resolves the query to
+    ///      `outcome`, so the parent's first reporter of that outcome earned the fee ramp there, paid in child
+    ///      wREP from the parked balance. Nothing is paid if nobody staked on `outcome`. The unpaid part of the
+    ///      fee is never drawn, so it is effectively burned in the child.
+    function _payForkReporter(
+        uint248 universeId,
+        uint248 childUniverseId,
+        ILituusRep childRepToken,
+        uint256 queryId,
+        uint8 outcome
+    ) internal {
+        QueryResolution storage resolution = queryResolutions[universeId][queryId];
+        OutcomeStakes storage winnerStakes = resolution.outcomes[outcome];
+        address reporter = winnerStakes.firstReporter;
+        if (reporter == address(0)) return;
+
+        // Ramps to the full fee over the reporting window, like the non-fork resolution.
+        uint256 reporterPay =
+            _timeBasedFeeShare(queries[queryId].fee, winnerStakes.firstReportTime - resolution.queryCreateTime);
+        if (reporterPay == 0) return;
+
+        uint256 assets = universes[universeId].repToken.convertToAssets(reporterPay);
+        uint256 childShares = _moveParkedToChild(universeId, childRepToken, outcome, assets);
+        childRepToken.safeTransfer(reporter, childShares);
+
+        emit ReporterRewardPaid(reporter, childUniverseId, queryId, childShares);
+    }
+
+    /// @dev Records `assets` of REP moving out of a forking universe into one of its children through a counted
+    ///      lane: the parent's outflow (the electorate at the end of migration), the child's inflow, and the
+    ///      running max that designates the fork's leader.
+    function _countMigration(
+        Universe storage universe,
+        Universe storage childUniverse,
+        uint248 childUniverseId,
+        uint256 assets
+    ) internal {
+        // Asset amounts are REP amounts within uint128.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        universe.totalMigratedOut += uint128(assets);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        childUniverse.totalMigratedIn += uint128(assets);
+        if (childUniverse.totalMigratedIn > universe.maxMigratedOut) {
+            universe.maxMigratedOut = childUniverse.totalMigratedIn;
+            universe.favoriteChild = childUniverseId;
+        }
     }
 
     /**
@@ -1689,8 +1778,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         // single-spend voting capital — totalQueryFees is their ledger.
         uint256 feeAssets = parentUniverse.repToken.convertToAssets(parentUniverse.totalQueryFees);
         if (feeAssets > 0) {
-            ZOLTAR.splitMigrationRep(universeId, feeAssets, outcome);
-            uint256 feeShares = childUniverseRepToken.wrap(address(this), feeAssets);
+            uint256 feeShares = _moveParkedToChild(universeId, childUniverseRepToken, outcome, feeAssets);
             // Share amounts are REP amounts within uint128.
             // forge-lint: disable-next-line(unsafe-typecast)
             childUniverse.totalQueryFees = uint128(feeShares);
@@ -1703,9 +1791,20 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         resolution.outcome = outcome;
         emit QueryResolved(msg.sender, childUniverseId, queryId, outcome);
 
+        // Only a Lituus fork has a forking query with stakes. Its reporter is paid here, the stakes are
+        // claimed through migrateStake.
         if (parentUniverse.isLituusFork) {
-            // TODO: fork payouts
+            _payForkReporter(universeId, childUniverseId, childUniverseRepToken, queryId, outcome);
         }
+    }
+
+    /// @dev Whether a forking universe still takes migrations into its children. The window closes 60 days
+    ///      after the fork, but not before the parent's own fork is resolved: a nested fork cannot finish
+    ///      migrating while the parent is still migrating.
+    function _isMigrationWindowOpen(uint248 universeId, Universe storage universe) internal view returns (bool) {
+        bool isParentForkResolved =
+            universeId == GENESIS_UNIVERSE_ID || universes[universe.parent].universeState == UniverseState.PostFork;
+        return block.timestamp < uint256(universe.forkTime) + SIXTY_DAYS || !isParentForkResolved;
     }
 
     /**
@@ -1723,17 +1822,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     function migrate(uint248 universeId, uint8 outcome, uint256 shares) external nonReentrant {
         Universe storage universe = universes[universeId];
         if (universe.universeState != UniverseState.Migration) revert InvalidUniverseState();
-
-        // The forking window is closed if the migration stage is over (60 days passed)
-        // and the parent fork is resolved (PostFork). The parent migration phase must end first,
-        // and then the nested fork can finish migration.
-        // TODO: make a getter for universe state
-        Universe storage parentUniverse = universes[universe.parent];
-        bool isParentForkResolved =
-            universeId == GENESIS_UNIVERSE_ID || parentUniverse.universeState == UniverseState.PostFork;
-        if ((block.timestamp >= uint256(universe.forkTime) + SIXTY_DAYS) && isParentForkResolved) {
-            revert MigrationWindowClosed();
-        }
+        if (!_isMigrationWindowOpen(universeId, universe)) revert MigrationWindowClosed();
 
         // Outcome to universe index mapping (see _forkLituusUniverse).
         // TODO: finalize the mapping after Zoltar decides on question format.
@@ -1753,17 +1842,72 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         uint256 childShares = childUniverse.repToken.wrap(address(this), assets);
         childUniverse.repToken.safeTransfer(msg.sender, childShares);
 
-        // Count the vote in underlying assets (what actually flowed through Lituus). The parent's
-        // outflow total is the live electorate measure: the 2/3 denominator and the SR max supply.
+        // Count the vote in underlying assets (what actually flowed through Lituus).
+        _countMigration(universe, childUniverse, childUniverseId, assets);
+    }
+
+    /**
+     * @notice Claims the caller's stake on the forking query out of a forked universe, into the child that
+     *         resolves the query to that outcome. In the child for outcome X the query is resolved to X, so a
+     *         stake on X is a winning stake there: it comes back with the return every child pays (see
+     *         _forkPayout), in the child's wREP.
+     * @dev The stake record stays in the parent; the payout is drawn from the parked migration balance, which
+     *      Zoltar tracks per child, so the one record pays each child's winners from that child's own copy.
+     *      Zeroing the stake before any transfer makes it claimable once, and since the outcome fixes the
+     *      child, into one child only. Only the claimed principal counts as a migration vote for the child;
+     *      the winnings on top of it are paid in every child and do not vote. Open for as long as migrate()
+     *      is: the vote is counted, so it cannot land after the fork is resolved.
+     * @param universeId The forked universe the stake was placed in.
+     * @param queryId The query the stake was placed on. Only the forking query is accepted for now.
+     * @param outcome The outcome the caller staked on.
+     * @param childOutcome The outcome whose child receives the payout. Must equal `outcome` for the forking
+     * query, since no other outcome wins in that child.
+     */
+    function migrateStake(uint248 universeId, uint256 queryId, uint8 outcome, uint8 childOutcome)
+        external
+        nonReentrant
+    {
+        Universe storage universe = universes[universeId];
+        if (universe.universeState != UniverseState.Migration) revert InvalidUniverseState();
+        if (!_isMigrationWindowOpen(universeId, universe)) revert MigrationWindowClosed();
+
+        uint248 childUniverseId = ZOLTAR.getChildUniverseId(universeId, childOutcome);
+        Universe storage childUniverse = universes[childUniverseId];
+        // The target child must exist: spawn it first (permissionless) if this outcome has none yet.
+        if (childUniverse.universeState == UniverseState.NotExisting) revert InvalidUniverse();
+
+        // TODO: winnings of queries resolved before the fork, settled ladders and refunds of voided
+        // ladders go through this path too.
+        if (queryId != universe.forkQuery) revert InvalidQuery();
+        // The child resolves the forking query to its own outcome, so only that outcome wins there.
+        if (outcome != childOutcome) revert NotAWinningOutcome();
+
+        QueryResolution storage resolution = queryResolutions[universeId][queryId];
+        uint256 amount = resolution.userStakes[msg.sender][outcome];
+        if (amount == 0) revert NothingToClaim();
+        // Zeroed is the settled flag, set before any transfer.
+        resolution.userStakes[msg.sender][outcome] = 0;
+
+        uint256 payout = _forkPayout(resolution, amount);
+
+        // Both amounts are parent shares. The parent rate is frozen since the fork, so they convert to the
+        // same assets whenever the claim happens.
+        ILituusRep repToken = universe.repToken;
+        uint256 assets = repToken.convertToAssets(payout);
+        uint256 principalAssets = repToken.convertToAssets(amount);
+
+        ILituusRep childRepToken = childUniverse.repToken;
+        uint256 childShares = _moveParkedToChild(universeId, childRepToken, childOutcome, assets);
+        childRepToken.safeTransfer(msg.sender, childShares);
+
+        // Only the principal leaves the parked supply and counts as a migration vote for the child. The
+        // winnings on top of it are paid in every child, so they never vote.
         // Asset amounts are REP amounts within uint128.
         // forge-lint: disable-next-line(unsafe-typecast)
-        universe.totalMigratedOut += uint128(assets);
-        // forge-lint: disable-next-line(unsafe-typecast)
-        childUniverse.totalMigratedIn += uint128(assets);
-        if (childUniverse.totalMigratedIn > universe.maxMigratedOut) {
-            universe.maxMigratedOut = childUniverse.totalMigratedIn;
-            universe.favoriteChild = childUniverseId;
-        }
+        universe.unmigratedSupply -= uint128(principalAssets);
+        _countMigration(universe, childUniverse, childUniverseId, principalAssets);
+
+        emit StakeMigrated(msg.sender, universeId, childUniverseId, queryId, assets);
     }
 
     /**
