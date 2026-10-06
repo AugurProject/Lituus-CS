@@ -15,6 +15,11 @@ import { MultiverseDeployFixture } from "./Multiverse.fixtures.sol";
 /// @dev Mirrors the contract's integer operations (same order, same floors), so expected values are
 ///      derived from scenario parameters instead of being hardcoded.
 abstract contract QueryFeeTestHelpers is MultiverseDeployFixture {
+    /// @dev The single funded payer holds the whole supply; the stress suite pins a larger one.
+    function _genesisSupply() internal view virtual override returns (uint256) {
+        return USER_REP_BALANCE;
+    }
+
     /// @dev Warps to window `window` with `elapsed` seconds of it gone by.
     function _warpToWindow(uint256 window, uint256 elapsed) internal {
         vm.warp(multiverse.GENESIS_TIMESTAMP() + window * multiverse.THREE_DAYS() + elapsed);
@@ -459,6 +464,10 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
 ///      always affordable, since the single payer holds the entire supply.
 contract MultiverseQueryFeeStressTest is QueryFeeTestHelpers {
     uint256 internal constant STRESS_SUPPLY = 2000 ether;
+
+    function _genesisSupply() internal pure override returns (uint256) {
+        return STRESS_SUPPLY;
+    }
 
     function setUp() public override {
         super.setUp();

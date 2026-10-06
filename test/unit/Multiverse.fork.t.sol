@@ -2,6 +2,7 @@
 pragma solidity ^0.8.35;
 
 import { Multiverse } from "src/Multiverse.sol";
+import { LituusRep } from "src/LituusRep.sol";
 import { ILituusRep } from "src/interfaces/ILituusRep.sol";
 import { MultiverseFixtures } from "./Multiverse.fixtures.sol";
 
@@ -11,9 +12,12 @@ import { MultiverseFixtures } from "./Multiverse.fixtures.sol";
 ///      stubs). Refunds of the other queries and SupplyRestoration are later phases and not tested here.
 contract MultiverseForkTest is MultiverseFixtures {
     uint256 internal constant INVALID_OUTCOME = type(uint256).max;
+    // The fork bond Zoltar takes on the fixture supply (2% of 3200 ether) and what it keeps of it (a fifth).
+    uint256 internal constant FORK_BOND = 64 ether;
+    uint256 internal constant FORK_BURN = FORK_BOND / 5;
     // On the fixture ladder the two capped outcomes are the only ones staked, so the losing side of the cap
-    // is the other cap: a winner's payout in its own child is its 32 plus 80% of 32.
-    uint256 internal constant WINNER_PAYOUT = 32 ether + 32 ether * 4 / 5;
+    // is the other cap less what Zoltar burned: a winner's payout in its own child is its 32 plus 32 - 12.8.
+    uint256 internal constant WINNER_PAYOUT = 32 ether + (32 ether - FORK_BURN);
 
     /// @dev Escalates a query in `universeId` until the fork fires (the second outcome reaches the
     ///      per-outcome cap inside report()), alternating OUTCOME_A/OUTCOME_B from
@@ -90,6 +94,10 @@ contract MultiverseForkTest is MultiverseFixtures {
     /* ============================================= FORK TRIGGER ============================================= */
 
     function test_Fork_TriggersAtSecondOutcomeAtCapInsideReport() public {
+        // Read before the trigger: the fork burn lowers the supply the threshold and the cap derive from.
+        uint256 forkThreshold = zoltar.getForkThreshold(GENESIS_UID);
+        uint256 capBefore = _capWrep();
+        uint256 supplyBefore = underlying.totalSupply();
         (uint256 queryId, uint256 triggerStake) = _forkGenesis();
 
         // The forking universe enters Migration with its split moment recorded in forkTime.
@@ -117,7 +125,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         // A total is cap/2, so the trigger rung is exactly cap/2.
         ResolutionView memory r = _resolution(queryId);
         assertEq(r.noOfOutcomesAtCap, 2);
-        assertEq(r.cap, _capWrep());
+        assertEq(r.cap, capBefore);
         assertEq(multiverse.getOutcomeStakes(GENESIS_UID, queryId, OUTCOME_A).totalOutcomeStaked, r.cap);
         assertEq(multiverse.getOutcomeStakes(GENESIS_UID, queryId, OUTCOME_B).totalOutcomeStaked, r.cap);
         assertEq(r.totalStaked, 2 * r.cap);
@@ -133,15 +141,77 @@ contract MultiverseForkTest is MultiverseFixtures {
         // The forking universe itself still reads UNRESOLVED (it never resolves the query locally).
         assertEq(multiverse.getOutcome(GENESIS_UID, queryId), 0);
 
-        // The whole pot parked: the contract's entire wREP holding (the forking query's fee + all
-        // its stakes; rate is 1 here so assets == shares) moved into the Zoltar migration balance
-        // and is recorded as unmigratedSupply. Parent-side value is no longer withdrawable.
+        // The whole pot left the vault: the contract's entire wREP holding (the forking query's fee + all
+        // its stakes; rate is 1 here so assets == shares) is recorded as unmigratedSupply at face value.
+        // Zoltar took the fork bond out of it and credited it back less its burn, the rest was parked
+        // on top, so the migration balance is the pot net of the burn, and the burn sits on the forking
+        // query's record for the payouts. Parent-side value is no longer withdrawable.
         assertEq(genesisRep.balanceOf(address(multiverse)), 0);
+        assertEq(underlying.balanceOf(address(multiverse)), 0);
+        assertEq(forkThreshold, FORK_BOND);
+        assertEq(forkThreshold / zoltar.FORK_BURN_DIVISOR(), FORK_BURN);
         assertEq(unmigratedSupply, r.totalStaked + DEFAULT_FEE);
-        assertEq(zoltar.getMigrationRepBalance(address(multiverse), GENESIS_UID), unmigratedSupply);
+        assertEq(zoltar.getMigrationRepBalance(address(multiverse), GENESIS_UID), unmigratedSupply - FORK_BURN);
+        assertEq(r.forkBurn, FORK_BURN);
+        assertEq(underlying.totalSupply(), supplyBefore - (r.totalStaked + DEFAULT_FEE));
         // The forking query's own fee is excluded from the fee aggregate (no payoff path ever
         // consumes it in a child — its resolution is pre-written at spawn); it stays parked.
         assertEq(totalQueryFees, 0);
+    }
+
+    function test_Fork_TwoCapsCoverTheBondWhenTheRateIsNotOne() public {
+        // A resolve before the fork burns a fifth of its losing side: the rate is above 1 from here on and 1%
+        // and 2% of the supply no longer convert to whole numbers of shares.
+        uint256 earlierQueryId = _createDefaultQuery();
+        _report(user, earlierQueryId, OUTCOME_A);
+        _report(challenger, earlierQueryId, OUTCOME_B);
+        _warpPastAppealWindow(earlierQueryId);
+        vm.prank(bystander);
+        multiverse.resolve(GENESIS_UID, earlierQueryId);
+        assertGt(genesisRep.rate(), LituusRep(address(genesisRep)).SCALE());
+        uint256 supply = zoltar.getUniverseTheoreticalSupply(GENESIS_UID);
+        uint256 forkThreshold = zoltar.getForkThreshold(GENESIS_UID);
+        uint256 bondShares = genesisRep.convertToSharesUp(forkThreshold);
+        // Rounded down, two caps would fall a wei or two short of the bond and the fork could never fire.
+        assertLt(2 * genesisRep.convertToShares(supply / multiverse.CAP_DIVISOR()), bondShares);
+
+        (uint256 queryId,) = _forkGenesis();
+        assertEq(uint8(_universeState(GENESIS_UID)), uint8(Multiverse.UniverseState.Migration));
+
+        // The cap is rounded up, so the two outcomes at the cap hold the bond in shares, and the fee on top of
+        // them covers it in REP with room to spare.
+        ResolutionView memory r = _resolution(queryId);
+        assertEq(r.cap, genesisRep.convertToSharesUp(supply / multiverse.CAP_DIVISOR()));
+        assertEq(r.totalStaked, 2 * r.cap);
+        assertGe(r.totalStaked, bondShares);
+        assertGe(genesisRep.convertToAssets(r.totalStaked) + DEFAULT_FEE, forkThreshold);
+
+        // Zoltar got its bond out of the whole pot, kept its burn, and the rest is parked; nothing stays here.
+        assertEq(underlying.balanceOf(address(multiverse)), 0);
+        assertEq(genesisRep.balanceOf(address(multiverse)), 0);
+        uint256 burn = forkThreshold / zoltar.FORK_BURN_DIVISOR();
+        assertEq(r.forkBurn, genesisRep.convertToSharesUp(burn));
+        assertEq(zoltar.getMigrationRepBalance(address(multiverse), GENESIS_UID), _unmigratedSupply(GENESIS_UID) - burn);
+
+        // The payout math holds at this rate too: both winners are paid in full from their child's copy. The
+        // child vault starts at the parent's rate, so the payout comes back as the same number of child
+        // shares, less the rounding of the two conversions.
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_B);
+        ILituusRep child1Rep = multiverse.repTokenOf(_childId(GENESIS_UID, OUTCOME_A));
+        ILituusRep child2Rep = multiverse.repTokenOf(_childId(GENESIS_UID, OUTCOME_B));
+        uint256 payoutShares = r.cap + (r.totalStaked - r.cap - r.forkBurn);
+        uint256 payoutAssets = genesisRep.convertToAssets(payoutShares);
+        vm.prank(user);
+        multiverse.migrateStake(GENESIS_UID, queryId, OUTCOME_A, OUTCOME_A);
+        vm.prank(challenger);
+        multiverse.migrateStake(GENESIS_UID, queryId, OUTCOME_B, OUTCOME_B);
+        assertEq(child1Rep.balanceOf(user), child1Rep.convertToShares(payoutAssets));
+        assertEq(child2Rep.balanceOf(challenger), child2Rep.convertToShares(payoutAssets));
+        assertApproxEqAbs(child1Rep.balanceOf(user), payoutShares, 1);
+        uint256 parked = zoltar.getMigrationRepBalance(address(multiverse), GENESIS_UID);
+        assertLe(_drawnIntoChild(GENESIS_UID, OUTCOME_A), parked);
+        assertLe(_drawnIntoChild(GENESIS_UID, OUTCOME_B), parked);
     }
 
     function test_Fork_RevertsWhenZoltarUniverseAlreadyForking() public {
@@ -580,6 +650,7 @@ contract MultiverseForkTest is MultiverseFixtures {
             r.totalStaked,
             r.noOfOutcomesAtCap,
             r.cap,
+            r.forkBurn,
             r.outcome,
             r.lastReportedOutcome
         ) = multiverse.queryResolutions(universeId, queryId);
@@ -1055,7 +1126,8 @@ contract MultiverseForkTest is MultiverseFixtures {
         ILituusRep child1Rep = multiverse.repTokenOf(child1);
         ILituusRep child2Rep = multiverse.repTokenOf(child2);
 
-        // user staked A: a winner in the A child, paid its stake plus 80% of B's stakes in child1 wREP.
+        // user staked A: a winner in the A child, paid its stake plus B's stakes less the fork burn, in
+        // child1 wREP.
         vm.expectEmit(true, true, true, true);
         emit Multiverse.StakeMigrated(user, GENESIS_UID, child1, forkQueryId, WINNER_PAYOUT);
         vm.prank(user);
@@ -1172,7 +1244,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         vm.prank(user);
         multiverse.migrateStake(GENESIS_UID, forkQueryId, OUTCOME_A, OUTCOME_A);
 
-        // The 32 ether principal moved from parked to counted; the 25.6 ether of winnings did not vote.
+        // The 32 ether principal moved from parked to counted; the 19.2 ether of winnings did not vote.
         (,,,,, uint248 favoriteChild,,, uint128 maxOut,, uint128 totalOut,,) = multiverse.universes(GENESIS_UID);
         (,,,,,,, uint128 totalIn,,,,,) = multiverse.universes(child1);
         assertEq(totalOut, 32 ether);
@@ -1202,14 +1274,14 @@ contract MultiverseForkTest is MultiverseFixtures {
         uint248 child1 = _childId(GENESIS_UID, OUTCOME_A);
         uint248 child2 = _childId(GENESIS_UID, OUTCOME_B);
 
-        // Each side's winners share 32 + 0.8 * 32 pro rata: in child A user holds 4/32 of the winning
-        // stakes, in child B 24/32.
+        // Each side's winners share 32 + (32 - 12.8) pro rata, a return of 60%: in child A user holds 4/32 of
+        // the winning stakes, in child B 24/32.
         vm.prank(user);
         multiverse.migrateStake(GENESIS_UID, queryId, OUTCOME_A, OUTCOME_A);
-        assertEq(multiverse.repTokenOf(child1).balanceOf(user), 4 ether + 4 ether * 4 / 5);
+        assertEq(multiverse.repTokenOf(child1).balanceOf(user), 4 ether + 4 ether * 3 / 5);
         vm.prank(user);
         multiverse.migrateStake(GENESIS_UID, queryId, OUTCOME_B, OUTCOME_B);
-        assertEq(multiverse.repTokenOf(child2).balanceOf(user), 24 ether + 24 ether * 4 / 5);
+        assertEq(multiverse.repTokenOf(child2).balanceOf(user), 24 ether + 24 ether * 3 / 5);
         // Nothing is left of either stake.
         assertEq(multiverse.getUserStake(GENESIS_UID, queryId, user, OUTCOME_A), 0);
         assertEq(multiverse.getUserStake(GENESIS_UID, queryId, user, OUTCOME_B), 0);
@@ -1229,23 +1301,28 @@ contract MultiverseForkTest is MultiverseFixtures {
         assertEq(multiverse.getUserStake(GENESIS_UID, queryId, bystander, OUTCOME_C), 6 ether);
 
         // Anyone can spawn the C child; there the query resolved to C and both capped sides lost. Every
-        // child pays the capped outcomes' return: 80% of (70 - 32) over 32, so 6 earns 5.7, not 80% of 64.
+        // child pays the capped outcomes' return: (70 - 32 - 12.8) over 32, so 6 earns 4.725, not the 64 of
+        // A and B.
         vm.prank(bystander);
         multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_C);
         uint248 child3 = _childId(GENESIS_UID, OUTCOME_C);
         vm.prank(bystander);
         multiverse.migrateStake(GENESIS_UID, queryId, OUTCOME_C, OUTCOME_C);
-        uint256 cappedReturn = 6 ether * (38 ether * 4 / 5) / 32 ether;
+        uint256 cappedReturn = 6 ether * (38 ether - FORK_BURN) / 32 ether;
         assertEq(multiverse.repTokenOf(child3).balanceOf(bystander), 6 ether + cappedReturn);
-        assertEq(cappedReturn, 5.7 ether);
+        assertEq(cappedReturn, 4.725 ether);
         // The rest of A and B stays parked: the C child drew only the payout.
         assertEq(_drawnIntoChild(GENESIS_UID, OUTCOME_C), 6 ether + cappedReturn);
 
-        // The capped sides earn the same return on their 32: 32 + 30.4 each, in their own child.
+        // The capped sides earn the same return on their 32: 32 + 25.2 each, in their own child, which is
+        // exactly what the parked balance can pay once the burn is gone.
         multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_B);
         vm.prank(challenger);
         multiverse.migrateStake(GENESIS_UID, queryId, OUTCOME_B, OUTCOME_B);
-        assertEq(multiverse.repTokenOf(_childId(GENESIS_UID, OUTCOME_B)).balanceOf(challenger), 32 ether + 30.4 ether);
+        assertEq(multiverse.repTokenOf(_childId(GENESIS_UID, OUTCOME_B)).balanceOf(challenger), 32 ether + 25.2 ether);
+        assertLe(
+            _drawnIntoChild(GENESIS_UID, OUTCOME_B), zoltar.getMigrationRepBalance(address(multiverse), GENESIS_UID)
+        );
 
         // In the A child the C stake is a losing one.
         multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);

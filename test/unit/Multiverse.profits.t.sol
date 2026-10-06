@@ -35,6 +35,10 @@ contract MultiverseProfitsTest is MultiverseDeployFixture {
         return Multiverse(address(harness));
     }
 
+    function _genesisSupply() internal pure override returns (uint256) {
+        return USER_REP_BALANCE;
+    }
+
     function setUp() public override {
         super.setUp();
 

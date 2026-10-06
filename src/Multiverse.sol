@@ -114,11 +114,12 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     }
 
     /// @dev Escalation state of a query in one universe. The first five fields share a storage slot: every
-    ///      report touches it (`noOfOutcomesAtCap` only when an outcome reaches the cap). `cap` takes the next
-    ///      slot and is written at the first report only. Outcomes are full words — categorical outcomes and
-    ///      Zoltar's packed scalar answers share one uint256 domain — so `outcome` and `lastReportedOutcome`
-    ///      take a slot each; a report writes `lastReportedOutcome` and the shared slot. wREP amounts are
-    ///      bounded by the REP max supply (100M * 1e18), comfortably within uint96.
+    ///      report touches it (`noOfOutcomesAtCap` only when an outcome reaches the cap). `cap` and `forkBurn`
+    ///      share the next slot: the cap is written at the first report only, the burn once, in the fork tx, and
+    ///      the fork payouts read both together. Outcomes are full words — categorical outcomes and Zoltar's
+    ///      packed scalar answers share one uint256 domain — so `outcome` and `lastReportedOutcome` take a slot
+    ///      each; a report writes `lastReportedOutcome` and the shared slot. wREP amounts are bounded by the REP
+    ///      max supply (100M * 1e18), comfortably within uint96.
     struct QueryResolution {
         // The time the query first became reportable in this universe.
         // Set on createQuery in the origin universe and lazily on the first report() in heir universes
@@ -132,9 +133,13 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         uint96 totalStaked;
         // Number of outcomes whose total has reached `cap`. The second one triggers the fork.
         uint8 noOfOutcomesAtCap;
-        // Per-outcome stake ceiling: 1% of the universe's REP supply, converted to wREP shares and frozen at
-        // the first report so the whole ladder is measured against one grid.
+        // Per-outcome stake ceiling: 1% of the universe's REP supply, converted to wREP shares (rounded up, see
+        // _capShares) and frozen at the first report so the whole ladder is measured against one grid.
         uint96 cap;
+        // Forking query only: what Zoltar kept of the fork bond, in wREP shares at the parent's rate. It comes
+        // off the losing side before the stakes are paid out in the children (see _forkPayout). Set in the fork
+        // tx, zero on every other query.
+        uint96 forkBurn;
         // The resolved outcome. 0 means UNRESOLVED.
         uint256 outcome;
         // The outcome of the latest stake. Wins the query if the appeal window lapses unchallenged.
@@ -181,11 +186,13 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         // funding inherited queries' resolutions there; the counter carries recursively.
         uint128 totalQueryFees;
         // The supply for migration at fork, in underlying assets: the contract's entire wREP balance (fees,
-        // forking-query stakes, other stakes/winnings), moved into the Zoltar migration balance in
-        // the fork tx. Written once. Supply committed to the child level but not yet realized as
-        // counted migration — SR max supply = totalMigratedOut + unmigratedSupply. Future
-        // stake-claims move value across (parked -> counted); fee splits move neither (per-world
-        // duplicated copies). Kept locally: Zoltar's balance would include foreign flows.
+        // forking-query stakes, other stakes/winnings) as it stood before the fork, moved into the Zoltar
+        // migration balance in the fork tx less what Zoltar kept of the fork bond (recorded on the forking
+        // query's record as forkBurn). Written once. Supply committed to the child level but not yet
+        // realized as counted migration — SR max supply = totalMigratedOut + unmigratedSupply, less that
+        // burn. Future stake-claims move value across (parked -> counted) at face value, which is why the
+        // burned part stays in here; fee splits move neither (per-world duplicated copies). Kept locally:
+        // Zoltar's balance would include foreign flows.
         uint128 unmigratedSupply;
     }
 
@@ -407,9 +414,14 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     }
 
     /// @dev The per-outcome stake cap in wREP shares: 1% of the universe's REP supply at the vault's current rate.
-    ///      Read once, at a query's first report, and frozen in `QueryResolution.cap`.
+    ///      Read once, at a query's first report, and frozen in `QueryResolution.cap`. Rounded up: two outcomes
+    ///      at the cap are the fork bond Zoltar takes (2% of the supply), and the bond is converted to shares
+    ///      rounded up as well. Rounding the cap down would leave the two caps a wei or two short of the bond
+    ///      whenever the rate is not exactly 1, and the fork could never fire. The cap is a ceiling, not an
+    ///      amount anyone is owed, so the extra wei costs nobody anything. The rate only ever rises, so the bond
+    ///      in shares at fork time is never above what it was when the cap was frozen.
     function _capShares(ILituusRep repToken, uint248 universeId) internal view returns (uint256) {
-        return repToken.convertToShares(ZOLTAR.getUniverseTheoreticalSupply(universeId) / CAP_DIVISOR);
+        return repToken.convertToSharesUp(ZOLTAR.getUniverseTheoreticalSupply(universeId) / CAP_DIVISOR);
     }
 
     /* ============================================= WRAP FUNCTIONS ============================================== */
@@ -885,15 +897,16 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         return amount + amount * totalDistributable / winnerStaked;
     }
 
-    /// @dev A forking query stake's payout in the child of its outcome. Every child pays the same return: the
-    ///      one the outcomes at the cap would get, which is the lowest of all. The outcomes at the cap hold
-    ///      exactly `cap` each and nothing holds more, so their losing side is `totalStaked - cap`. A smaller
-    ///      outcome gets the same multiplier instead of the whole of the other outcomes, and the rest of its
-    ///      losing side is never drawn from the parked balance.
+    /// @dev A forking query stake's payout in the child of its outcome. Nothing is burned at the Lituus level in
+    ///      a fork: what Zoltar kept of the fork bond is the burn, and it comes off the losing side. Every child
+    ///      pays the same return, the one the outcomes at the cap get, which is the lowest of all. The outcomes
+    ///      at the cap hold exactly `cap` each and nothing holds more, so their losing side is
+    ///      `totalStaked - cap`. A smaller outcome gets the same multiplier instead of the whole of the other
+    ///      outcomes, and the rest of its losing side is never drawn from the parked balance. The burn is at
+    ///      most a fifth of the bond, which is two caps, so it never exceeds the losing side.
     function _forkPayout(QueryResolution storage resolution, uint256 amount) internal view returns (uint256) {
         uint256 cap = resolution.cap;
-        uint256 totalLoserStakes = resolution.totalStaked - cap;
-        uint256 totalDistributable = totalLoserStakes - totalLoserStakes / BURN_DIVIDER;
+        uint256 totalDistributable = resolution.totalStaked - cap - resolution.forkBurn;
         return amount + amount * totalDistributable / cap;
     }
 
@@ -1584,8 +1597,21 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         uint256 zoltarQueryId = ZOLTAR_QUESTION_DATA.createQuestion(questionData, outcomes);
         if (zoltarQueryId == 0) revert ZoltarQueryCreationFailed();
 
-        // Fork in Zoltar. The threshold burn / pot escrow will be added later; the mock is a no-op.
+        // Fork in Zoltar. It burns the fork bond from this contract's REP and credits most of it back to our
+        // migration balance, so the whole pot is unwrapped first. The bond is two caps (2% of the supply) and
+        // the forking query holds exactly that in its two outcomes at the cap (see _capShares), with its fee
+        // on top, so the REP in hand always covers it. The threshold is read before the burn lowers the supply
+        // it is derived from.
+        ILituusRep repToken = universe.repToken;
+        uint256 potAssets = repToken.migrateOut(address(this), repToken.balanceOf(address(this)));
+        uint256 forkThreshold = ZOLTAR.getForkThreshold(universeId);
         ZOLTAR.forkUniverse(universeId, zoltarQueryId);
+        // Nothing was parked before the fork, so the balance is what Zoltar credited back. The rest of the bond
+        // is gone for good; it comes off the forking query's losing side when the stakes are paid out in the
+        // children (see _forkPayout). Share amounts are bounded by the REP max supply, within uint96.
+        uint256 zoltarBurn = forkThreshold - ZOLTAR.getMigrationRepBalance(address(this), universeId);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        queryResolutions[universeId][queryId].forkBurn = uint96(repToken.convertToSharesUp(zoltarBurn));
 
         Query storage query = queries[queryId];
         // The Lituus query now has a Zoltar question: the fork question just submitted.
@@ -1595,10 +1621,10 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         // forge-lint: disable-next-line(unsafe-typecast)
         universe.forkQuery = uint128(queryId);
         universe.isLituusFork = true;
-        // The forking query's fee leaves the fee aggregate: every child resolves the query at spawn
-        // by writing the outcome directly, so no payoff path ever consumes this fee in any child.
+        // The forking query's fee leaves the fee aggregate so the children don't inherit it as a resolution
+        // fee. It is paid as the fork's reporter reward when each child spawns (see _payForkReporter).
         _consumeQueryFee(universe, query.fee);
-        _enterMigration(universeId, universe, queryId, zoltarQueryId);
+        _enterMigration(universeId, universe, queryId, zoltarQueryId, potAssets - forkThreshold, zoltarBurn);
     }
 
     /**
@@ -1609,13 +1635,21 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      *      forkTime is Lituus time — the tx that forks or mirrors — never Zoltar's own fork time: a late
      *      mirror must still open a full migration window, or the permanent unwrap pause would strand
      *      every holder with the window already closed. (For a Lituus fork the two times coincide.)
+     *      `unwrappedAssets` is REP the caller already unwrapped and still holds here (for a Lituus fork, the
+     *      pot left after the bond) and `zoltarBurn` what Zoltar kept of the bond; both are zero for a
+     *      mirrored fork.
      */
-    function _enterMigration(uint248 universeId, Universe storage universe, uint256 queryId, uint256 zoltarQuestionId)
-        internal
-    {
+    function _enterMigration(
+        uint248 universeId,
+        Universe storage universe,
+        uint256 queryId,
+        uint256 zoltarQuestionId,
+        uint256 unwrappedAssets,
+        uint256 zoltarBurn
+    ) internal {
         universe.universeState = UniverseState.Migration;
         universe.forkTime = uint48(block.timestamp);
-        _addPotToMigrationBalance(universeId, universe);
+        _addPotToMigrationBalance(universeId, universe, unwrappedAssets, zoltarBurn);
         // Permanent: wrapped capital in a forked universe exits ONLY through the counted Lituus
         // migration lane (migrate(), and later the claim lanes) — never by unwrapping to the Zoltar
         // level. No code path ever unpauses a forked universe's vault.
@@ -1627,20 +1661,28 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * @notice Parks the contract's entire wREP holding of a forking universe in the Zoltar
      *         migration balance: query fees, the forking query's pot, and all other stakes and
      *         unclaimed winnings. Runs once, in the fork tx.
-     * @dev From here every path to this value is a "second part" of a migration — minting into a
-     *      child universe (fee splits at spawn now; per-stake claims/refunds in the claims phase).
-     *      Nothing is ever withdrawable on the parent side again. The parked total is recorded in
-     *      unmigratedSupply: SR max supply = totalMigratedOut + unmigratedSupply.
+     * @dev `unwrappedAssets` is REP already unwrapped and still held here (the pot left after the fork
+     *      bond for a Lituus fork, zero for a mirrored one) and `zoltarBurn` what Zoltar kept of the
+     *      bond. From here every path to this value is a "second part" of a migration — minting into
+     *      a child universe (fee splits at spawn now; per-stake claims/refunds in the claims phase).
+     *      Nothing is ever withdrawable on the parent side again. unmigratedSupply records the pot as
+     *      it stood before the fork, parked plus burned: stake claims take their principal out of it
+     *      at face value, so it has to carry the burned part too. SR max supply = totalMigratedOut +
+     *      unmigratedSupply, less the burn kept on the forking query's record.
      */
-    function _addPotToMigrationBalance(uint248 universeId, Universe storage universe) internal {
+    function _addPotToMigrationBalance(
+        uint248 universeId,
+        Universe storage universe,
+        uint256 unwrappedAssets,
+        uint256 zoltarBurn
+    ) internal {
         uint256 potShares = universe.repToken.balanceOf(address(this));
-        if (potShares > 0) {
-            uint256 potAssets = universe.repToken.migrateOut(address(this), potShares);
-            ZOLTAR.addRepToMigrationBalance(universeId, potAssets);
-            // Asset amounts are REP amounts within uint128.
-            // forge-lint: disable-next-line(unsafe-typecast)
-            universe.unmigratedSupply = uint128(potAssets);
-        }
+        if (potShares > 0) unwrappedAssets += universe.repToken.migrateOut(address(this), potShares);
+        if (unwrappedAssets > 0) ZOLTAR.addRepToMigrationBalance(universeId, unwrappedAssets);
+        // Nothing was parked before the fork, so the balance is the pot net of the burn.
+        // Asset amounts are REP amounts within uint128.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        universe.unmigratedSupply = uint128(ZOLTAR.getMigrationRepBalance(address(this), universeId) + zoltarBurn);
     }
 
     /// @dev Marks a query's fee consumed in this universe's fee aggregate. Saturating: the
@@ -2025,7 +2067,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         universe.forkQuery = uint128(queryId);
         // Explicit for clarity: a mirrored fork pays nothing out for its forking query.
         universe.isLituusFork = false;
-        _enterMigration(universeId, universe, queryId, zoltarQuestionId);
+        _enterMigration(universeId, universe, queryId, zoltarQuestionId, 0, 0);
     }
 
     /* =========================================== INTERNAL HELPERS ============================================== */

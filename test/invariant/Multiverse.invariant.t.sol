@@ -25,6 +25,11 @@ contract MultiverseInvariantTest is MultiverseDeployFixture {
 
     MultiverseHandler internal handler;
 
+    /// @dev The handler plus every actor holds HANDLER_REP_BALANCE; nothing stays in the pool.
+    function _genesisSupply() internal pure override returns (uint256) {
+        return (ACTOR_COUNT + 1) * HANDLER_REP_BALANCE;
+    }
+
     function setUp() public override {
         super.setUp();
 

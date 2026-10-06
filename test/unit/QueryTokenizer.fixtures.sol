@@ -21,7 +21,7 @@ abstract contract QueryTokenizerFixtures is MultiverseFixtures {
     // that aligns the fee with the cap grid), so MockZoltar's fork threshold is 3200 / 20 = 160 REP.
     // Half of it — the cap on both the tokenizer's mint price and the direct-path query fee — is
     // the single derivation every cap assertion builds on.
-    uint256 internal constant HALF_FORK_THRESHOLD = 80 ether;
+    uint256 internal constant HALF_FORK_THRESHOLD = 32 ether;
 
     QueryTokenizer internal tokenizer;
 

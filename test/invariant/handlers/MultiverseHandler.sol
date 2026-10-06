@@ -113,7 +113,7 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
 
     /// @dev The time of the latest stake on a query, read off the resolution record.
     function _lastStakeTime(uint256 queryId) internal view returns (uint256 lastStakeTime) {
-        (, lastStakeTime,,,,,,) = MULTIVERSE.queryResolutions(GENESIS_UID, queryId);
+        (, lastStakeTime,,,,,,,) = MULTIVERSE.queryResolutions(GENESIS_UID, queryId);
     }
 
     /// @notice Report on an existing query as a random actor, with a valid outcome that differs
@@ -152,6 +152,13 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
         } catch {
             return;
         }
+
+        // A stake that lands the second outcome on the cap forks the universe inside report(), and every
+        // later call on the genesis would revert. The fork flow has its own suite; this ladder stops one
+        // step short of it.
+        (,,,, uint8 outcomesAtCap, uint96 cap,,,) = MULTIVERSE.queryResolutions(GENESIS_UID, queryId);
+        uint256 outcomeStaked = MULTIVERSE.getOutcomeStakes(GENESIS_UID, queryId, outcome).totalOutcomeStaked;
+        if (outcomesAtCap == 1 && outcomeStaked + requiredStake == cap) return;
 
         address actor = actors[bound(actorSeed, 0, actors.length - 1)];
         // Affordability guard: a pathological sequence of deep ladders could outrun an actor's

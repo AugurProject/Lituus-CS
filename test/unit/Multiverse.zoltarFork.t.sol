@@ -3,6 +3,7 @@ pragma solidity ^0.8.35;
 
 import { Multiverse } from "src/Multiverse.sol";
 import { ILituusRep } from "src/interfaces/ILituusRep.sol";
+import { MockERC20 } from "src/mock/MockERC20.sol";
 import { MultiverseFixtures } from "./Multiverse.fixtures.sol";
 
 /// @notice Mirroring native Zoltar forks (mirror-by-id): the entry points (auto-mirror in resolve(), the
@@ -294,6 +295,8 @@ contract MultiverseZoltarForkTest is MultiverseFixtures {
         // A nested native fork of the winner, mirrored in turn: its children inherit the first mirrored
         // answer through the ancestor walk and answer the second question themselves.
         uint256 zq2 = _createZoltarCategoricalQuestion(2);
+        // Zoltar burns the fork threshold from the initiator, so this contract needs child2 REP in hand.
+        MockERC20(address(zoltar.childRepTokens(child2))).mint(address(this), zoltar.getForkThreshold(child2));
         zoltar.forkUniverse(child2, zq2);
         vm.prank(bystander);
         multiverse.mirrorZoltarFork(child2);

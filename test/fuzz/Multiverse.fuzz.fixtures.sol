@@ -15,14 +15,18 @@ abstract contract MultiverseFuzzFixtures is MultiverseDeployFixture {
     // exactly what resolve() pays the caller.
     address internal resolver = makeAddr("resolver");
 
+    /// @dev 3200 ether (two actors' balances plus a 1200 ether pool remainder) so the per-outcome cap is
+    ///      32 ether = 2^5 * DEFAULT_FEE: the default fee sits exactly on the cap grid and the first stake
+    ///      equals the fee.
+    function _genesisSupply() internal view virtual override returns (uint256) {
+        return 2 * USER_REP_BALANCE + 1200 ether;
+    }
+
     function setUp() public virtual override {
         super.setUp();
 
         _fundWithRep(user, USER_REP_BALANCE);
         _fundWithRep(reporter, USER_REP_BALANCE);
-        // Top the supply up to 3200 ether so the per-outcome cap is 32 ether = 2^5 * DEFAULT_FEE: the default
-        // fee sits exactly on the cap grid and the first stake equals the fee.
-        underlying.mint(address(this), 1200 ether);
         assertEq(_capWrep(), 32 * DEFAULT_FEE, "fuzz supply must put the default fee on the cap grid");
     }
 
