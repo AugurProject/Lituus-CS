@@ -5,11 +5,15 @@ import { Multiverse } from "src/Multiverse.sol";
 import { ILituusRep } from "src/interfaces/ILituusRep.sol";
 import { MultiverseFixtures } from "./Multiverse.fixtures.sol";
 
-/// @notice Minimal forking flow: trigger inside report(), lazy spawn, migration voting, resolution.
+/// @notice Minimal forking flow: trigger inside report(), lazy spawn, migration voting, resolution, and
+///         the forking query's payouts in the children.
 /// @dev Runs against MockZoltar (unique keccak child ids, per-child REP, credit-only migration
-///      stubs). Payouts, refunds, and SupplyRestoration are later phases and not tested here.
+///      stubs). Refunds of the other queries and SupplyRestoration are later phases and not tested here.
 contract MultiverseForkTest is MultiverseFixtures {
     uint8 internal constant INVALID_OUTCOME = 255;
+    // On the fixture ladder both capped outcomes hold exactly the cap, so a winner's payout in its own
+    // child is the cap plus 80% of the other side.
+    uint256 internal constant WINNER_PAYOUT = 32 ether + 32 ether * 4 / 5;
 
     /// @dev Escalates a query in `universeId` until the fork fires (the second outcome reaches the
     ///      per-outcome cap inside report()), alternating OUTCOME_A/OUTCOME_B from
@@ -61,6 +65,26 @@ contract MultiverseForkTest is MultiverseFixtures {
 
     function _universeState(uint248 universeId) internal view returns (Multiverse.UniverseState state) {
         (, state,,,,,,,,,,,) = multiverse.universes(universeId);
+    }
+
+    /// @dev Forks the genesis on a fresh default query and spawns the OUTCOME_A and OUTCOME_B children
+    ///      without placing any migration vote, so the parent's counters stay at zero for the stake
+    ///      claim tests to read.
+    function _forkGenesisAndSpawn() internal returns (uint256 forkQueryId, uint248 child1, uint248 child2) {
+        (forkQueryId,) = _forkGenesis();
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_B);
+        child1 = _childId(GENESIS_UID, OUTCOME_A);
+        child2 = _childId(GENESIS_UID, OUTCOME_B);
+    }
+
+    /// @dev How much the mock has minted into `outcome`'s child from the parked balance of `universeId`.
+    function _drawnIntoChild(uint248 universeId, uint8 outcome) internal view returns (uint256) {
+        return zoltar.splitPerChild(address(multiverse), universeId, outcome);
+    }
+
+    function _unmigratedSupply(uint248 universeId) internal view returns (uint128 supply) {
+        (,,,,,,,,,,,, supply) = multiverse.universes(universeId);
     }
 
     /* ============================================= FORK TRIGGER ============================================= */
@@ -1018,5 +1042,245 @@ contract MultiverseForkTest is MultiverseFixtures {
         multiverse.resolve(child1, settledQueryId);
         assertEq(multiverse.getOutcome(child1, settledQueryId), INVALID_OUTCOME);
         assertEq(_totalQueryFees(child1), 0);
+    }
+
+    /* ============================================= FORK PAYOUTS ============================================= */
+
+    function test_MigrateStake_PaysWinnerInItsOutcomesChild() public {
+        (uint256 forkQueryId, uint248 child1, uint248 child2) = _forkGenesisAndSpawn();
+        ILituusRep child1Rep = multiverse.repTokenOf(child1);
+        ILituusRep child2Rep = multiverse.repTokenOf(child2);
+
+        // user staked A: a winner in the A child, paid its stake plus 80% of B's stakes in child1 wREP.
+        vm.expectEmit(true, true, true, true);
+        emit Multiverse.StakeMigrated(user, GENESIS_UID, child1, forkQueryId, WINNER_PAYOUT);
+        vm.prank(user);
+        multiverse.migrateStake(GENESIS_UID, forkQueryId, OUTCOME_A, OUTCOME_A);
+        assertEq(child1Rep.balanceOf(user), WINNER_PAYOUT);
+        // The parent record is settled for this (staker, outcome).
+        assertEq(multiverse.getUserStake(GENESIS_UID, forkQueryId, user, OUTCOME_A), 0);
+
+        // challenger staked B: the same record pays it in the B child, from that child's own copy of the pot.
+        vm.prank(challenger);
+        multiverse.migrateStake(GENESIS_UID, forkQueryId, OUTCOME_B, OUTCOME_B);
+        assertEq(child2Rep.balanceOf(challenger), WINNER_PAYOUT);
+
+        // Each child drew its payout independently, and neither exceeded the parked balance.
+        uint256 parked = zoltar.getMigrationRepBalance(address(multiverse), GENESIS_UID);
+        assertLe(_drawnIntoChild(GENESIS_UID, OUTCOME_A), parked);
+        assertLe(_drawnIntoChild(GENESIS_UID, OUTCOME_B), parked);
+    }
+
+    function test_MigrateStake_RevertsForTheLosingOutcomeOfAChild() public {
+        (uint256 forkQueryId,,) = _forkGenesisAndSpawn();
+
+        // In the B child the query resolved to B: an A stake lost there and cannot be paid into it.
+        vm.prank(user);
+        vm.expectRevert(Multiverse.NotAWinningOutcome.selector);
+        multiverse.migrateStake(GENESIS_UID, forkQueryId, OUTCOME_A, OUTCOME_B);
+    }
+
+    function test_MigrateStake_Reverts() public {
+        uint256 openQueryId = _createDefaultQuery();
+        uint256 forkQueryId = _createDefaultQuery();
+
+        // Not forked: the parent's own claim() is the lane.
+        vm.prank(user);
+        vm.expectRevert(Multiverse.InvalidUniverseState.selector);
+        multiverse.migrateStake(GENESIS_UID, forkQueryId, OUTCOME_A, OUTCOME_A);
+
+        _escalateToFork(GENESIS_UID, forkQueryId, user, challenger);
+
+        // The target child must be spawned first.
+        vm.prank(user);
+        vm.expectRevert(Multiverse.InvalidUniverse.selector);
+        multiverse.migrateStake(GENESIS_UID, forkQueryId, OUTCOME_A, OUTCOME_A);
+
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
+
+        // Only the forking query is claimable through this lane for now.
+        vm.prank(user);
+        vm.expectRevert(Multiverse.InvalidQuery.selector);
+        multiverse.migrateStake(GENESIS_UID, openQueryId, OUTCOME_A, OUTCOME_A);
+
+        // No stake on that outcome.
+        vm.prank(bystander);
+        vm.expectRevert(Multiverse.NothingToClaim.selector);
+        multiverse.migrateStake(GENESIS_UID, forkQueryId, OUTCOME_A, OUTCOME_A);
+
+        // A second claim finds the stake zeroed.
+        vm.prank(user);
+        multiverse.migrateStake(GENESIS_UID, forkQueryId, OUTCOME_A, OUTCOME_A);
+        vm.prank(user);
+        vm.expectRevert(Multiverse.NothingToClaim.selector);
+        multiverse.migrateStake(GENESIS_UID, forkQueryId, OUTCOME_A, OUTCOME_A);
+    }
+
+    function test_MigrateStake_RevertsAfterTheMigrationWindowCloses() public {
+        (uint256 forkQueryId,,) = _forkGenesisAndSpawn();
+
+        // The claim is a counted vote, so it closes with the migration window, like migrate().
+        vm.warp(vm.getBlockTimestamp() + multiverse.SIXTY_DAYS());
+        vm.prank(user);
+        vm.expectRevert(Multiverse.MigrationWindowClosed.selector);
+        multiverse.migrateStake(GENESIS_UID, forkQueryId, OUTCOME_A, OUTCOME_A);
+
+        // Once the fork is resolved the parent is no longer migrating at all.
+        multiverse.advanceForkState(GENESIS_UID);
+        vm.prank(user);
+        vm.expectRevert(Multiverse.InvalidUniverseState.selector);
+        multiverse.migrateStake(GENESIS_UID, forkQueryId, OUTCOME_A, OUTCOME_A);
+    }
+
+    function test_MigrateStake_StaysOpenWhileTheParentForkIsUnresolved() public {
+        // Genesis forks; user migrates into child1, which then forks on its own query with user on both
+        // sides of the ladder.
+        (, uint248 child1,) = _forkGenesisWithTwoChildren();
+        ILituusRep child1Rep = multiverse.repTokenOf(child1);
+        vm.prank(user);
+        child1Rep.approve(address(multiverse), type(uint256).max);
+        uint256 nestedQueryId = multiverse.queryCount();
+        vm.prank(user);
+        multiverse.createQuery(child1, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
+        _escalateToFork(child1, nestedQueryId, user, user);
+        multiverse.spawnChildUniverse(child1, OUTCOME_A);
+        multiverse.spawnChildUniverse(child1, OUTCOME_B);
+        uint248 grandchildA = _childId(child1, OUTCOME_A);
+
+        // 60 days later child1's own window has lapsed, but the genesis fork is not resolved yet, so
+        // child1 keeps migrating and the claim still lands.
+        vm.warp(vm.getBlockTimestamp() + multiverse.SIXTY_DAYS());
+        vm.prank(user);
+        multiverse.migrateStake(child1, nestedQueryId, OUTCOME_A, OUTCOME_A);
+        assertGt(multiverse.repTokenOf(grandchildA).balanceOf(user), 0);
+
+        // Resolving the genesis fork closes child1's window: the B stake can no longer be claimed.
+        multiverse.advanceForkState(GENESIS_UID);
+        vm.prank(user);
+        vm.expectRevert(Multiverse.MigrationWindowClosed.selector);
+        multiverse.migrateStake(child1, nestedQueryId, OUTCOME_B, OUTCOME_B);
+    }
+
+    function test_MigrateStake_CountsThePrincipalAsAVote() public {
+        (uint256 forkQueryId, uint248 child1,) = _forkGenesisAndSpawn();
+        uint128 unmigratedBefore = _unmigratedSupply(GENESIS_UID);
+
+        vm.prank(user);
+        multiverse.migrateStake(GENESIS_UID, forkQueryId, OUTCOME_A, OUTCOME_A);
+
+        // The 32 ether principal moved from parked to counted; the 25.6 ether of winnings did not vote.
+        (,,,,, uint248 favoriteChild,,, uint128 maxOut,, uint128 totalOut,,) = multiverse.universes(GENESIS_UID);
+        (,,,,,,, uint128 totalIn,,,,,) = multiverse.universes(child1);
+        assertEq(totalOut, 32 ether);
+        assertEq(totalIn, 32 ether);
+        assertEq(maxOut, 32 ether);
+        assertEq(favoriteChild, child1);
+        assertEq(_unmigratedSupply(GENESIS_UID), unmigratedBefore - 32 ether);
+    }
+
+    function test_MigrateStake_StakerOnBothSidesClaimsInBothChildren() public {
+        // user A 1, challenger B 2, user A 3, challenger B 6, challenger A 12, user B 24 (B at the cap),
+        // challenger A 16 (A at the cap, fork): user holds 4 on A and 24 on B, challenger 28 on A and 8 on B.
+        uint256 queryId = _createDefaultQuery();
+        address[7] memory reporters = [user, challenger, user, challenger, challenger, user, challenger];
+        uint8[7] memory outcomes = [OUTCOME_A, OUTCOME_B, OUTCOME_A, OUTCOME_B, OUTCOME_A, OUTCOME_B, OUTCOME_A];
+        for (uint256 i = 0; i < reporters.length; i++) {
+            vm.prank(reporters[i]);
+            multiverse.report(GENESIS_UID, queryId, outcomes[i]);
+        }
+        assertEq(uint8(_universeState(GENESIS_UID)), uint8(Multiverse.UniverseState.Migration));
+        assertEq(multiverse.getUserStake(GENESIS_UID, queryId, user, OUTCOME_A), 4 ether);
+        assertEq(multiverse.getUserStake(GENESIS_UID, queryId, user, OUTCOME_B), 24 ether);
+        assertEq(multiverse.getUserStake(GENESIS_UID, queryId, challenger, OUTCOME_A), 28 ether);
+        assertEq(multiverse.getUserStake(GENESIS_UID, queryId, challenger, OUTCOME_B), 8 ether);
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_B);
+        uint248 child1 = _childId(GENESIS_UID, OUTCOME_A);
+        uint248 child2 = _childId(GENESIS_UID, OUTCOME_B);
+
+        // Each side's winners share 32 + 0.8 * 32 pro rata: in child A user holds 4/32 of the winning
+        // stakes, in child B 24/32.
+        vm.prank(user);
+        multiverse.migrateStake(GENESIS_UID, queryId, OUTCOME_A, OUTCOME_A);
+        assertEq(multiverse.repTokenOf(child1).balanceOf(user), 4 ether + 4 ether * 4 / 5);
+        vm.prank(user);
+        multiverse.migrateStake(GENESIS_UID, queryId, OUTCOME_B, OUTCOME_B);
+        assertEq(multiverse.repTokenOf(child2).balanceOf(user), 24 ether + 24 ether * 4 / 5);
+        // Nothing is left of either stake.
+        assertEq(multiverse.getUserStake(GENESIS_UID, queryId, user, OUTCOME_A), 0);
+        assertEq(multiverse.getUserStake(GENESIS_UID, queryId, user, OUTCOME_B), 0);
+    }
+
+    function test_MigrateStake_ThirdOutcomeWinsInItsOwnChild() public {
+        // user A 1, challenger B 2, bystander C 6, user A 15, challenger B 30 (B at the cap), user A 16
+        // (A at the cap, fork): C never reached the cap but holds bystander's 6.
+        uint256 queryId = _createDefaultQuery();
+        address[6] memory reporters = [user, challenger, bystander, user, challenger, user];
+        uint8[6] memory outcomes = [OUTCOME_A, OUTCOME_B, OUTCOME_C, OUTCOME_A, OUTCOME_B, OUTCOME_A];
+        for (uint256 i = 0; i < reporters.length; i++) {
+            vm.prank(reporters[i]);
+            multiverse.report(GENESIS_UID, queryId, outcomes[i]);
+        }
+        assertEq(uint8(_universeState(GENESIS_UID)), uint8(Multiverse.UniverseState.Migration));
+        assertEq(multiverse.getUserStake(GENESIS_UID, queryId, bystander, OUTCOME_C), 6 ether);
+
+        // Anyone can spawn the C child; there the query resolved to C and both capped sides lost.
+        vm.prank(bystander);
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_C);
+        uint248 child3 = _childId(GENESIS_UID, OUTCOME_C);
+        vm.prank(bystander);
+        multiverse.migrateStake(GENESIS_UID, queryId, OUTCOME_C, OUTCOME_C);
+        // The only C staker takes the whole 80% of A and B: 6 + 0.8 * 64.
+        assertEq(multiverse.repTokenOf(child3).balanceOf(bystander), 6 ether + 64 ether * 4 / 5);
+        uint256 parked = zoltar.getMigrationRepBalance(address(multiverse), GENESIS_UID);
+        assertLe(_drawnIntoChild(GENESIS_UID, OUTCOME_C), parked);
+
+        // In the A child the C stake is a losing one.
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
+        vm.prank(bystander);
+        vm.expectRevert(Multiverse.NotAWinningOutcome.selector);
+        multiverse.migrateStake(GENESIS_UID, queryId, OUTCOME_C, OUTCOME_A);
+    }
+
+    /* ========================================== FORK REPORTER REWARD ========================================= */
+
+    function test_Spawn_PaysTheForkReporterReward() public {
+        // The first reports land halfway through the reporting window, so each outcome's first reporter
+        // earned half the fee.
+        uint256 queryId = _createDefaultQuery();
+        vm.warp(vm.getBlockTimestamp() + multiverse.THREE_DAYS() / 2);
+        _escalateToFork(GENESIS_UID, queryId, user, challenger);
+        uint248 child1 = _childId(GENESIS_UID, OUTCOME_A);
+        uint248 child2 = _childId(GENESIS_UID, OUTCOME_B);
+
+        vm.expectEmit(true, true, true, true);
+        emit Multiverse.ReporterRewardPaid(user, child1, queryId, DEFAULT_FEE / 2);
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
+        assertEq(multiverse.repTokenOf(child1).balanceOf(user), DEFAULT_FEE / 2);
+        assertEq(multiverse.repTokenOf(child1).balanceOf(challenger), 0);
+
+        // The B child pays its own first reporter from its own copy of the pot.
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_B);
+        assertEq(multiverse.repTokenOf(child2).balanceOf(challenger), DEFAULT_FEE / 2);
+        assertEq(multiverse.repTokenOf(child2).balanceOf(user), 0);
+        // The reward is the fee of the forking query: it was excluded from the fee pot the children inherit.
+        assertEq(_totalQueryFees(child1), 0);
+        assertEq(_totalQueryFees(child2), 0);
+    }
+
+    function test_Spawn_PaysNothingWithoutAFirstReporter() public {
+        // The ladder starts in the same block as the query, so the fee ramp is zero for both sides.
+        (uint256 queryId,) = _forkGenesis();
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
+        uint248 child1 = _childId(GENESIS_UID, OUTCOME_A);
+        assertEq(multiverse.repTokenOf(child1).balanceOf(user), 0);
+        assertEq(multiverse.repTokenOf(child1).totalAssets(), 0);
+
+        // Nobody staked INVALID: that child has no first reporter, the spawn still succeeds.
+        multiverse.spawnChildUniverse(GENESIS_UID, INVALID_OUTCOME);
+        uint248 childInvalid = _childId(GENESIS_UID, INVALID_OUTCOME);
+        assertEq(multiverse.repTokenOf(childInvalid).totalAssets(), 0);
+        assertEq(multiverse.getOutcome(childInvalid, queryId), INVALID_OUTCOME);
+        assertEq(_drawnIntoChild(GENESIS_UID, INVALID_OUTCOME), 0);
     }
 }

@@ -1786,6 +1786,15 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         }
     }
 
+    /// @dev Whether a forking universe still takes migrations into its children. The window closes 60 days
+    ///      after the fork, but not before the parent's own fork is resolved: a nested fork cannot finish
+    ///      migrating while the parent is still migrating.
+    function _isMigrationWindowOpen(uint248 universeId, Universe storage universe) internal view returns (bool) {
+        bool isParentForkResolved =
+            universeId == GENESIS_UNIVERSE_ID || universes[universe.parent].universeState == UniverseState.PostFork;
+        return block.timestamp < uint256(universe.forkTime) + SIXTY_DAYS || !isParentForkResolved;
+    }
+
     /**
      * @notice Migrates the caller's wREP from a forking universe into one of its children.
      *         Counted voting: the running migration max designates the fork's winner.
@@ -1801,17 +1810,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     function migrate(uint248 universeId, uint8 outcome, uint256 shares) external nonReentrant {
         Universe storage universe = universes[universeId];
         if (universe.universeState != UniverseState.Migration) revert InvalidUniverseState();
-
-        // The forking window is closed if the migration stage is over (60 days passed)
-        // and the parent fork is resolved (PostFork). The parent migration phase must end first,
-        // and then the nested fork can finish migration.
-        // TODO: make a getter for universe state
-        Universe storage parentUniverse = universes[universe.parent];
-        bool isParentForkResolved =
-            universeId == GENESIS_UNIVERSE_ID || parentUniverse.universeState == UniverseState.PostFork;
-        if ((block.timestamp >= uint256(universe.forkTime) + SIXTY_DAYS) && isParentForkResolved) {
-            revert MigrationWindowClosed();
-        }
+        if (!_isMigrationWindowOpen(universeId, universe)) revert MigrationWindowClosed();
 
         // Outcome to universe index mapping (see _forkLituusUniverse).
         // TODO: finalize the mapping after Zoltar decides on question format.
@@ -1844,8 +1843,8 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      *      Zoltar tracks per child, so the one record pays each child's winners from that child's own copy.
      *      Zeroing the stake before any transfer makes it claimable once, and since the outcome fixes the
      *      child, into one child only. Only the claimed principal counts as a migration vote for the child;
-     *      the winnings on top of it are paid in every child and do not vote. Allowed while the parent
-     *      migrates and after its fork settled.
+     *      the winnings on top of it are paid in every child and do not vote. Open for as long as migrate()
+     *      is: the vote is counted, so it cannot land after the fork is resolved.
      * @param universeId The forked universe the stake was placed in.
      * @param queryId The query the stake was placed on. Only the forking query is accepted for now.
      * @param outcome The outcome the caller staked on.
@@ -1857,10 +1856,8 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         nonReentrant
     {
         Universe storage universe = universes[universeId];
-        UniverseState universeState = universe.universeState;
-        if (universeState != UniverseState.Migration && universeState != UniverseState.PostFork) {
-            revert InvalidUniverseState();
-        }
+        if (universe.universeState != UniverseState.Migration) revert InvalidUniverseState();
+        if (!_isMigrationWindowOpen(universeId, universe)) revert MigrationWindowClosed();
 
         uint248 childUniverseId = ZOLTAR.getChildUniverseId(universeId, childOutcome);
         Universe storage childUniverse = universes[childUniverseId];
