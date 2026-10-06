@@ -82,9 +82,9 @@ contract MultiverseReportTest is MultiverseFixtures {
     }
 
     function test_Report_EmitsEventForInvalid() public {
-        // INVALID (255) is the special outcome encoding; pin its event shape explicitly.
+        // INVALID (max-uint) is the special outcome encoding; pin its event shape explicitly.
         uint256 queryId = _createDefaultQuery();
-        uint8 invalid = multiverse.INVALID();
+        uint256 invalid = multiverse.INVALID();
 
         vm.expectEmit(true, true, true, true, address(multiverse));
         emit Multiverse.QueryReported(user, GENESIS_UID, queryId, invalid, DEFAULT_FEE);
@@ -155,7 +155,7 @@ contract MultiverseReportTest is MultiverseFixtures {
         uint256 queryId = _createDefaultQuery();
 
         address[] memory reporters = new address[](5);
-        uint8[] memory outcomes = new uint8[](5);
+        uint256[] memory outcomes = new uint256[](5);
         for (uint256 i = 0; i < 5; i++) {
             reporters[i] = i % 2 == 0 ? user : bystander;
             outcomes[i] = i % 2 == 0 ? OUTCOME_A : OUTCOME_B;
@@ -212,7 +212,7 @@ contract MultiverseReportTest is MultiverseFixtures {
         uint256 queryId = _createDefaultQuery();
 
         address[] memory reporters = new address[](3);
-        uint8[] memory outcomes = new uint8[](3);
+        uint256[] memory outcomes = new uint256[](3);
         (reporters[0], reporters[1], reporters[2]) = (user, bystander, challenger);
         (outcomes[0], outcomes[1], outcomes[2]) = (OUTCOME_A, multiverse.INVALID(), OUTCOME_B);
         _escalateChain(queryId, reporters, outcomes);
@@ -269,7 +269,7 @@ contract MultiverseReportTest is MultiverseFixtures {
         uint48 createTimeBefore = _resolution(queryId).queryCreateTime;
 
         address[] memory reporters = new address[](3);
-        uint8[] memory outcomes = new uint8[](3);
+        uint256[] memory outcomes = new uint256[](3);
         (reporters[0], reporters[1], reporters[2]) = (user, bystander, user);
         (outcomes[0], outcomes[1], outcomes[2]) = (OUTCOME_A, OUTCOME_B, OUTCOME_A);
         _escalateChain(queryId, reporters, outcomes);
@@ -291,7 +291,7 @@ contract MultiverseReportTest is MultiverseFixtures {
         // The second query costs more than the first one because the first one already raised
         // the demand modifier, but its slightly higher fee still rounds to the same grid step.
         assertEq(_resolution(queryId1).stakeCount, 0);
-        (,, uint256 fee1,) = multiverse.queries(queryId1);
+        (,, uint256 fee1,,) = multiverse.queries(queryId1);
         uint256 requiredStake = multiverse.getNextRequiredStake(GENESIS_UID, queryId1, OUTCOME_A);
         assertGt(fee1, DEFAULT_FEE);
         assertEq(requiredStake, DEFAULT_FEE);
@@ -317,7 +317,7 @@ contract MultiverseReportTest is MultiverseFixtures {
         uint256 challengerBalanceBefore = genesisRep.balanceOf(challenger);
 
         address[] memory reporters = new address[](3);
-        uint8[] memory outcomes = new uint8[](3);
+        uint256[] memory outcomes = new uint256[](3);
         (reporters[0], reporters[1], reporters[2]) = (user, bystander, challenger);
         (outcomes[0], outcomes[1], outcomes[2]) = (OUTCOME_A, OUTCOME_B, OUTCOME_A);
         _escalateChain(queryId, reporters, outcomes);
@@ -342,7 +342,7 @@ contract MultiverseReportTest is MultiverseFixtures {
 
         // The same address may hold multiple consecutive and non-consecutive stakes on one query.
         address[] memory reporters = new address[](4);
-        uint8[] memory outcomes = new uint8[](4);
+        uint256[] memory outcomes = new uint256[](4);
         (reporters[0], reporters[1], reporters[2], reporters[3]) = (user, user, bystander, user);
         (outcomes[0], outcomes[1], outcomes[2], outcomes[3]) = (OUTCOME_A, OUTCOME_B, OUTCOME_A, OUTCOME_B);
         _escalateChain(queryId, reporters, outcomes);
@@ -359,7 +359,7 @@ contract MultiverseReportTest is MultiverseFixtures {
 
         // Five consecutive stakes rotating all actors, with varied gaps inside every appeal window.
         address[5] memory reporters = [user, bystander, challenger, user, bystander];
-        uint8[5] memory outcomes = [OUTCOME_A, OUTCOME_B, OUTCOME_A, OUTCOME_B, OUTCOME_A];
+        uint256[5] memory outcomes = [OUTCOME_A, OUTCOME_B, OUTCOME_A, OUTCOME_B, OUTCOME_A];
         uint256[5] memory gaps = [uint256(2 hours), 23 hours, 6 hours, 20 hours, 12 hours];
         uint48[5] memory stakeTimes;
         for (uint256 i = 0; i < 5; i++) {
@@ -396,7 +396,7 @@ contract MultiverseReportTest is MultiverseFixtures {
         // Each query's ladder runs from its own first stake. The second query's fee is higher than
         // the base fee (the first one already raised the demand modifier) but rounds to the same
         // grid step, so both ladders start at DEFAULT_FEE.
-        (,, uint256 fee1,) = multiverse.queries(queryId1);
+        (,, uint256 fee1,,) = multiverse.queries(queryId1);
         assertGt(fee1, DEFAULT_FEE);
         ResolutionView memory r0 = _resolution(queryId0);
         ResolutionView memory r1 = _resolution(queryId1);
@@ -423,7 +423,7 @@ contract MultiverseReportTest is MultiverseFixtures {
 
         uint256 queryId = _createDefaultQuery();
         address[] memory reporters = new address[](4);
-        uint8[] memory outcomes = new uint8[](4);
+        uint256[] memory outcomes = new uint256[](4);
         (reporters[0], reporters[1], reporters[2], reporters[3]) = (user, bystander, challenger, bystander);
         (outcomes[0], outcomes[1], outcomes[2], outcomes[3]) = (OUTCOME_A, OUTCOME_B, OUTCOME_A, OUTCOME_B);
         _escalateChain(queryId, reporters, outcomes);
@@ -471,7 +471,7 @@ contract MultiverseReportTest is MultiverseFixtures {
     }
 
     function test_RevertWhen_OutcomeBelowInvalidMarker() public {
-        // 254 is above the query's outcome range but is not the INVALID marker (255).
+        // 254 is above the query's outcome range but is not the INVALID marker (max-uint).
         uint256 queryId = _createDefaultQuery();
         vm.prank(user);
         vm.expectRevert(Multiverse.InvalidOutcome.selector);
@@ -762,7 +762,7 @@ contract MultiverseReportTest is MultiverseFixtures {
         uint256[4] memory expectedStakes = [uint256(1 ether), 2 ether, 3 ether, 6 ether];
 
         for (uint256 i = 0; i < 4; i++) {
-            uint8 outcome = i % 2 == 0 ? OUTCOME_A : OUTCOME_B;
+            uint256 outcome = i % 2 == 0 ? OUTCOME_A : OUTCOME_B;
             uint256 requiredStake = multiverse.getNextRequiredStake(GENESIS_UID, queryId, outcome);
             assertEq(requiredStake, expectedStakes[i]);
             _report(i % 2 == 0 ? user : bystander, queryId, outcome);

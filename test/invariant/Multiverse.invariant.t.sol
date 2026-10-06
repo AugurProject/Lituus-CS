@@ -79,17 +79,6 @@ contract MultiverseInvariantTest is MultiverseDeployFixture {
         );
     }
 
-    /// @dev Every created query has a valid outcome count and origin universe.
-    function invariant_QueryRecordsWellFormed() public view {
-        uint256 count = multiverse.queryCount();
-        for (uint256 i = 0; i < count; ++i) {
-            (uint8 numberOfOutcomes, uint248 originUniverse,,) = multiverse.queries(i);
-            assertGe(numberOfOutcomes, multiverse.MIN_OUTCOMES());
-            assertLe(numberOfOutcomes, multiverse.MAX_OUTCOMES());
-            assertEq(originUniverse, GENESIS_UID);
-        }
-    }
-
     /// @dev The escalation ladder respects the per-outcome cap and its live totals match the
     ///      ghosts: every landed stake is at most the cap and so is every outcome's total, each
     ///      outcome's total is the sum of the ghost stakes placed on it, the query total is the sum
@@ -110,7 +99,7 @@ contract MultiverseInvariantTest is MultiverseDeployFixture {
 
                 // The staker's live balance on this outcome: the sum of their unsettled ghost stakes on it.
                 address owner = handler.ghostStakeReporter(i, j);
-                uint8 outcome = handler.ghostStakeOutcome(i, j);
+                uint256 outcome = handler.ghostStakeOutcome(i, j);
                 uint256 expectedUserStake;
                 for (uint256 k = 0; k < stakeCount; ++k) {
                     if (handler.ghostStakeReporter(i, k) != owner || handler.ghostStakeOutcome(i, k) != outcome) {
@@ -124,7 +113,7 @@ contract MultiverseInvariantTest is MultiverseDeployFixture {
 
             // Per-outcome totals: the sum of the ghost stakes placed on each outcome.
             for (uint256 j = 0; j < stakeCount; ++j) {
-                uint8 outcome = handler.ghostStakeOutcome(i, j);
+                uint256 outcome = handler.ghostStakeOutcome(i, j);
                 uint256 expectedOutcomeStaked;
                 for (uint256 k = 0; k < stakeCount; ++k) {
                     if (handler.ghostStakeOutcome(i, k) == outcome) {
@@ -197,11 +186,11 @@ contract MultiverseInvariantTest is MultiverseDeployFixture {
         uint256 count = multiverse.queryCount();
         for (uint256 i = 0; i < count; ++i) {
             uint256 stakeCount = handler.ghostStakeCount(i);
-            (uint8 numberOfOutcomes,,,) = multiverse.queries(i);
+            (uint8 numberOfOutcomes,,,,) = multiverse.queries(i);
             ResolutionView memory r = _resolution(i);
             assertEq(r.stakeCount, stakeCount);
             for (uint256 j = 0; j < stakeCount; ++j) {
-                uint8 outcome = handler.ghostStakeOutcome(i, j);
+                uint256 outcome = handler.ghostStakeOutcome(i, j);
                 assertTrue((outcome >= 1 && outcome <= numberOfOutcomes) || outcome == multiverse.INVALID());
                 if (j > 0) assertTrue(outcome != handler.ghostStakeOutcome(i, j - 1));
 

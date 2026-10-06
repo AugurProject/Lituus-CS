@@ -9,8 +9,8 @@ import { MultiverseForkHandler } from "./handlers/MultiverseForkHandler.sol";
 ///         moves and the fork's resolution must keep the migration accounting consistent.
 /// @dev The genesis is forked in setUp on a query the three actors staked on (one of them on a third
 ///      outcome that never reaches the cap), so every handler action has something to work with from the
-///      first call. The parked balance at the fork is pinned here and the invariants hold the counters
-///      against it.
+///      first call. The pot at the fork is pinned here, at face value and as parked (net of Zoltar's burn
+///      on the fork bond), and the invariants hold the counters against them.
 contract MultiverseForkInvariantTest is MultiverseDeployFixture {
     uint256 internal constant ACTOR_REP_BALANCE = 1000 ether;
     uint256 internal constant ACTOR_COUNT = 3;
@@ -18,6 +18,7 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
     MultiverseForkHandler internal handler;
     address[] internal actors;
     uint256 internal forkQueryId;
+    uint256 internal potAtFork;
     uint256 internal parkedAtFork;
 
     /// @dev 3200 ether (the actors' balances plus a 200 ether pool remainder) so the per-outcome cap is
@@ -36,11 +37,12 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
         assertEq(_capWrep(), 32 * DEFAULT_FEE);
 
         // actor0 and actor1 alternate A and B to the cap, actor2 holds a stake on C that never gets there.
+        uint256 forkThreshold = zoltar.getForkThreshold(GENESIS_UID);
         forkQueryId = multiverse.queryCount();
         vm.prank(actors[0]);
         multiverse.createQuery(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
         address[6] memory reporters = [actors[0], actors[1], actors[2], actors[0], actors[1], actors[0]];
-        uint8[6] memory outcomes = [OUTCOME_A, OUTCOME_B, OUTCOME_C, OUTCOME_A, OUTCOME_B, OUTCOME_A];
+        uint256[6] memory outcomes = [OUTCOME_A, OUTCOME_B, OUTCOME_C, OUTCOME_A, OUTCOME_B, OUTCOME_A];
         for (uint256 i = 0; i < reporters.length; i++) {
             vm.prank(reporters[i]);
             multiverse.report(GENESIS_UID, forkQueryId, outcomes[i]);
@@ -48,6 +50,9 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
         (, Multiverse.UniverseState state,,,,,,,,,,,) = multiverse.universes(GENESIS_UID);
         assertEq(uint8(state), uint8(Multiverse.UniverseState.Migration));
         parkedAtFork = zoltar.getMigrationRepBalance(address(multiverse), GENESIS_UID);
+        (,,,,,,,,,,,, uint128 unmigratedAtFork) = multiverse.universes(GENESIS_UID);
+        potAtFork = unmigratedAtFork;
+        assertEq(potAtFork, parkedAtFork + forkThreshold / zoltar.FORK_BURN_DIVISOR());
 
         handler = new MultiverseForkHandler(multiverse, zoltar, genesisRep, GENESIS_UID, forkQueryId, actors);
         targetContract(address(handler));
@@ -64,11 +69,11 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
         assertEq(totalOut, handler.ghostWalletMigrated() + handler.ghostPrincipalClaimed());
     }
 
-    /// @dev Counted plus still-parked supply only grows by what wallets bring in after the fork: stake
-    ///      claims move value from parked to counted, never create or destroy it.
-    function invariant_CountedPlusParkedIsConserved() public view {
+    /// @dev Counted plus unmigrated supply only grows by what wallets bring in after the fork: stake claims
+    ///      move their principal from unmigrated to counted at face value, never create or destroy it.
+    function invariant_CountedPlusUnmigratedIsConserved() public view {
         (,,,,,,,,,, uint128 totalOut,, uint128 unmigrated) = multiverse.universes(GENESIS_UID);
-        assertEq(uint256(totalOut) + unmigrated, parkedAtFork + handler.ghostWalletMigrated());
+        assertEq(uint256(totalOut) + unmigrated, potAtFork + handler.ghostWalletMigrated());
     }
 
     /// @dev Every child's inflow matches what was moved into it, the inflows add up to the outflow, and the
@@ -79,7 +84,7 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
         uint256 largest;
         uint256 favoriteInflow;
         for (uint256 i = 0; i < handler.outcomesLength(); ++i) {
-            uint8 outcome = handler.outcomeAt(i);
+            uint256 outcome = handler.outcomeAt(i);
             uint248 childId = handler.childOf(outcome);
             (,,,,,,, uint128 totalIn,,,,,) = multiverse.universes(childId);
             assertEq(totalIn, handler.ghostMigratedInto(outcome));
@@ -120,7 +125,7 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
                 );
             }
         }
-        (,,,,, uint96 totalStaked,,) = multiverse.queryResolutions(GENESIS_UID, forkQueryId);
+        (,,, uint96 totalStaked,,,,,) = multiverse.queryResolutions(GENESIS_UID, forkQueryId);
         assertEq(outstanding + handler.ghostPrincipalClaimed(), totalStaked);
     }
 }

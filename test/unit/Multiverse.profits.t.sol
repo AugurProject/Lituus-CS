@@ -62,7 +62,7 @@ contract MultiverseProfitsTest is MultiverseDeployFixture {
         uint256 queryId = multiverse.queryCount();
         vm.prank(user);
         multiverse.createQuery(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
-        (,, profit,) = multiverse.queries(queryId);
+        (,, profit,,) = multiverse.queries(queryId);
 
         vm.prank(user);
         multiverse.report(GENESIS_UID, queryId, OUTCOME_A);

@@ -27,11 +27,11 @@ contract MultiverseForkHandler is CommonBase, StdCheats, StdUtils {
     ILituusRep public immutable REP;
     uint248 public immutable GENESIS_UID;
     uint256 public immutable FORK_QUERY_ID;
-    uint8 public constant INVALID_OUTCOME = 255;
+    uint256 public constant INVALID_OUTCOME = type(uint256).max;
 
     address[] internal actors;
     // The forking query's outcome set: 1..3 and INVALID.
-    uint8[] internal outcomes;
+    uint256[] internal outcomes;
 
     // Ghost variables, observable from invariants.
     uint256 public ghostWalletMigrated;
@@ -39,8 +39,8 @@ contract MultiverseForkHandler is CommonBase, StdCheats, StdUtils {
     uint256 public ghostNow;
     bool public ghostResolved;
     uint248 public ghostWinner;
-    mapping(uint8 outcome => bool) public ghostSpawned;
-    mapping(uint8 outcome => uint256) public ghostMigratedInto;
+    mapping(uint256 outcome => bool) public ghostSpawned;
+    mapping(uint256 outcome => uint256) public ghostMigratedInto;
 
     constructor(
         Multiverse multiverse_,
@@ -72,11 +72,11 @@ contract MultiverseForkHandler is CommonBase, StdCheats, StdUtils {
         return outcomes.length;
     }
 
-    function outcomeAt(uint256 index) external view returns (uint8) {
+    function outcomeAt(uint256 index) external view returns (uint256) {
         return outcomes[index];
     }
 
-    function childOf(uint8 outcome) public view returns (uint248) {
+    function childOf(uint256 outcome) public view returns (uint248) {
         return ZOLTAR.getChildUniverseId(GENESIS_UID, outcome);
     }
 
@@ -98,7 +98,7 @@ contract MultiverseForkHandler is CommonBase, StdCheats, StdUtils {
     /// @notice Spawn the child of a random outcome. No-ops once spawned, after the window, or after
     ///         the fork resolved.
     function spawn(uint256 outcomeSeed) external {
-        uint8 outcome = outcomes[bound(outcomeSeed, 0, outcomes.length - 1)];
+        uint256 outcome = outcomes[bound(outcomeSeed, 0, outcomes.length - 1)];
         if (ghostSpawned[outcome] || ghostResolved || !_windowOpen()) return;
 
         MULTIVERSE.spawnChildUniverse(GENESIS_UID, outcome);
@@ -108,7 +108,7 @@ contract MultiverseForkHandler is CommonBase, StdCheats, StdUtils {
     /// @notice Migrate a random slice of a random actor's wallet wREP into a random spawned child. Once
     ///         the window closed or the fork resolved the migration must be rejected.
     function migrate(uint256 actorSeed, uint256 outcomeSeed, uint256 amountSeed) external {
-        uint8 outcome = outcomes[bound(outcomeSeed, 0, outcomes.length - 1)];
+        uint256 outcome = outcomes[bound(outcomeSeed, 0, outcomes.length - 1)];
         if (!ghostSpawned[outcome]) return;
         address actor = actors[bound(actorSeed, 0, actors.length - 1)];
         uint256 balance = REP.balanceOf(actor);
@@ -132,7 +132,7 @@ contract MultiverseForkHandler is CommonBase, StdCheats, StdUtils {
     /// @notice Claim a random actor's stake on a random outcome into that outcome's child. Once the
     ///         window closed or the fork resolved the claim must be rejected: it is a counted vote.
     function migrateStake(uint256 actorSeed, uint256 outcomeSeed) external {
-        uint8 outcome = outcomes[bound(outcomeSeed, 0, outcomes.length - 1)];
+        uint256 outcome = outcomes[bound(outcomeSeed, 0, outcomes.length - 1)];
         if (!ghostSpawned[outcome]) return;
         address actor = actors[bound(actorSeed, 0, actors.length - 1)];
         uint256 amount = MULTIVERSE.getUserStake(GENESIS_UID, FORK_QUERY_ID, actor, outcome);

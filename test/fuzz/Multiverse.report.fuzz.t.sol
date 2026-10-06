@@ -8,9 +8,9 @@ import { MultiverseFuzzFixtures } from "./Multiverse.fuzz.fixtures.sol";
 contract MultiverseReportFuzzTest is MultiverseFuzzFixtures {
     /// @dev Property: every outcome in the valid set (1..numberOfOutcomes and INVALID) is accepted
     /// as a first report and stored as given, at a stake equal to the query fee.
-    function testFuzz_Report_ValidOutcomes(uint8 outcome) public {
-        // 1..3 are the query's outcomes; map the extra bucket to the INVALID marker (255).
-        outcome = uint8(bound(uint256(outcome), 1, 4));
+    function testFuzz_Report_ValidOutcomes(uint256 outcome) public {
+        // 1..3 are the query's outcomes; map the extra bucket to the INVALID marker (max-uint).
+        outcome = bound(outcome, 1, 4);
         if (outcome == 4) outcome = multiverse.INVALID();
         uint256 queryId = _createQuery();
 
@@ -56,7 +56,7 @@ contract MultiverseReportFuzzTest is MultiverseFuzzFixtures {
         feeCtl.setFee(fee);
 
         uint256 queryId = _createQuery();
-        (,, uint256 chargedFee,) = multiverse.queries(queryId);
+        (,, uint256 chargedFee,,) = multiverse.queries(queryId);
         uint256 firstStake = multiverse.getNextRequiredStake(GENESIS_UID, queryId, 1);
 
         // Both directions of the bound, squared to avoid a square root: stake^2 <= 2 * fee^2 and
@@ -75,7 +75,7 @@ contract MultiverseReportFuzzTest is MultiverseFuzzFixtures {
 
         uint256 totalStaked;
         for (uint256 i = 0; i < rounds; i++) {
-            uint8 outcome = i % 2 == 0 ? 1 : 2;
+            uint256 outcome = i % 2 == 0 ? 1 : 2;
             uint256 stake = multiverse.getNextRequiredStake(GENESIS_UID, queryId, outcome);
             vm.prank(user);
             multiverse.report(GENESIS_UID, queryId, outcome);

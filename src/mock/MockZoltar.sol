@@ -9,7 +9,7 @@ contract MockZoltar is IZoltar {
     uint256 constant FORK_THRESHOLD_DIVISOR = 50; // 2% of total supply atm
     // Reference Zoltar's forkBurnDivisor (its minimum): the fork initiator's whole threshold is
     // burned, and all but this fraction of it is credited back to their migration balance. The
-    // net burn is threshold / FORK_BURN_DIVISOR = 1% of the supply atm.
+    // net burn is threshold / FORK_BURN_DIVISOR = 0.4% of the supply atm.
     uint256 public constant FORK_BURN_DIVISOR = 5;
 
     // mock accessors mirror the interface's lowercase getter names, so keep the non-standard casing
@@ -33,6 +33,8 @@ contract MockZoltar is IZoltar {
     // Fork start time per universe; zero means not forking.
     mapping(uint248 universeId => uint256) public forkTimes;
     mapping(uint248 universeId => uint256) public forkQuestionIds;
+    mapping(uint248 universeId => uint248) public parentUniverseIds;
+    mapping(uint248 universeId => uint256) public forkingOutcomeIndexes;
     // Caller-keyed migration balances per parent universe, credited against parent REP burned here:
     // forkUniverse credits the initiator's threshold net of the burn haircut, addRepToMigrationBalance
     // credits 1:1.
@@ -46,6 +48,7 @@ contract MockZoltar is IZoltar {
     error AlreadyForking();
     error InsufficientMigrationBalance();
     error UniverseNotForked();
+    error QuestionDoesNotExist();
     error UniverseDoesNotExist();
     error InsufficientRepForFork();
     error ZeroGenesisSupply();
@@ -87,19 +90,21 @@ contract MockZoltar is IZoltar {
     function universes(uint248 universeId) external view returns (Universe memory u) {
         u.forkTime = forkTimes[universeId];
         u.forkQuestionId = forkQuestionIds[universeId];
-        u.forkingOutcomeIndex = 0;
+        u.forkingOutcomeIndex = forkingOutcomeIndexes[universeId];
         u.reputationToken = getRepToken(universeId);
-        u.parentUniverseId = 0;
+        u.parentUniverseId = parentUniverseIds[universeId];
     }
 
     /// @notice Forks an unforked universe, like real Zoltar: the caller must hold the universe's
     ///         fork threshold in its REP; the whole threshold is burned from them and credited to
     ///         their migration balance net of the burn haircut (threshold / FORK_BURN_DIVISOR).
     /// @dev Fork-once per universe: a second fork reverts instead of silently overwriting the
-    ///      in-progress one. The universe's theoretical supply drops by the full threshold, and the
+    ///      in-progress one. The question must exist (real Zoltar also requires it to have ended; not
+    ///      modelled here). The universe's theoretical supply drops by the full threshold, and the
     ///      children's supply is snapshotted as that plus the migration credit.
     function forkUniverse(uint248 universeId, uint256 questionId) external {
         if (forkTimes[universeId] != 0) revert AlreadyForking();
+        if (zoltarQuestionData.questionCreatedTimestamp(questionId) == 0) revert QuestionDoesNotExist();
         IReputationToken token = childRepTokens[universeId];
         if (address(token) == address(0)) revert UniverseDoesNotExist();
         uint256 threshold = getForkThreshold(universeId);
@@ -116,12 +121,17 @@ contract MockZoltar is IZoltar {
     }
 
     /// @dev Reverts if the child already exists, like real Zoltar: callers must check the child's
-    ///      rep token first. The child's theoretical supply is the parent's fork-time snapshot.
+    ///      rep token first. The child's theoretical supply is the parent's fork-time snapshot. No malformed-
+    ///      answer check here (real Zoltar has one): Lituus forks still key INVALID as max-uint until the
+    ///      labels/mapping phase, and the Multiverse enforces Zoltar's rule for mirrored forks itself.
     function deployChild(uint248 universeId, uint256 outcomeIndex) external {
         if (forkTimes[universeId] == 0) revert UniverseNotForked();
         uint248 childUniverseId = getChildUniverseId(universeId, outcomeIndex);
         if (address(childRepTokens[childUniverseId]) != address(0)) revert ChildAlreadyDeployed();
         childRepTokens[childUniverseId] = new MockERC20("Child Reputation", "CREP");
+        parentUniverseIds[childUniverseId] = universeId;
+        forkingOutcomeIndexes[childUniverseId] = outcomeIndex;
+        forkQuestionIds[childUniverseId] = forkQuestionIds[universeId];
         universeTheoreticalSupplies[childUniverseId] = childSupplySnapshots[universeId];
     }
 

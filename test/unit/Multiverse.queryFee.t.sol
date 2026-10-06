@@ -116,7 +116,7 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
     function test_QueryFee_ChargedFeeIsStoredOnTheQuery() public {
         uint256 charged = _chargedFee();
 
-        (,, uint256 storedFee,) = multiverse.queries(0);
+        (,, uint256 storedFee,,) = multiverse.queries(0);
         assertEq(storedFee, charged);
     }
 
@@ -373,7 +373,7 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
         uint256 chargedFee = _chargedFee();
 
         assertEq(chargedFee, cap);
-        (,, uint256 storedFee,) = multiverse.queries(0);
+        (,, uint256 storedFee,,) = multiverse.queries(0);
         assertEq(storedFee, cap);
     }
 
@@ -386,7 +386,7 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
         uint256 chargedFee = _chargedFee();
 
         assertEq(chargedFee, cap - 1);
-        (,, uint256 storedFee,) = multiverse.queries(0);
+        (,, uint256 storedFee,,) = multiverse.queries(0);
         assertEq(storedFee, cap - 1);
     }
 
@@ -629,7 +629,7 @@ contract MultiverseUpdateBaseFeeTest is QueryFeeTestHelpers {
 
         assertEq(charged, newBase * _floorModifier() / multiverse.SCALE());
 
-        (,, uint256 storedFee,) = multiverse.queries(0);
+        (,, uint256 storedFee,,) = multiverse.queries(0);
         assertEq(storedFee, charged);
     }
 

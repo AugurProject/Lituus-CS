@@ -111,7 +111,7 @@ contract QueryTokenizerFuzzTest is QueryTokenizerFixtures {
         _mintTokens(user, mints);
 
         (uint256 price, uint256 queryId) = _redeemToken(user);
-        (,, uint256 recordedFee,) = multiverse.queries(queryId);
+        (,, uint256 recordedFee,,) = multiverse.queries(queryId);
         assertEq(recordedFee, price);
     }
 }

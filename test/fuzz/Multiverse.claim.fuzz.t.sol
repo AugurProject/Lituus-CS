@@ -57,7 +57,7 @@ contract MultiverseClaimFuzzTest is MultiverseFuzzFixtures {
     {
         queryId = _createQuery();
         for (uint256 i = 0; i < rounds; i++) {
-            uint8 outcome = i % 2 == 0 ? 1 : 2;
+            uint256 outcome = i % 2 == 0 ? 1 : 2;
             uint256 stake = multiverse.getNextRequiredStake(GENESIS_UID, queryId, outcome);
             vm.prank(i % 2 == 0 ? user : reporter);
             multiverse.report(GENESIS_UID, queryId, outcome);
@@ -166,7 +166,7 @@ contract MultiverseClaimFuzzTest is MultiverseFuzzFixtures {
 
         assertEq(genesisRep.balanceOf(winner), winnerBalanceBefore + expectedTotal);
         for (uint256 i = 0; i < queryCount; i++) {
-            uint8 outcome = _resolution(queryIds[i]).outcome;
+            uint256 outcome = _resolution(queryIds[i]).outcome;
             assertEq(multiverse.getUserStake(GENESIS_UID, queryIds[i], winner, outcome), 0);
         }
     }
@@ -179,10 +179,10 @@ contract MultiverseClaimFuzzTest is MultiverseFuzzFixtures {
     /// @return steps How many reports landed.
     function _buildRandomLadder(uint256 seed) internal returns (uint256 queryId, uint256 steps) {
         queryId = _createQuery();
-        uint8[4] memory outcomes = [uint8(1), 2, 3, multiverse.INVALID()];
+        uint256[4] memory outcomes = [uint256(1), 2, 3, multiverse.INVALID()];
         for (uint256 i = 0; i < RANDOM_LADDER_STEPS; i++) {
             uint256 word = uint256(keccak256(abi.encode(seed, i)));
-            uint8 outcome = outcomes[word % outcomes.length];
+            uint256 outcome = outcomes[word % outcomes.length];
 
             uint256 requiredStake;
             try multiverse.getNextRequiredStake(GENESIS_UID, queryId, outcome) returns (uint256 stake) {
