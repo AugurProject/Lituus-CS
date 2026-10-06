@@ -86,21 +86,19 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
         revert("ladder did not fork");
     }
 
-    /// @dev A winning stake's payout in the child of `outcome`, from the parent record: the stake plus
-    ///      its share of the other outcomes' stakes after the burn cut.
-    function _expectedChildPayout(uint256 queryId, uint8 outcome, uint256 amount) internal view returns (uint256) {
-        (,,,,, uint96 totalStaked,,) = multiverse.queryResolutions(GENESIS_UID, queryId);
-        uint256 winnerStaked = multiverse.getOutcomeStakes(GENESIS_UID, queryId, outcome).totalOutcomeStaked;
-        uint256 losers = uint256(totalStaked) - winnerStaked;
+    /// @dev A forking query stake's payout in its child, from the parent record: the stake plus the return
+    ///      the capped outcomes get, 80% of everything above the cap over the cap. The same in every child.
+    function _expectedChildPayout(uint256 queryId, uint256 amount) internal view returns (uint256) {
+        (,,,,, uint96 totalStaked, uint96 cap,) = multiverse.queryResolutions(GENESIS_UID, queryId);
+        uint256 losers = uint256(totalStaked) - cap;
         uint256 distributable = losers - losers / multiverse.BURN_DIVIDER();
-        return amount + amount * distributable / winnerStaked;
+        return amount + amount * distributable / cap;
     }
 
     /// @dev Property: for any ladder, every staker is paid in its outcome's child exactly its stake plus
-    /// its pro-rata share of the other outcomes after the burn cut, in that child's wREP; the fork
-    /// query's stakes become the counted migration and leave the parked supply one for one; and no
-    /// child ever draws more than the whole parked balance, even though every child pays its own
-    /// winners in full.
+    /// the capped outcomes' return on it, in that child's wREP; the fork query's stakes become the
+    /// counted migration and leave the parked supply one for one; and no child ever draws more than
+    /// the whole parked balance, even though every child pays its own winners.
     function testFuzz_MigrateStake_PaysEveryChildFromItsOwnCopyOfThePot(uint256 seed, uint256 fee) public {
         fee = bound(fee, MIN_LADDER_FEE, MAX_LADDER_FEE);
         feeCtl.setFee(fee);
@@ -124,7 +122,7 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
 
                 ILituusRep childRep = multiverse.repTokenOf(_childId(outcomes[o]));
                 uint256 balanceBefore = childRep.balanceOf(reporters[r]);
-                uint256 expected = _expectedChildPayout(queryId, outcomes[o], amount);
+                uint256 expected = _expectedChildPayout(queryId, amount);
                 vm.prank(reporters[r]);
                 multiverse.migrateStake(GENESIS_UID, queryId, outcomes[o], outcomes[o]);
                 // The rate is 1 everywhere (no resolution ever burned), so child shares equal assets.
@@ -135,14 +133,14 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
         }
         assertEq(principalClaimed, totalStaked);
 
-        // Every child drew its fee copy (none here: the forking query's fee is excluded) plus its own
-        // winners' payouts, which never add up to the parked balance.
+        // Every child drew its own winners' payouts (no fee copy: the forking query's fee is excluded),
+        // which never add up to the parked balance.
         for (uint256 o = 0; o < outcomes.length; o++) {
             assertLe(zoltar.splitPerChild(address(multiverse), GENESIS_UID, outcomes[o]), parked);
         }
 
-        // The stakes left the parked supply as counted migration, nothing more and nothing less: what
-        // stays parked is the forking query's fee.
+        // The stakes left the parked supply as counted migration; what stays parked is the forking
+        // query's fee.
         (,,,,,,,,,, uint128 totalOut,, uint128 unmigratedAfter) = multiverse.universes(GENESIS_UID);
         assertEq(totalOut, totalStaked);
         assertEq(unmigratedAfter, unmigratedBefore - totalStaked);

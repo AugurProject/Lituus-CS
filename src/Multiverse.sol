@@ -880,6 +880,18 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         return amount + amount * totalDistributable / winnerStaked;
     }
 
+    /// @dev A forking query stake's payout in the child of its outcome. Every child pays the same return: the
+    ///      one the outcomes at the cap would get, which is the lowest of all. The outcomes at the cap hold
+    ///      exactly `cap` each and nothing holds more, so their losing side is `totalStaked - cap`. A smaller
+    ///      outcome gets the same multiplier instead of the whole of the other outcomes, and the rest of its
+    ///      losing side is never drawn from the parked balance.
+    function _forkPayout(QueryResolution storage resolution, uint256 amount) internal view returns (uint256) {
+        uint256 cap = resolution.cap;
+        uint256 totalLoserStakes = resolution.totalStaked - cap;
+        uint256 totalDistributable = totalLoserStakes - totalLoserStakes / BURN_DIVIDER;
+        return amount + amount * totalDistributable / cap;
+    }
+
     /* ========================================== QUERY FEE EXTERNALS ============================================ */
     /**
      * @notice Pushes a universe's recent realized profits to the fee controller to run its monthly
@@ -1837,8 +1849,8 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     /**
      * @notice Claims the caller's stake on the forking query out of a forked universe, into the child that
      *         resolves the query to that outcome. In the child for outcome X the query is resolved to X, so a
-     *         stake on X is a winning stake there: it comes back with its share of the losing stakes after the
-     *         burn cut, in the child's wREP.
+     *         stake on X is a winning stake there: it comes back with the return every child pays (see
+     *         _forkPayout), in the child's wREP.
      * @dev The stake record stays in the parent; the payout is drawn from the parked migration balance, which
      *      Zoltar tracks per child, so the one record pays each child's winners from that child's own copy.
      *      Zeroing the stake before any transfer makes it claimable once, and since the outcome fixes the
@@ -1876,7 +1888,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         // Zeroed is the settled flag, set before any transfer.
         resolution.userStakes[msg.sender][outcome] = 0;
 
-        uint256 payout = _winningPayout(resolution, outcome, amount);
+        uint256 payout = _forkPayout(resolution, amount);
 
         // Both amounts are parent shares. The parent rate is frozen since the fork, so they convert to the
         // same assets whenever the claim happens.

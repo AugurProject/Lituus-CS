@@ -11,8 +11,8 @@ import { MultiverseFixtures } from "./Multiverse.fixtures.sol";
 ///      stubs). Refunds of the other queries and SupplyRestoration are later phases and not tested here.
 contract MultiverseForkTest is MultiverseFixtures {
     uint8 internal constant INVALID_OUTCOME = 255;
-    // On the fixture ladder both capped outcomes hold exactly the cap, so a winner's payout in its own
-    // child is the cap plus 80% of the other side.
+    // On the fixture ladder the two capped outcomes are the only ones staked, so the losing side of the cap
+    // is the other cap: a winner's payout in its own child is its 32 plus 80% of 32.
     uint256 internal constant WINNER_PAYOUT = 32 ether + 32 ether * 4 / 5;
 
     /// @dev Escalates a query in `universeId` until the fork fires (the second outcome reaches the
@@ -1211,9 +1211,9 @@ contract MultiverseForkTest is MultiverseFixtures {
         assertEq(multiverse.getUserStake(GENESIS_UID, queryId, user, OUTCOME_B), 0);
     }
 
-    function test_MigrateStake_ThirdOutcomeWinsInItsOwnChild() public {
+    function test_MigrateStake_ThirdOutcomeWinsInItsOwnChildAtTheCappedReturn() public {
         // user A 1, challenger B 2, bystander C 6, user A 15, challenger B 30 (B at the cap), user A 16
-        // (A at the cap, fork): C never reached the cap but holds bystander's 6.
+        // (A at the cap, fork): C never reached the cap but holds bystander's 6. Total 70.
         uint256 queryId = _createDefaultQuery();
         address[6] memory reporters = [user, challenger, bystander, user, challenger, user];
         uint8[6] memory outcomes = [OUTCOME_A, OUTCOME_B, OUTCOME_C, OUTCOME_A, OUTCOME_B, OUTCOME_A];
@@ -1224,16 +1224,24 @@ contract MultiverseForkTest is MultiverseFixtures {
         assertEq(uint8(_universeState(GENESIS_UID)), uint8(Multiverse.UniverseState.Migration));
         assertEq(multiverse.getUserStake(GENESIS_UID, queryId, bystander, OUTCOME_C), 6 ether);
 
-        // Anyone can spawn the C child; there the query resolved to C and both capped sides lost.
+        // Anyone can spawn the C child; there the query resolved to C and both capped sides lost. Every
+        // child pays the capped outcomes' return: 80% of (70 - 32) over 32, so 6 earns 5.7, not 80% of 64.
         vm.prank(bystander);
         multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_C);
         uint248 child3 = _childId(GENESIS_UID, OUTCOME_C);
         vm.prank(bystander);
         multiverse.migrateStake(GENESIS_UID, queryId, OUTCOME_C, OUTCOME_C);
-        // The only C staker takes the whole 80% of A and B: 6 + 0.8 * 64.
-        assertEq(multiverse.repTokenOf(child3).balanceOf(bystander), 6 ether + 64 ether * 4 / 5);
-        uint256 parked = zoltar.getMigrationRepBalance(address(multiverse), GENESIS_UID);
-        assertLe(_drawnIntoChild(GENESIS_UID, OUTCOME_C), parked);
+        uint256 cappedReturn = 6 ether * (38 ether * 4 / 5) / 32 ether;
+        assertEq(multiverse.repTokenOf(child3).balanceOf(bystander), 6 ether + cappedReturn);
+        assertEq(cappedReturn, 5.7 ether);
+        // The rest of A and B stays parked: the C child drew only the payout.
+        assertEq(_drawnIntoChild(GENESIS_UID, OUTCOME_C), 6 ether + cappedReturn);
+
+        // The capped sides earn the same return on their 32: 32 + 30.4 each, in their own child.
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_B);
+        vm.prank(challenger);
+        multiverse.migrateStake(GENESIS_UID, queryId, OUTCOME_B, OUTCOME_B);
+        assertEq(multiverse.repTokenOf(_childId(GENESIS_UID, OUTCOME_B)).balanceOf(challenger), 32 ether + 30.4 ether);
 
         // In the A child the C stake is a losing one.
         multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
