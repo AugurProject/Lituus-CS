@@ -128,9 +128,9 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
         // Respect the reporting window for the first report and the appeal window for escalations.
         uint256 stakeCount = ghostStakeCount[queryId];
         if (stakeCount == 0) {
-            if (ghostNow > ghostQueryCreateTime[queryId] + MULTIVERSE.THREE_DAYS()) return;
+            if (ghostNow > ghostQueryCreateTime[queryId] + MULTIVERSE.REPORTING_PERIOD()) return;
         } else {
-            if (ghostNow > _lastStakeTime(queryId) + MULTIVERSE.ONE_DAY()) return;
+            if (ghostNow > _lastStakeTime(queryId) + MULTIVERSE.APPEAL_PERIOD()) return;
         }
 
         // Pick from the valid outcome set {1..numberOfOutcomes, INVALID}; when escalating, shift
@@ -198,9 +198,9 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
         // resolve() requires the window end to be strictly in the past.
         uint256 stakeCount = ghostStakeCount[queryId];
         if (stakeCount == 0) {
-            if (ghostNow <= ghostQueryCreateTime[queryId] + MULTIVERSE.THREE_DAYS()) return;
+            if (ghostNow <= ghostQueryCreateTime[queryId] + MULTIVERSE.REPORTING_PERIOD()) return;
         } else {
-            if (ghostNow <= _lastStakeTime(queryId) + MULTIVERSE.ONE_DAY()) return;
+            if (ghostNow <= _lastStakeTime(queryId) + MULTIVERSE.APPEAL_PERIOD()) return;
         }
 
         uint256 winnerOutcome = stakeCount == 0 ? MULTIVERSE.INVALID() : ghostLastOutcome[queryId];

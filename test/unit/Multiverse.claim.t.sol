@@ -18,7 +18,7 @@ import { MultiverseFixtures } from "./Multiverse.fixtures.sol";
 ///        payout(user)      = 1e18 + 1e18 * 1.6e18 / 4e18 = 1.4e18
 ///        payout(bystander) = 3e18 + 3e18 * 1.6e18 / 4e18 = 4.2e18
 ///      The first report lands 18 hours after creation, so the fee reward push-paid to `user` at
-///      resolution is exactly a quarter of the fee: fee * 18h / THREE_DAYS = 0.25e18.
+///      resolution is exactly a quarter of the fee: fee * 18h / REPORTING_PERIOD = 0.25e18.
 contract MultiverseClaimTest is MultiverseFixtures {
     event Transfer(address indexed from, address indexed to, uint256 value);
 
@@ -72,7 +72,7 @@ contract MultiverseClaimTest is MultiverseFixtures {
         uint256 queryId = _createReportedLadder();
 
         // Resolve pays `user` (first reporter of the winning outcome A) the ramped fee share only:
-        // fee * 18h / THREE_DAYS = 1e18 / 4 = 0.25e18.
+        // fee * 18h / REPORTING_PERIOD = 1e18 / 4 = 0.25e18.
         uint256 userBalanceBeforeResolve = genesisRep.balanceOf(user);
         _resolve(bystander, queryId);
         assertEq(genesisRep.balanceOf(user), userBalanceBeforeResolve + 0.25 ether);

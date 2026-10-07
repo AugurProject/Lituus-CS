@@ -41,8 +41,8 @@ contract MultiverseResolveTest is MultiverseFixtures {
         assertEq(outcome, multiverse.INVALID());
 
         // the payment should be half of the query fee (half of the time passed)
-        // fee = 1 ether, elapsed past the deadline = 36 hours (129600 s), THREE_DAYS = 3 days (259200 s)
-        // resolverPay = fee * elapsed / THREE_DAYS = 1e18 * 129600 / 259200 = 0.5e18
+        // fee = 1 ether, elapsed past the deadline = 36 hours (129600 s), REPORTING_PERIOD = 3 days (259200 s)
+        // resolverPay = fee * elapsed / REPORTING_PERIOD = 1e18 * 129600 / 259200 = 0.5e18
         // The other half of the fee is the query's profit, burned at resolve.
         assertEq(genesisRep.balanceOf(user), userBalanceBefore + 0.5 ether);
         assertEq(genesisRep.balanceOf(address(multiverse)), multiverseBalanceBefore - 1 ether);
@@ -92,7 +92,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
         uint256 queryId = _createDefaultQuery();
         uint256 userBalanceBefore = genesisRep.balanceOf(user);
 
-        // Exactly three days past the deadline: elapsed == THREE_DAYS hits the `>=` cap branch.
+        // Exactly three days past the deadline: elapsed == REPORTING_PERIOD hits the `>=` cap branch.
         vm.warp(START_TIME + 3 days + 3 days);
         _resolve(user, queryId);
 
@@ -123,7 +123,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
         vm.warp(START_TIME + 3 days + 36 hours);
         _resolve(bystander, queryId);
 
-        // resolverPay = fee * elapsed / THREE_DAYS = 4e18 * 129600 / 259200 = 2e18
+        // resolverPay = fee * elapsed / REPORTING_PERIOD = 4e18 * 129600 / 259200 = 2e18
         assertEq(genesisRep.balanceOf(bystander), bystanderBalanceBefore + 2 ether);
     }
 
@@ -195,7 +195,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
         assertEq(multiverse.getUserStake(GENESIS_UID, queryId, user, OUTCOME_A), 0);
 
         // reporterPay is half the query fee (half of the time passed)
-        // reporterPay = fee * elapsed / THREE_DAYS = 1e18 * 129600 / 259200 = 0.5e18;
+        // reporterPay = fee * elapsed / REPORTING_PERIOD = 1e18 * 129600 / 259200 = 0.5e18;
         // the reporter also gets the 1 ether stake back in the same transfer -> 1.5 ether total.
         assertEq(genesisRep.balanceOf(user), userBalanceBefore + 1.5 ether);
         // The resolver of a reported query earns nothing — the fee reward is the reporter's.
@@ -273,7 +273,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
         _report(user, queryId, OUTCOME_A);
         _warpPastAppealWindow(queryId);
 
-        // reporterPay = fee * elapsed / THREE_DAYS = 1e18 / 2 = 0.5e18
+        // reporterPay = fee * elapsed / REPORTING_PERIOD = 1e18 / 2 = 0.5e18
         vm.expectEmit(true, true, true, true, address(multiverse));
         emit Multiverse.ReporterRewardPaid(user, GENESIS_UID, queryId, 0.5 ether);
 
@@ -290,7 +290,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
         uint256 queryId = _createDefaultQuery();
 
         // Exactly at the reporting deadline the query is still reportable (strict `<`), and
-        // elapsed == THREE_DAYS hits the `>=` cap branch: the reward is the whole fee.
+        // elapsed == REPORTING_PERIOD hits the `>=` cap branch: the reward is the whole fee.
         vm.warp(START_TIME + 3 days);
         _report(user, queryId, OUTCOME_A);
         _warpPastAppealWindow(queryId);
@@ -321,7 +321,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
         uint256 multiverseBalanceBefore = genesisRep.balanceOf(address(multiverse));
 
         // The winning outcome's first stake landed 18 hours after creation: 1/4 of the ramp elapsed
-        // reporterPay = fee * elapsed / THREE_DAYS = 1e18 / 4 = 1e18 * 64800 / 259200 = 0.25e18
+        // reporterPay = fee * elapsed / REPORTING_PERIOD = 1e18 / 4 = 1e18 * 64800 / 259200 = 0.25e18
         vm.expectEmit(true, true, true, true, address(multiverse));
         emit Multiverse.ReporterRewardPaid(bystander, GENESIS_UID, queryId, 0.25 ether);
 
@@ -426,7 +426,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
         // earliest of them (user's stake 0, 18 hours in, 1/4 fee) and must not be overwritten by the later
         // repeats — neither challenger's stake 2 nor the ramp time of user's own stake 4 (+66h,
         // which would pay 11/12 of the fee instead):
-        // reporterPay = fee * elapsed / THREE_DAYS = 1e18 * 1/4 = 0.25e18
+        // reporterPay = fee * elapsed / REPORTING_PERIOD = 1e18 * 1/4 = 0.25e18
         vm.expectEmit(true, true, true, true, address(multiverse));
         emit Multiverse.ReporterRewardPaid(user, GENESIS_UID, queryId, 0.25 ether);
 
@@ -453,7 +453,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
         _report(bystander, queryId, OUTCOME_B); // stake 1: 8 ether, 18h after creation
         _warpPastAppealWindow(queryId);
 
-        // reporterPay = fee * elapsed / THREE_DAYS = 4e18 * 64800 / 259200 = 1e18
+        // reporterPay = fee * elapsed / REPORTING_PERIOD = 4e18 * 64800 / 259200 = 1e18
         vm.expectEmit(true, true, true, true, address(multiverse));
         emit Multiverse.ReporterRewardPaid(bystander, GENESIS_UID, queryId, 1 ether);
 
@@ -477,7 +477,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
         _warpPastAppealWindow(queryId);
 
         // The winning stake landed 3 days + 19 hours after creation — past the ramp end, so the
-        // reward is capped at the whole 1 ether fee instead of fee * elapsed / THREE_DAYS.
+        // reward is capped at the whole 1 ether fee instead of fee * elapsed / REPORTING_PERIOD.
         vm.expectEmit(true, true, true, true, address(multiverse));
         emit Multiverse.ReporterRewardPaid(bystander, GENESIS_UID, queryId, 1 ether);
 
@@ -611,7 +611,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
 
     function test_Resolve_Ladder_LateWinningOutcomeEarnsWholeFee() public {
         // An outcome can first be backed after the reporting window, as an appeal. If it wins, its first
-        // reporter's ramp runs past THREE_DAYS and pays the whole fee. Ladder: A 1, B 2, A 3, then C
+        // reporter's ramp runs past REPORTING_PERIOD and pays the whole fee. Ladder: A 1, B 2, A 3, then C
         // enters at 78h with twice the pot (12) and wins.
         uint256 queryId = _createDefaultQuery();
 
@@ -642,7 +642,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
     function test_Resolve_AtEarliestMomentAfterReportingWindow() public {
         uint256 queryId = _createDefaultQuery();
 
-        // Literal offset on purpose: THREE_DAYS in the contract must equal 3 days (259200 s).
+        // Literal offset on purpose: REPORTING_PERIOD in the contract must equal 3 days (259200 s).
         vm.warp(START_TIME + 3 days + 1);
         uint256 outcome = _resolve(user, queryId);
         assertEq(outcome, multiverse.INVALID());
@@ -652,7 +652,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
     function test_Resolve_AtEarliestMomentAfterAppealWindow() public {
         uint256 queryId = _createReportedQuery(OUTCOME_A); // stake placed at START_TIME
 
-        // Literal offset on purpose: ONE_DAY in the contract must equal 1 day (86400 s).
+        // Literal offset on purpose: APPEAL_PERIOD in the contract must equal 1 day (86400 s).
         vm.warp(START_TIME + 1 days + 1);
         uint256 outcome = _resolve(user, queryId);
         assertEq(outcome, OUTCOME_A);
@@ -770,7 +770,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
     function test_RevertWhen_ExactlyAtAppealDeadline() public {
         uint256 queryId = _createReportedQuery(OUTCOME_A); // stake placed at START_TIME
 
-        // The appeal check is strict `<`: exactly ONE_DAY after the stake it is still appealable,
+        // The appeal check is strict `<`: exactly APPEAL_PERIOD after the stake it is still appealable,
         // so it cannot be resolved yet.
         vm.warp(START_TIME + 1 days);
         vm.prank(user);

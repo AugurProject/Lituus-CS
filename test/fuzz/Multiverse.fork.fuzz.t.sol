@@ -218,7 +218,7 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
     /// reporter's first report, and pays nothing for an outcome nobody staked on.
     function testFuzz_Spawn_PaysEachChildsFirstReporterTheRamp(uint256 seed, uint256 delay) public {
         // Any delay inside the reporting window; at its end the ramp pays the whole fee.
-        delay = bound(delay, 0, multiverse.THREE_DAYS());
+        delay = bound(delay, 0, multiverse.REPORTING_PERIOD());
         feeCtl.setFee(DEFAULT_FEE);
 
         uint256 queryId = _createQuery();
@@ -226,7 +226,7 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
         vm.warp(createdAt + delay);
         // The whole ladder lands in one block, so every outcome's first report is at the same time.
         _buildRandomForkingLadderOn(queryId, seed);
-        uint256 expectedReward = DEFAULT_FEE * delay / multiverse.THREE_DAYS();
+        uint256 expectedReward = DEFAULT_FEE * delay / multiverse.REPORTING_PERIOD();
 
         for (uint256 o = 0; o < outcomes.length; o++) {
             Multiverse.OutcomeStakes memory side = multiverse.getOutcomeStakes(GENESIS_UID, queryId, outcomes[o]);

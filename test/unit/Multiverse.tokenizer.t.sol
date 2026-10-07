@@ -156,7 +156,7 @@ contract MultiverseTokenizerTest is QueryTokenizerFixtures {
         // Idle two windows plus a partial-window offset: the view must catch the 60-day cache up
         // in memory (only the mutating path persists it) and interpolate the partial window —
         // parity must survive a stale cache.
-        vm.warp(vm.getBlockTimestamp() + 2 * multiverse.THREE_DAYS() + 1 days);
+        vm.warp(vm.getBlockTimestamp() + 2 * multiverse.REPORTING_PERIOD() + 1 days);
         preview = _previewUncappedFee();
         vm.prank(user);
         multiverse.createQuery(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
@@ -164,7 +164,7 @@ contract MultiverseTokenizerTest is QueryTokenizerFixtures {
         assertEq(chargedFee, preview);
 
         // Idle past 20 windows: the cache roll switches to the full recompute branch.
-        vm.warp(vm.getBlockTimestamp() + 21 * multiverse.THREE_DAYS() + 36 hours);
+        vm.warp(vm.getBlockTimestamp() + 21 * multiverse.REPORTING_PERIOD() + 36 hours);
         preview = _previewUncappedFee();
         vm.prank(user);
         multiverse.createQuery(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);

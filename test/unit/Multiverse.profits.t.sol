@@ -12,8 +12,21 @@ contract MultiverseHarness is Multiverse {
         IZoltar zoltar,
         uint248 genesisUniverseId,
         IQueryFeeController queryFeeController,
-        address queryTokenizer
-    ) Multiverse(zoltar, genesisUniverseId, queryFeeController, queryTokenizer) { }
+        address queryTokenizer,
+        uint256 migrationDuration,
+        uint256 reportingPeriod,
+        uint256 appealPeriod
+    )
+        Multiverse(
+            zoltar,
+            genesisUniverseId,
+            queryFeeController,
+            queryTokenizer,
+            migrationDuration,
+            reportingPeriod,
+            appealPeriod
+        )
+    { }
 
     function exposed_getProfits(uint248 universeId) external view returns (uint256, uint256) {
         return _getProfits(universeId);
@@ -31,7 +44,9 @@ contract MultiverseProfitsTest is MultiverseDeployFixture {
     MultiverseHarness internal harness;
 
     function _deployMultiverse(IQueryFeeController controller) internal override returns (Multiverse) {
-        harness = new MultiverseHarness(zoltar, GENESIS_UID, controller, queryTokenizerStub);
+        harness = new MultiverseHarness(
+            zoltar, GENESIS_UID, controller, queryTokenizerStub, MIGRATION_DURATION, REPORTING_PERIOD, APPEAL_PERIOD
+        );
         return Multiverse(address(harness));
     }
 

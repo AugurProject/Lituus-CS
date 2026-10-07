@@ -142,8 +142,8 @@ contract MultiverseInvariantTest is MultiverseDeployFixture {
     }
 
     /// @dev Stake times never decrease (same-block stakes are legal, amounts still differ) and
-    ///      every stake landed inside its window: the first within THREE_DAYS of the query's
-    ///      creation in this universe, each escalation within ONE_DAY of the previous stake. The
+    ///      every stake landed inside its window: the first within REPORTING_PERIOD of the query's
+    ///      creation in this universe, each escalation within APPEAL_PERIOD of the previous stake. The
     ///      live head time is the ghost time of the latest stake.
     function invariant_StakeTimesMonotonicAndInWindow() public view {
         uint256 count = multiverse.queryCount();
@@ -152,10 +152,10 @@ contract MultiverseInvariantTest is MultiverseDeployFixture {
             if (stakeCount == 0) continue;
             ResolutionView memory r = _resolution(i);
             assertGe(handler.ghostStakeTime(i, 0), r.queryCreateTime);
-            assertLe(handler.ghostStakeTime(i, 0), uint256(r.queryCreateTime) + multiverse.THREE_DAYS());
+            assertLe(handler.ghostStakeTime(i, 0), uint256(r.queryCreateTime) + multiverse.REPORTING_PERIOD());
             for (uint256 j = 1; j < stakeCount; ++j) {
                 assertGe(handler.ghostStakeTime(i, j), handler.ghostStakeTime(i, j - 1));
-                assertLe(handler.ghostStakeTime(i, j), handler.ghostStakeTime(i, j - 1) + multiverse.ONE_DAY());
+                assertLe(handler.ghostStakeTime(i, j), handler.ghostStakeTime(i, j - 1) + multiverse.APPEAL_PERIOD());
             }
             assertEq(r.lastStakeTime, handler.ghostStakeTime(i, stakeCount - 1));
         }

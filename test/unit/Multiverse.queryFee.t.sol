@@ -646,7 +646,7 @@ contract MultiverseUpdateBaseFeeTest is QueryFeeTestHelpers {
         vm.prank(user);
         multiverse.createQuery(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
 
-        vm.warp(START_TIME + multiverse.THREE_DAYS() + 1);
+        vm.warp(START_TIME + multiverse.REPORTING_PERIOD() + 1);
         multiverse.resolve(GENESIS_UID, 0);
 
         (,, uint48 timeBefore) = controller.feeStates(GENESIS_UID);

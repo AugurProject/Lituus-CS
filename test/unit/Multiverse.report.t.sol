@@ -60,8 +60,8 @@ contract MultiverseReportTest is MultiverseFixtures {
         uint256 queryId = _createDefaultQuery();
         uint48 queryCreateTime = _resolution(queryId).queryCreateTime;
 
-        // The window check is strict `<`, so exactly THREE_DAYS after creation is still reportable.
-        vm.warp(queryCreateTime + multiverse.THREE_DAYS());
+        // The window check is strict `<`, so exactly REPORTING_PERIOD after creation is still reportable.
+        vm.warp(queryCreateTime + multiverse.REPORTING_PERIOD());
         _report(user, queryId, OUTCOME_A);
     }
 
@@ -171,8 +171,8 @@ contract MultiverseReportTest is MultiverseFixtures {
     function test_Report_Escalation_AtAppealDeadline() public {
         uint256 queryId = _createReportedQuery(OUTCOME_A);
 
-        // The appeal check is strict `<`, so exactly ONE_DAY after the last stake is still open.
-        vm.warp(_resolution(queryId).lastStakeTime + multiverse.ONE_DAY());
+        // The appeal check is strict `<`, so exactly APPEAL_PERIOD after the last stake is still open.
+        vm.warp(_resolution(queryId).lastStakeTime + multiverse.APPEAL_PERIOD());
         _report(bystander, queryId, OUTCOME_B);
     }
 
@@ -230,14 +230,14 @@ contract MultiverseReportTest is MultiverseFixtures {
         uint48 queryCreateTime = _resolution(queryId).queryCreateTime;
 
         // First report lands near the end of the 3-day reporting window
-        uint256 firstReportTime = queryCreateTime + multiverse.THREE_DAYS() - 1 hours;
+        uint256 firstReportTime = queryCreateTime + multiverse.REPORTING_PERIOD() - 1 hours;
         vm.warp(firstReportTime);
         _report(user, queryId, OUTCOME_A);
 
         // The escalation lands after the reporting window has passed. Only the appeal
         // window governs escalations.
         uint256 escalationTime = firstReportTime + 20 hours;
-        assertGt(escalationTime, queryCreateTime + multiverse.THREE_DAYS());
+        assertGt(escalationTime, queryCreateTime + multiverse.REPORTING_PERIOD());
         vm.warp(escalationTime);
         _report(bystander, queryId, OUTCOME_B);
     }
@@ -248,7 +248,7 @@ contract MultiverseReportTest is MultiverseFixtures {
 
         // Place the first stake near the end of the reporting window so the query is already
         // older than three days by the time of the last stake.
-        uint256 firstStakeTime = queryCreateTime + multiverse.THREE_DAYS() - 1 hours;
+        uint256 firstStakeTime = queryCreateTime + multiverse.REPORTING_PERIOD() - 1 hours;
         vm.warp(firstStakeTime);
         _report(user, queryId, OUTCOME_A);
 
@@ -256,10 +256,10 @@ contract MultiverseReportTest is MultiverseFixtures {
         vm.warp(secondStakeTime);
         _report(bystander, queryId, OUTCOME_B);
 
-        // The appeal window is measured from the last stake only: a report exactly ONE_DAY after
+        // The appeal window is measured from the last stake only: a report exactly APPEAL_PERIOD after
         // the second stake succeeds even though the first stake is now almost two days old.
-        uint256 lastStakeTime = secondStakeTime + multiverse.ONE_DAY();
-        assertGt(lastStakeTime, queryCreateTime + multiverse.THREE_DAYS());
+        uint256 lastStakeTime = secondStakeTime + multiverse.APPEAL_PERIOD();
+        assertGt(lastStakeTime, queryCreateTime + multiverse.REPORTING_PERIOD());
         vm.warp(lastStakeTime);
         _report(challenger, queryId, OUTCOME_A);
     }
@@ -483,7 +483,7 @@ contract MultiverseReportTest is MultiverseFixtures {
         uint48 queryCreateTime = _resolution(queryId).queryCreateTime;
 
         // One second past the deadline is the earliest moment a first report must revert.
-        vm.warp(queryCreateTime + multiverse.THREE_DAYS() + 1);
+        vm.warp(queryCreateTime + multiverse.REPORTING_PERIOD() + 1);
         vm.prank(user);
         vm.expectRevert(Multiverse.QueryExpired.selector);
         multiverse.report(GENESIS_UID, queryId, OUTCOME_A);
@@ -500,7 +500,7 @@ contract MultiverseReportTest is MultiverseFixtures {
         uint256 queryId = _createReportedQuery(OUTCOME_A);
 
         // One second past the appeal deadline is the earliest moment an escalation must revert.
-        vm.warp(_resolution(queryId).lastStakeTime + multiverse.ONE_DAY() + 1);
+        vm.warp(_resolution(queryId).lastStakeTime + multiverse.APPEAL_PERIOD() + 1);
         vm.prank(bystander);
         vm.expectRevert(Multiverse.AppealPeriodOver.selector);
         multiverse.report(GENESIS_UID, queryId, OUTCOME_B);
@@ -509,7 +509,7 @@ contract MultiverseReportTest is MultiverseFixtures {
     function test_RevertWhen_QueryAlreadyResolved() public {
         uint256 queryId = _createReportedQuery(OUTCOME_A);
 
-        vm.warp(_resolution(queryId).lastStakeTime + multiverse.ONE_DAY() + 1);
+        vm.warp(_resolution(queryId).lastStakeTime + multiverse.APPEAL_PERIOD() + 1);
         multiverse.resolve(GENESIS_UID, queryId);
 
         vm.prank(bystander);
@@ -522,7 +522,7 @@ contract MultiverseReportTest is MultiverseFixtures {
         uint256 queryId = _createDefaultQuery();
         uint48 queryCreateTime = _resolution(queryId).queryCreateTime;
 
-        vm.warp(queryCreateTime + multiverse.THREE_DAYS() + 1);
+        vm.warp(queryCreateTime + multiverse.REPORTING_PERIOD() + 1);
         multiverse.resolve(GENESIS_UID, queryId);
 
         vm.prank(user);

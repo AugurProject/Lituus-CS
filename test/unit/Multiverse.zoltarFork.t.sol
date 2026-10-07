@@ -97,7 +97,7 @@ contract MultiverseZoltarForkTest is MultiverseFixtures {
 
         // Resolve the unreported query past the full resolver ramp: the resolver takes the whole fee out of
         // the vault, nothing is burned, and the rest of the pot is parked by the mirror in the same tx.
-        vm.warp(START_TIME + 2 * multiverse.THREE_DAYS() + 1);
+        vm.warp(START_TIME + 2 * multiverse.REPORTING_PERIOD() + 1);
         uint256 potBefore = genesisRep.balanceOf(address(multiverse));
         uint128 feesBefore = _universe(GENESIS_UID).totalQueryFees;
 
@@ -257,7 +257,7 @@ contract MultiverseZoltarForkTest is MultiverseFixtures {
         multiverse.migrate(GENESIS_UID, answerB, 400 ether);
         assertEq(_repOf(_childId(answerB)).balanceOf(challenger), 400 ether);
 
-        vm.warp(vm.getBlockTimestamp() + multiverse.SIXTY_DAYS());
+        vm.warp(vm.getBlockTimestamp() + multiverse.MIGRATION_DURATION());
         multiverse.advanceForkState(GENESIS_UID);
 
         assertEq(uint8(_universe(GENESIS_UID).state), uint8(Multiverse.UniverseState.PostFork));
@@ -285,7 +285,7 @@ contract MultiverseZoltarForkTest is MultiverseFixtures {
         // Unsettled: the running max is not followed.
         assertEq(multiverse.getOutcome(GENESIS_UID, forkQuery), multiverse.UNRESOLVED());
 
-        vm.warp(vm.getBlockTimestamp() + multiverse.SIXTY_DAYS());
+        vm.warp(vm.getBlockTimestamp() + multiverse.MIGRATION_DURATION());
         multiverse.advanceForkState(GENESIS_UID);
         assertEq(multiverse.canonicalHeir(), child2);
         assertEq(multiverse.getOutcome(GENESIS_UID, forkQuery), 2);
@@ -311,11 +311,12 @@ contract MultiverseZoltarForkTest is MultiverseFixtures {
     }
 
     function test_Mirror_InheritedQueriesUseMirrorTime() public {
-        // A ladder whose appeal window lapses before the mirror tx, and a query created right before it.
+        // A ladder whose appeal window lapses before the mirror tx, and a query created right before it:
+        // both restart in the children with a full window clocked from the mirror tx (the Lituus-time fork).
         uint256 settledId = _createReportedQuery(OUTCOME_B);
         uint256 zq = _createZoltarCategoricalQuestion(2);
         _forkZoltarNatively(zq);
-        vm.warp(START_TIME + multiverse.ONE_DAY() + 1);
+        vm.warp(START_TIME + multiverse.APPEAL_PERIOD() + 1);
         uint256 freshId = _createDefaultQuery();
         uint256 mirrorTime = vm.getBlockTimestamp();
         _mirror();
@@ -323,7 +324,7 @@ contract MultiverseZoltarForkTest is MultiverseFixtures {
         uint248 child1 = _childId(1);
 
         // The mirrored child is a fully functional universe: migrate in, create and report a new query.
-        // (Done before the inherited resolutions below: those burn nearly all of the child's fee-copy
+        // (Done before the inherited INVALID resolution below: it burns most of the child's fee-copy
         // shares, which — by the vault's burn-to-appreciate design — makes the few remaining shares, and
         // therefore the share-denominated fee cap, far dearer.)
         vm.prank(bystander);
@@ -337,22 +338,22 @@ contract MultiverseZoltarForkTest is MultiverseFixtures {
         vm.stopPrank();
         assertEq(multiverse.getOutcomeStakes(child1, newQueryId, OUTCOME_A).firstReporter, bystander);
 
-        // Settled before the (Lituus-time) fork: resolvable at once in the child, to the frozen outcome.
+        // The concluded ladder is reopened, not settled: its old outcome is not resolvable, and a fresh
+        // first report lands anchored at the mirror tx.
         vm.prank(bystander);
+        vm.expectRevert(Multiverse.QueryNotReadyToResolve.selector);
         multiverse.resolve(child1, settledId);
-        assertEq(multiverse.getOutcome(child1, settledId), OUTCOME_B);
-
-        _spawn(2);
-        uint248 child2 = _childId(2);
         vm.prank(bystander);
-        multiverse.resolve(child2, settledId);
-        assertEq(multiverse.getOutcome(child2, settledId), OUTCOME_B);
+        multiverse.report(child1, settledId, OUTCOME_A);
+        (uint48 childCreateTime,, uint16 childStakeCount,,,,,,) = multiverse.queryResolutions(child1, settledId);
+        assertEq(childCreateTime, mirrorTime);
+        assertEq(childStakeCount, 1);
 
-        // Fresh: its clock restarts at the mirror tx, so it is not resolvable until that window lapses.
+        // Fresh: its clock restarts at the mirror tx too, so it is not resolvable until that window lapses.
         vm.prank(bystander);
         vm.expectRevert(Multiverse.QueryNotReadyToResolve.selector);
         multiverse.resolve(child1, freshId);
-        vm.warp(mirrorTime + multiverse.THREE_DAYS() + 1);
+        vm.warp(mirrorTime + multiverse.REPORTING_PERIOD() + 1);
         vm.prank(bystander);
         multiverse.resolve(child1, freshId);
         assertEq(multiverse.getOutcome(child1, freshId), multiverse.INVALID());
