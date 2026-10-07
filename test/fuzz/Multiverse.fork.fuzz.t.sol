@@ -6,9 +6,9 @@ import { LituusRep } from "src/LituusRep.sol";
 import { ILituusRep } from "src/interfaces/ILituusRep.sol";
 import { MultiverseFuzzFixtures } from "./Multiverse.fuzz.fixtures.sol";
 
-/// @notice Property-based tests for the forking query's payouts: random ladders over A, B, C and
-///         INVALID from three reporters, forked, spawned on every outcome, and claimed into every
-///         child.
+/// @notice Property-based tests for the forking query's payouts and the settlement of the parent's other
+///         queries: random ladders over A, B, C and INVALID from three reporters, forked, spawned on every
+///         outcome, and claimed into every child.
 /// @dev The fee bound keeps the first stake well below the cap so ladders take several rounds to fork,
 ///      and keeps every reporter's cumulative stakes within its balance: the two capped outcomes hold
 ///      the cap each and no other outcome can exceed it. The third reporter gets wREP wrapped from the
@@ -24,6 +24,10 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
     // leaving the user 200 ether at the high end, enough for the cap on every outcome.
     uint256 internal constant MIN_RATE_BURN = 0.001 ether;
     uint256 internal constant MAX_RATE_BURN = 800 ether;
+    // Side queries of the settlement fuzz: with at most three reports on a fee of 0.1 ether or less, a
+    // ladder never gets anywhere near the cap.
+    uint256 internal constant SIDE_QUERIES = 3;
+    uint256 internal constant MAX_SIDE_REPORTS = 3;
     uint256 internal constant INVALID_OUTCOME = type(uint256).max;
 
     address internal reporterTwo = makeAddr("reporterTwo");
@@ -66,29 +70,39 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
     ///      from the stake required before each report.
     function _buildRandomForkingLadderOn(uint256 queryId, uint256 seed) internal returns (uint256[4][3] memory staked) {
         for (uint256 step = 0; step < MAX_LADDER_STEPS; step++) {
-            uint256 roll = uint256(keccak256(abi.encode(seed, step)));
-            uint256 reporterIndex = roll % reporters.length;
-            uint256 outcomeIndex = (roll >> 8) % outcomes.length;
-            uint256 requiredStake;
-            bool found;
-            for (uint256 shift = 0; shift < outcomes.length; shift++) {
-                uint256 candidate = (outcomeIndex + shift) % outcomes.length;
-                try multiverse.getNextRequiredStake(GENESIS_UID, queryId, outcomes[candidate]) returns (uint256 stake) {
-                    outcomeIndex = candidate;
-                    requiredStake = stake;
-                    found = true;
-                    break;
-                } catch { }
-            }
-            assertTrue(found, "no stakeable outcome before the fork");
-
-            vm.prank(reporters[reporterIndex]);
-            multiverse.report(GENESIS_UID, queryId, outcomes[outcomeIndex]);
-            staked[reporterIndex][outcomeIndex] += requiredStake;
+            (uint256 reporterIndex, uint256 outcomeIndex, uint256 stake) =
+                _placeRandomReport(queryId, uint256(keccak256(abi.encode(seed, step))));
+            staked[reporterIndex][outcomeIndex] += stake;
 
             if (_universeState(GENESIS_UID) == Multiverse.UniverseState.Migration) return staked;
         }
         revert("ladder did not fork");
+    }
+
+    /// @dev Places one report on `queryId` from a reporter and an outcome picked by `roll`, skipping outcomes
+    ///      the contract will not take a stake on (the latest one, or one already holding two thirds of the
+    ///      total). Returns who staked how much on which outcome, indexed like `reporters` and `outcomes`,
+    ///      with the stake read from the quote before the report.
+    function _placeRandomReport(uint256 queryId, uint256 roll)
+        internal
+        returns (uint256 reporterIndex, uint256 outcomeIndex, uint256 stake)
+    {
+        reporterIndex = roll % reporters.length;
+        outcomeIndex = (roll >> 8) % outcomes.length;
+        bool found;
+        for (uint256 shift = 0; shift < outcomes.length; shift++) {
+            uint256 candidate = (outcomeIndex + shift) % outcomes.length;
+            try multiverse.getNextRequiredStake(GENESIS_UID, queryId, outcomes[candidate]) returns (uint256 required) {
+                outcomeIndex = candidate;
+                stake = required;
+                found = true;
+                break;
+            } catch { }
+        }
+        assertTrue(found, "no stakeable outcome");
+
+        vm.prank(reporters[reporterIndex]);
+        multiverse.report(GENESIS_UID, queryId, outcomes[outcomeIndex]);
     }
 
     /// @dev A forking query stake's payout in its child, in parent shares, from the parent record: the stake
@@ -242,5 +256,137 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
             assertEq(childRep.totalAssets(), expectedReward);
             assertLe(expectedReward, DEFAULT_FEE);
         }
+    }
+
+    /// @dev A query of the parent other than the forking one: who staked how much on which outcome, indexed
+    ///      like `reporters` and `outcomes`, and whether it was resolved before the fork.
+    struct SideQuery {
+        uint256 id;
+        uint256[4][3] staked;
+        bool resolved;
+    }
+
+    /// @dev Creates SIDE_QUERIES queries with up to MAX_SIDE_REPORTS random reports each, lets every appeal
+    ///      window lapse and resolves a random half of the reported ones. A single-stake query hands its
+    ///      reporter the stake back at resolution, so its record is already settled and its entry is cleared;
+    ///      a ladder of two or more keeps its winners' payouts for the claims lane.
+    function _buildSideQueries(uint256 seed) internal returns (SideQuery[] memory side) {
+        side = new SideQuery[](SIDE_QUERIES);
+        for (uint256 q = 0; q < SIDE_QUERIES; q++) {
+            side[q].id = _createQuery();
+            uint256 reports = uint256(keccak256(abi.encode(seed, "reports", q))) % (MAX_SIDE_REPORTS + 1);
+            for (uint256 i = 0; i < reports; i++) {
+                (uint256 r, uint256 o, uint256 stake) =
+                    _placeRandomReport(side[q].id, uint256(keccak256(abi.encode(seed, "side", q, i))));
+                side[q].staked[r][o] += stake;
+            }
+        }
+
+        vm.warp(vm.getBlockTimestamp() + multiverse.APPEAL_PERIOD() + 1);
+        for (uint256 q = 0; q < SIDE_QUERIES; q++) {
+            (,, uint16 stakeCount,,,,,,) = multiverse.queryResolutions(GENESIS_UID, side[q].id);
+            if (stakeCount == 0 || uint256(keccak256(abi.encode(seed, "resolve", q))) % 2 == 0) continue;
+            vm.prank(resolver);
+            multiverse.resolve(GENESIS_UID, side[q].id);
+            side[q].resolved = true;
+            if (stakeCount > 1) continue;
+            for (uint256 r = 0; r < reporters.length; r++) {
+                for (uint256 o = 0; o < outcomes.length; o++) {
+                    if (side[q].staked[r][o] == 0) continue;
+                    assertEq(multiverse.getUserStake(GENESIS_UID, side[q].id, reporters[r], outcomes[o]), 0);
+                    side[q].staked[r][o] = 0;
+                }
+            }
+        }
+    }
+
+    /// @dev Settles every side stake into a child picked by `seed`, checking each one against the record: a
+    ///      resolved query's winner gets the payout claim() would have made and its loser is refused, any
+    ///      other stake comes back as it was. Returns the votes added to each child, indexed like `outcomes`.
+    function _settleSideStakes(SideQuery[] memory side, uint256 seed) internal returns (uint256[4] memory votes) {
+        for (uint256 q = 0; q < side.length; q++) {
+            (,,, uint96 totalStaked,,,, uint256 winner,) = multiverse.queryResolutions(GENESIS_UID, side[q].id);
+            for (uint256 r = 0; r < reporters.length; r++) {
+                for (uint256 o = 0; o < outcomes.length; o++) {
+                    uint256 amount = side[q].staked[r][o];
+                    if (amount == 0) continue;
+                    assertEq(multiverse.getUserStake(GENESIS_UID, side[q].id, reporters[r], outcomes[o]), amount);
+                    uint256 childIndex = uint256(keccak256(abi.encode(seed, "child", q, r, o))) % outcomes.length;
+
+                    uint256 payout = amount;
+                    if (side[q].resolved) {
+                        if (outcomes[o] != winner) {
+                            vm.prank(reporters[r]);
+                            vm.expectRevert(Multiverse.NotAWinningOutcome.selector);
+                            multiverse.migrateStake(GENESIS_UID, side[q].id, outcomes[o], outcomes[childIndex]);
+                            continue;
+                        }
+                        uint256 winnerStaked =
+                            multiverse.getOutcomeStakes(GENESIS_UID, side[q].id, winner).totalOutcomeStaked;
+                        uint256 losers = uint256(totalStaked) - winnerStaked;
+                        payout = amount + amount * (losers - losers / multiverse.BURN_DIVIDER()) / winnerStaked;
+                    }
+
+                    ILituusRep childRep = multiverse.repTokenOf(_childId(outcomes[childIndex]));
+                    uint256 payoutAssets = genesisRep.convertToAssets(payout);
+                    uint256 balanceBefore = childRep.balanceOf(reporters[r]);
+                    vm.prank(reporters[r]);
+                    multiverse.migrateStake(GENESIS_UID, side[q].id, outcomes[o], outcomes[childIndex]);
+                    assertEq(childRep.balanceOf(reporters[r]) - balanceBefore, childRep.convertToShares(payoutAssets));
+                    assertEq(multiverse.getUserStake(GENESIS_UID, side[q].id, reporters[r], outcomes[o]), 0);
+                    votes[childIndex] += payoutAssets;
+                }
+            }
+        }
+    }
+
+    /// @dev Property: alongside the forking query, every stake on every other query of the parent is settled
+    /// exactly once through migrateStake, into a child of the staker's choice. A query resolved before the
+    /// fork pays its winners what claim() would have and refuses its losers; any other query refunds every
+    /// stake as it was. Each settlement votes with what it moved, in the child it went to; no child draws
+    /// past the parked balance; and what stays unmigrated at the end is the fees of the queries still open,
+    /// the forking query's among them.
+    function testFuzz_MigrateStake_SettlesEveryQuerysStakesOnce(uint256 seed, uint256 fee) public {
+        fee = bound(fee, MIN_LADDER_FEE, MAX_LADDER_FEE);
+        feeCtl.setFee(fee);
+        SideQuery[] memory side = _buildSideQueries(seed);
+        uint256 forkThreshold = zoltar.getForkThreshold(GENESIS_UID);
+
+        (uint256 forkQueryId, uint256[4][3] memory forkStaked) = _buildRandomForkingLadder(seed);
+        uint256 parked = zoltar.getMigrationRepBalance(address(multiverse), GENESIS_UID);
+        (,,,,,,,,,,,, uint128 unmigratedBefore) = multiverse.universes(GENESIS_UID);
+        assertEq(unmigratedBefore, parked + _forkBurn(forkThreshold));
+
+        uint256 totalVotes = _claimEveryStakeInEveryChild(forkQueryId, forkStaked);
+        uint256[4] memory sideVotes = _settleSideStakes(side, seed);
+
+        // Every lane voted with what it moved, child by child, and no child overdrew its copy of the pot.
+        for (uint256 o = 0; o < outcomes.length; o++) {
+            uint256 forkVotes;
+            for (uint256 r = 0; r < reporters.length; r++) {
+                forkVotes += genesisRep.convertToAssets(forkStaked[r][o]);
+            }
+            (,,,,,,, uint128 totalIn,,,,,) = multiverse.universes(_childId(outcomes[o]));
+            assertEq(totalIn, forkVotes + sideVotes[o]);
+            totalVotes += sideVotes[o];
+            assertLe(zoltar.splitPerChild(address(multiverse), GENESIS_UID, outcomes[o]), parked);
+        }
+        (,,,,,,,,,, uint128 totalOut,, uint128 unmigratedAfter) = multiverse.universes(GENESIS_UID);
+        assertEq(totalOut, totalVotes);
+        assertEq(unmigratedAfter, unmigratedBefore - totalVotes);
+
+        // The fees of the queries still open are all that is left, up to one wei of rounding per settlement:
+        // a resolved query consumed its fee at resolution and paid out everything else.
+        (,, uint256 forkFee,,) = multiverse.queries(forkQueryId);
+        uint256 openFees = genesisRep.convertToAssets(forkFee);
+        uint256 settlements = 1;
+        for (uint256 q = 0; q < side.length; q++) {
+            settlements += reporters.length * outcomes.length;
+            if (side[q].resolved) continue;
+            (,, uint256 sideFee,,) = multiverse.queries(side[q].id);
+            openFees += genesisRep.convertToAssets(sideFee);
+        }
+        assertGe(unmigratedAfter, openFees);
+        assertLe(unmigratedAfter, openFees + settlements);
     }
 }
