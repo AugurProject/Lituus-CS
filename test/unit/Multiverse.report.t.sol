@@ -60,8 +60,8 @@ contract MultiverseReportTest is MultiverseFixtures {
         uint256 queryId = _createDefaultQuery();
         uint48 queryCreateTime = _resolution(queryId).queryCreateTime;
 
-        // The window check is strict `<`, so exactly THREE_DAYS after creation is still reportable.
-        vm.warp(queryCreateTime + multiverse.THREE_DAYS());
+        // The window check is strict `<`, so exactly REPORTING_PERIOD after creation is still reportable.
+        vm.warp(queryCreateTime + multiverse.REPORTING_PERIOD());
         _report(user, queryId, OUTCOME_A);
     }
 
@@ -82,9 +82,9 @@ contract MultiverseReportTest is MultiverseFixtures {
     }
 
     function test_Report_EmitsEventForInvalid() public {
-        // INVALID (255) is the special outcome encoding; pin its event shape explicitly.
+        // INVALID (max-uint) is the special outcome encoding; pin its event shape explicitly.
         uint256 queryId = _createDefaultQuery();
-        uint8 invalid = multiverse.INVALID();
+        uint256 invalid = multiverse.INVALID();
 
         vm.expectEmit(true, true, true, true, address(multiverse));
         emit Multiverse.QueryReported(user, GENESIS_UID, queryId, invalid, DEFAULT_FEE);
@@ -155,7 +155,7 @@ contract MultiverseReportTest is MultiverseFixtures {
         uint256 queryId = _createDefaultQuery();
 
         address[] memory reporters = new address[](5);
-        uint8[] memory outcomes = new uint8[](5);
+        uint256[] memory outcomes = new uint256[](5);
         for (uint256 i = 0; i < 5; i++) {
             reporters[i] = i % 2 == 0 ? user : bystander;
             outcomes[i] = i % 2 == 0 ? OUTCOME_A : OUTCOME_B;
@@ -171,8 +171,8 @@ contract MultiverseReportTest is MultiverseFixtures {
     function test_Report_Escalation_AtAppealDeadline() public {
         uint256 queryId = _createReportedQuery(OUTCOME_A);
 
-        // The appeal check is strict `<`, so exactly ONE_DAY after the last stake is still open.
-        vm.warp(_resolution(queryId).lastStakeTime + multiverse.ONE_DAY());
+        // The appeal check is strict `<`, so exactly APPEAL_PERIOD after the last stake is still open.
+        vm.warp(_resolution(queryId).lastStakeTime + multiverse.APPEAL_PERIOD());
         _report(bystander, queryId, OUTCOME_B);
     }
 
@@ -212,7 +212,7 @@ contract MultiverseReportTest is MultiverseFixtures {
         uint256 queryId = _createDefaultQuery();
 
         address[] memory reporters = new address[](3);
-        uint8[] memory outcomes = new uint8[](3);
+        uint256[] memory outcomes = new uint256[](3);
         (reporters[0], reporters[1], reporters[2]) = (user, bystander, challenger);
         (outcomes[0], outcomes[1], outcomes[2]) = (OUTCOME_A, multiverse.INVALID(), OUTCOME_B);
         _escalateChain(queryId, reporters, outcomes);
@@ -230,14 +230,14 @@ contract MultiverseReportTest is MultiverseFixtures {
         uint48 queryCreateTime = _resolution(queryId).queryCreateTime;
 
         // First report lands near the end of the 3-day reporting window
-        uint256 firstReportTime = queryCreateTime + multiverse.THREE_DAYS() - 1 hours;
+        uint256 firstReportTime = queryCreateTime + multiverse.REPORTING_PERIOD() - 1 hours;
         vm.warp(firstReportTime);
         _report(user, queryId, OUTCOME_A);
 
         // The escalation lands after the reporting window has passed. Only the appeal
         // window governs escalations.
         uint256 escalationTime = firstReportTime + 20 hours;
-        assertGt(escalationTime, queryCreateTime + multiverse.THREE_DAYS());
+        assertGt(escalationTime, queryCreateTime + multiverse.REPORTING_PERIOD());
         vm.warp(escalationTime);
         _report(bystander, queryId, OUTCOME_B);
     }
@@ -248,7 +248,7 @@ contract MultiverseReportTest is MultiverseFixtures {
 
         // Place the first stake near the end of the reporting window so the query is already
         // older than three days by the time of the last stake.
-        uint256 firstStakeTime = queryCreateTime + multiverse.THREE_DAYS() - 1 hours;
+        uint256 firstStakeTime = queryCreateTime + multiverse.REPORTING_PERIOD() - 1 hours;
         vm.warp(firstStakeTime);
         _report(user, queryId, OUTCOME_A);
 
@@ -256,10 +256,10 @@ contract MultiverseReportTest is MultiverseFixtures {
         vm.warp(secondStakeTime);
         _report(bystander, queryId, OUTCOME_B);
 
-        // The appeal window is measured from the last stake only: a report exactly ONE_DAY after
+        // The appeal window is measured from the last stake only: a report exactly APPEAL_PERIOD after
         // the second stake succeeds even though the first stake is now almost two days old.
-        uint256 lastStakeTime = secondStakeTime + multiverse.ONE_DAY();
-        assertGt(lastStakeTime, queryCreateTime + multiverse.THREE_DAYS());
+        uint256 lastStakeTime = secondStakeTime + multiverse.APPEAL_PERIOD();
+        assertGt(lastStakeTime, queryCreateTime + multiverse.REPORTING_PERIOD());
         vm.warp(lastStakeTime);
         _report(challenger, queryId, OUTCOME_A);
     }
@@ -269,7 +269,7 @@ contract MultiverseReportTest is MultiverseFixtures {
         uint48 createTimeBefore = _resolution(queryId).queryCreateTime;
 
         address[] memory reporters = new address[](3);
-        uint8[] memory outcomes = new uint8[](3);
+        uint256[] memory outcomes = new uint256[](3);
         (reporters[0], reporters[1], reporters[2]) = (user, bystander, user);
         (outcomes[0], outcomes[1], outcomes[2]) = (OUTCOME_A, OUTCOME_B, OUTCOME_A);
         _escalateChain(queryId, reporters, outcomes);
@@ -291,7 +291,7 @@ contract MultiverseReportTest is MultiverseFixtures {
         // The second query costs more than the first one because the first one already raised
         // the demand modifier, but its slightly higher fee still rounds to the same grid step.
         assertEq(_resolution(queryId1).stakeCount, 0);
-        (,, uint256 fee1,) = multiverse.queries(queryId1);
+        (,, uint256 fee1,,) = multiverse.queries(queryId1);
         uint256 requiredStake = multiverse.getNextRequiredStake(GENESIS_UID, queryId1, OUTCOME_A);
         assertGt(fee1, DEFAULT_FEE);
         assertEq(requiredStake, DEFAULT_FEE);
@@ -317,7 +317,7 @@ contract MultiverseReportTest is MultiverseFixtures {
         uint256 challengerBalanceBefore = genesisRep.balanceOf(challenger);
 
         address[] memory reporters = new address[](3);
-        uint8[] memory outcomes = new uint8[](3);
+        uint256[] memory outcomes = new uint256[](3);
         (reporters[0], reporters[1], reporters[2]) = (user, bystander, challenger);
         (outcomes[0], outcomes[1], outcomes[2]) = (OUTCOME_A, OUTCOME_B, OUTCOME_A);
         _escalateChain(queryId, reporters, outcomes);
@@ -342,7 +342,7 @@ contract MultiverseReportTest is MultiverseFixtures {
 
         // The same address may hold multiple consecutive and non-consecutive stakes on one query.
         address[] memory reporters = new address[](4);
-        uint8[] memory outcomes = new uint8[](4);
+        uint256[] memory outcomes = new uint256[](4);
         (reporters[0], reporters[1], reporters[2], reporters[3]) = (user, user, bystander, user);
         (outcomes[0], outcomes[1], outcomes[2], outcomes[3]) = (OUTCOME_A, OUTCOME_B, OUTCOME_A, OUTCOME_B);
         _escalateChain(queryId, reporters, outcomes);
@@ -359,7 +359,7 @@ contract MultiverseReportTest is MultiverseFixtures {
 
         // Five consecutive stakes rotating all actors, with varied gaps inside every appeal window.
         address[5] memory reporters = [user, bystander, challenger, user, bystander];
-        uint8[5] memory outcomes = [OUTCOME_A, OUTCOME_B, OUTCOME_A, OUTCOME_B, OUTCOME_A];
+        uint256[5] memory outcomes = [OUTCOME_A, OUTCOME_B, OUTCOME_A, OUTCOME_B, OUTCOME_A];
         uint256[5] memory gaps = [uint256(2 hours), 23 hours, 6 hours, 20 hours, 12 hours];
         uint48[5] memory stakeTimes;
         for (uint256 i = 0; i < 5; i++) {
@@ -396,7 +396,7 @@ contract MultiverseReportTest is MultiverseFixtures {
         // Each query's ladder runs from its own first stake. The second query's fee is higher than
         // the base fee (the first one already raised the demand modifier) but rounds to the same
         // grid step, so both ladders start at DEFAULT_FEE.
-        (,, uint256 fee1,) = multiverse.queries(queryId1);
+        (,, uint256 fee1,,) = multiverse.queries(queryId1);
         assertGt(fee1, DEFAULT_FEE);
         ResolutionView memory r0 = _resolution(queryId0);
         ResolutionView memory r1 = _resolution(queryId1);
@@ -423,7 +423,7 @@ contract MultiverseReportTest is MultiverseFixtures {
 
         uint256 queryId = _createDefaultQuery();
         address[] memory reporters = new address[](4);
-        uint8[] memory outcomes = new uint8[](4);
+        uint256[] memory outcomes = new uint256[](4);
         (reporters[0], reporters[1], reporters[2], reporters[3]) = (user, bystander, challenger, bystander);
         (outcomes[0], outcomes[1], outcomes[2], outcomes[3]) = (OUTCOME_A, OUTCOME_B, OUTCOME_A, OUTCOME_B);
         _escalateChain(queryId, reporters, outcomes);
@@ -471,7 +471,7 @@ contract MultiverseReportTest is MultiverseFixtures {
     }
 
     function test_RevertWhen_OutcomeBelowInvalidMarker() public {
-        // 254 is above the query's outcome range but is not the INVALID marker (255).
+        // 254 is above the query's outcome range but is not the INVALID marker (max-uint).
         uint256 queryId = _createDefaultQuery();
         vm.prank(user);
         vm.expectRevert(Multiverse.InvalidOutcome.selector);
@@ -483,7 +483,7 @@ contract MultiverseReportTest is MultiverseFixtures {
         uint48 queryCreateTime = _resolution(queryId).queryCreateTime;
 
         // One second past the deadline is the earliest moment a first report must revert.
-        vm.warp(queryCreateTime + multiverse.THREE_DAYS() + 1);
+        vm.warp(queryCreateTime + multiverse.REPORTING_PERIOD() + 1);
         vm.prank(user);
         vm.expectRevert(Multiverse.QueryExpired.selector);
         multiverse.report(GENESIS_UID, queryId, OUTCOME_A);
@@ -500,7 +500,7 @@ contract MultiverseReportTest is MultiverseFixtures {
         uint256 queryId = _createReportedQuery(OUTCOME_A);
 
         // One second past the appeal deadline is the earliest moment an escalation must revert.
-        vm.warp(_resolution(queryId).lastStakeTime + multiverse.ONE_DAY() + 1);
+        vm.warp(_resolution(queryId).lastStakeTime + multiverse.APPEAL_PERIOD() + 1);
         vm.prank(bystander);
         vm.expectRevert(Multiverse.AppealPeriodOver.selector);
         multiverse.report(GENESIS_UID, queryId, OUTCOME_B);
@@ -509,7 +509,7 @@ contract MultiverseReportTest is MultiverseFixtures {
     function test_RevertWhen_QueryAlreadyResolved() public {
         uint256 queryId = _createReportedQuery(OUTCOME_A);
 
-        vm.warp(_resolution(queryId).lastStakeTime + multiverse.ONE_DAY() + 1);
+        vm.warp(_resolution(queryId).lastStakeTime + multiverse.APPEAL_PERIOD() + 1);
         multiverse.resolve(GENESIS_UID, queryId);
 
         vm.prank(bystander);
@@ -522,7 +522,7 @@ contract MultiverseReportTest is MultiverseFixtures {
         uint256 queryId = _createDefaultQuery();
         uint48 queryCreateTime = _resolution(queryId).queryCreateTime;
 
-        vm.warp(queryCreateTime + multiverse.THREE_DAYS() + 1);
+        vm.warp(queryCreateTime + multiverse.REPORTING_PERIOD() + 1);
         multiverse.resolve(GENESIS_UID, queryId);
 
         vm.prank(user);
@@ -533,11 +533,12 @@ contract MultiverseReportTest is MultiverseFixtures {
     function test_RevertWhen_InsufficientAllowance() public {
         uint256 queryId = _createDefaultQuery();
         address noAllowance = makeAddr("noAllowance");
-        // Fund with REP but do NOT approve the multiverse to spend it.
-        underlying.mint(noAllowance, USER_REP_BALANCE);
+        // Fund with REP from the genesis pool but do NOT approve the multiverse to spend it.
+        uint256 amount = 100 ether;
+        underlying.transfer(noAllowance, amount);
         vm.startPrank(noAllowance);
         underlying.approve(address(genesisRep), type(uint256).max);
-        multiverse.wrap(GENESIS_UID, USER_REP_BALANCE, 0);
+        multiverse.wrap(GENESIS_UID, amount, 0);
         vm.expectRevert();
         multiverse.report(GENESIS_UID, queryId, OUTCOME_A);
         vm.stopPrank();
@@ -577,8 +578,13 @@ contract MultiverseReportTest is MultiverseFixtures {
         // that the fork is sized against.
         (uint256 queryId, uint256 cap) = _createLadderToCap();
         assertEq(_resolution(queryId).noOfOutcomesAtCap, 1);
+        // Read before the trigger: the fork burns parent REP, lowering the supply the cap was sized against.
+        uint256 supplyAtCap = zoltar.getUniverseTheoreticalSupply(GENESIS_UID);
 
-        _report(challenger, queryId, OUTCOME_A);
+        // The final stake forks the universe inside report() and parks the whole pot, so it is
+        // placed raw rather than through the balance-asserting _report fixture.
+        vm.prank(challenger);
+        multiverse.report(GENESIS_UID, queryId, OUTCOME_A);
 
         ResolutionView memory r = _resolution(queryId);
         assertEq(multiverse.getOutcomeStakes(GENESIS_UID, queryId, OUTCOME_A).totalOutcomeStaked, cap);
@@ -588,7 +594,11 @@ contract MultiverseReportTest is MultiverseFixtures {
 
         // The pot is exactly two per-outcome caps, i.e. 2% of the universe's REP supply.
         assertEq(r.totalStaked, 2 * cap);
-        assertEq(r.totalStaked, 2 * zoltar.getUniverseTheoreticalSupply(GENESIS_UID) / 100);
+        assertEq(r.totalStaked, 2 * supplyAtCap / 100);
+
+        // Two outcomes at the cap means the fork level: the same report forked the universe.
+        (, Multiverse.UniverseState state,,,,,,,,,,,) = multiverse.universes(GENESIS_UID);
+        assertEq(uint8(state), uint8(Multiverse.UniverseState.Migration));
     }
 
     function test_Report_LateOutcomePaysTwiceThePot() public {
@@ -618,10 +628,16 @@ contract MultiverseReportTest is MultiverseFixtures {
         uint256 requiredStake = multiverse.getNextRequiredStake(GENESIS_UID, queryId, OUTCOME_C);
         assertEq(requiredStake, cap);
 
-        _report(challenger, queryId, OUTCOME_C);
+        // The final stake forks the universe inside report() and parks the whole pot, so it is
+        // placed raw rather than through the balance-asserting _report fixture.
+        vm.prank(challenger);
+        multiverse.report(GENESIS_UID, queryId, OUTCOME_C);
 
         assertEq(multiverse.getOutcomeStakes(GENESIS_UID, queryId, OUTCOME_C).totalOutcomeStaked, cap);
         assertEq(_resolution(queryId).noOfOutcomesAtCap, 2);
+        // The universe is forked because two outcomes are at the cap
+        (, Multiverse.UniverseState state,,,,,,,,,,,) = multiverse.universes(GENESIS_UID);
+        assertEq(uint8(state), uint8(Multiverse.UniverseState.Migration));
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -746,7 +762,7 @@ contract MultiverseReportTest is MultiverseFixtures {
         uint256[4] memory expectedStakes = [uint256(1 ether), 2 ether, 3 ether, 6 ether];
 
         for (uint256 i = 0; i < 4; i++) {
-            uint8 outcome = i % 2 == 0 ? OUTCOME_A : OUTCOME_B;
+            uint256 outcome = i % 2 == 0 ? OUTCOME_A : OUTCOME_B;
             uint256 requiredStake = multiverse.getNextRequiredStake(GENESIS_UID, queryId, outcome);
             assertEq(requiredStake, expectedStakes[i]);
             _report(i % 2 == 0 ? user : bystander, queryId, outcome);

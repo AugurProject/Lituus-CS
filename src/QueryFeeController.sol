@@ -83,7 +83,23 @@ contract QueryFeeController is IQueryFeeController {
         multiverse = multiverse_;
     }
 
-    // TODO - CHECK IF WE NEED TO ADD A FUNCTION TO INITIALIZE THE UNIVERSE FEE STATE
+    /**
+     * @notice Seeds a child universe's fee state when it is spawned at a fork.
+     * @dev Pushed by the Multiverse from the spawn path. Seeds BOTH the base fee (inherited from the
+     *      parent — a zero base fee would be stuck at zero forever, since the monthly step is
+     *      multiplicative) AND the monthly-change timestamp (so the first hill-climb step waits a
+     *      full month). Reverts if the universe's fee state was already initialized.
+     * @param universeId The freshly spawned child universe.
+     * @param baseFee The parent universe's current base fee, inherited as the child's starting fee.
+     */
+    function initializeFeeState(uint248 universeId, uint256 baseFee) external onlyMultiverse {
+        FeeState storage feeState = feeStates[universeId];
+        if (feeState.timeFeeLastChanged != 0) revert CannotSet();
+        // Base fees are REP amounts, within uint128
+        // forge-lint: disable-next-line(unsafe-typecast)
+        feeState.baseFee = uint128(baseFee);
+        feeState.timeFeeLastChanged = uint48(block.timestamp);
+    }
 
     /* ============================================= GETTER FUNCTION ============================================= */
     /**
