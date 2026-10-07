@@ -17,23 +17,23 @@ contract MultiverseResolveFuzzTest is MultiverseFuzzFixtures {
         pastDeadline = bound(pastDeadline, 1, 365 days);
         uint256 queryId = _createQuery();
 
-        vm.warp(vm.getBlockTimestamp() + multiverse.THREE_DAYS() + pastDeadline);
+        vm.warp(vm.getBlockTimestamp() + multiverse.REPORTING_PERIOD() + pastDeadline);
         uint256 resolverBalanceBefore = genesisRep.balanceOf(user);
         vm.prank(user);
         multiverse.resolve(GENESIS_UID, queryId);
 
         assertEq(_resolution(queryId).outcome, multiverse.INVALID());
 
-        uint256 expectedPay = pastDeadline >= multiverse.THREE_DAYS()
+        uint256 expectedPay = pastDeadline >= multiverse.REPORTING_PERIOD()
             ? DEFAULT_FEE
-            : DEFAULT_FEE * pastDeadline / multiverse.THREE_DAYS();
+            : DEFAULT_FEE * pastDeadline / multiverse.REPORTING_PERIOD();
         assertEq(genesisRep.balanceOf(user) - resolverBalanceBefore, expectedPay);
     }
 
     /// @dev Property: an unreported query is never resolvable up to and including the reporting
     /// deadline (the check is strict: exactly at the deadline is still too early).
     function testFuzz_Resolve_Invalid_RevertsWithinWindow(uint256 delay) public {
-        delay = bound(delay, 0, multiverse.THREE_DAYS());
+        delay = bound(delay, 0, multiverse.REPORTING_PERIOD());
         uint256 queryId = _createQuery();
 
         vm.warp(vm.getBlockTimestamp() + delay);
@@ -47,18 +47,19 @@ contract MultiverseResolveFuzzTest is MultiverseFuzzFixtures {
     function testFuzz_Resolve_Invalid_RewardScalesWithFee(uint256 fee, uint256 pastDeadline) public {
         // The first bond equals the fee, so createQuery accepts fees below half the fork threshold.
         fee = bound(fee, 1, _queryFeeCapWrep() - 1);
-        pastDeadline = bound(pastDeadline, 1, multiverse.THREE_DAYS());
+        pastDeadline = bound(pastDeadline, 1, multiverse.REPORTING_PERIOD());
         feeCtl.setFee(fee);
         uint256 queryId = _createQuery();
         (,, uint256 chargedFee,,) = multiverse.queries(queryId);
 
-        vm.warp(vm.getBlockTimestamp() + multiverse.THREE_DAYS() + pastDeadline);
+        vm.warp(vm.getBlockTimestamp() + multiverse.REPORTING_PERIOD() + pastDeadline);
         uint256 resolverBalanceBefore = genesisRep.balanceOf(user);
         vm.prank(user);
         multiverse.resolve(GENESIS_UID, queryId);
 
-        uint256 expectedPay =
-            pastDeadline >= multiverse.THREE_DAYS() ? chargedFee : chargedFee * pastDeadline / multiverse.THREE_DAYS();
+        uint256 expectedPay = pastDeadline >= multiverse.REPORTING_PERIOD()
+            ? chargedFee
+            : chargedFee * pastDeadline / multiverse.REPORTING_PERIOD();
         assertEq(genesisRep.balanceOf(user) - resolverBalanceBefore, expectedPay);
     }
 
@@ -78,8 +79,8 @@ contract MultiverseResolveFuzzTest is MultiverseFuzzFixtures {
         // 1..3 are the query's outcomes; map the extra bucket to the INVALID marker (max-uint).
         outcome = bound(outcome, 1, 4);
         if (outcome == 4) outcome = multiverse.INVALID();
-        reportDelay = bound(reportDelay, 0, multiverse.THREE_DAYS());
-        resolveDelay = bound(resolveDelay, multiverse.ONE_DAY() + 1, 365 days);
+        reportDelay = bound(reportDelay, 0, multiverse.REPORTING_PERIOD());
+        resolveDelay = bound(resolveDelay, multiverse.APPEAL_PERIOD() + 1, 365 days);
         uint256 creatorBalanceBefore = genesisRep.balanceOf(user);
         uint256 reporterBalanceBefore = genesisRep.balanceOf(reporter);
         uint256 queryId = _createQuery();
@@ -98,7 +99,7 @@ contract MultiverseResolveFuzzTest is MultiverseFuzzFixtures {
         // The creator's fee is spent for good; the reporter's bond (== fee) came back with the
         // reward ramping over the reporting window; the resolver earns nothing here; the unrewarded
         // fee remainder is the query's profit, burned at resolve, so the multiverse keeps nothing.
-        uint256 expectedReward = DEFAULT_FEE * reportDelay / multiverse.THREE_DAYS();
+        uint256 expectedReward = DEFAULT_FEE * reportDelay / multiverse.REPORTING_PERIOD();
         assertEq(genesisRep.balanceOf(user), creatorBalanceBefore - DEFAULT_FEE);
         assertEq(genesisRep.balanceOf(reporter), reporterBalanceBefore + expectedReward);
         assertEq(genesisRep.balanceOf(resolver), 0);
@@ -112,7 +113,7 @@ contract MultiverseResolveFuzzTest is MultiverseFuzzFixtures {
     /// @dev Property: a reported query is never resolvable up to and including the appeal deadline
     /// (the check is strict: exactly at the deadline is still too early).
     function testFuzz_Resolve_SingleStake_RevertsWithinAppealWindow(uint256 delay) public {
-        delay = bound(delay, 0, multiverse.ONE_DAY());
+        delay = bound(delay, 0, multiverse.APPEAL_PERIOD());
         uint256 queryId = _createQuery();
         vm.prank(user);
         multiverse.report(GENESIS_UID, queryId, 1);
@@ -128,7 +129,7 @@ contract MultiverseResolveFuzzTest is MultiverseFuzzFixtures {
     /// `user` creates, `reporter` reports, `resolver` resolves.
     function testFuzz_Resolve_SingleStake_FeeScales(uint256 fee, uint256 reportDelay) public {
         fee = bound(fee, 1, _queryFeeCapWrep() - 1);
-        reportDelay = bound(reportDelay, 0, multiverse.THREE_DAYS());
+        reportDelay = bound(reportDelay, 0, multiverse.REPORTING_PERIOD());
         feeCtl.setFee(fee);
         uint256 creatorBalanceBefore = genesisRep.balanceOf(user);
         uint256 reporterBalanceBefore = genesisRep.balanceOf(reporter);
@@ -139,14 +140,14 @@ contract MultiverseResolveFuzzTest is MultiverseFuzzFixtures {
         vm.prank(reporter);
         multiverse.report(GENESIS_UID, queryId, 1);
 
-        vm.warp(vm.getBlockTimestamp() + multiverse.ONE_DAY() + 1);
+        vm.warp(vm.getBlockTimestamp() + multiverse.APPEAL_PERIOD() + 1);
         vm.prank(resolver);
         multiverse.resolve(GENESIS_UID, queryId);
 
         // The creator paid the fee, the reporter netted the ramped reward (bond refunded), and the
         // resolver earned nothing on this path. Whatever the reward didn't hand out is the query's
         // profit, burned at resolve, so the multiverse keeps nothing.
-        uint256 expectedReward = chargedFee * reportDelay / multiverse.THREE_DAYS();
+        uint256 expectedReward = chargedFee * reportDelay / multiverse.REPORTING_PERIOD();
         assertEq(genesisRep.balanceOf(user), creatorBalanceBefore - chargedFee);
         assertEq(genesisRep.balanceOf(reporter), reporterBalanceBefore + expectedReward);
         assertEq(genesisRep.balanceOf(resolver), 0);

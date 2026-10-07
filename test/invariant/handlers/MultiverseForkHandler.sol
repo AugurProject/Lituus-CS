@@ -19,7 +19,7 @@ import { MockZoltar } from "src/mock/MockZoltar.sol";
 ///         The vault rate is 1 throughout (nothing ever burns in the parent after the fork and the
 ///         children never resolve anything here), so parent shares, child shares and REP coincide.
 contract MultiverseForkHandler is CommonBase, StdCheats, StdUtils {
-    // Per-call time-advance ceiling: a few of these cross the 60-day window within one run.
+    // Per-call time-advance ceiling: a few of these cross the MIGRATION_DURATION within one run.
     uint256 internal constant MAX_TIME_ADVANCE = 10 days;
 
     Multiverse public immutable MULTIVERSE;
@@ -84,9 +84,9 @@ contract MultiverseForkHandler is CommonBase, StdCheats, StdUtils {
         (,, forkTime,,,,,,,,,,) = MULTIVERSE.universes(GENESIS_UID);
     }
 
-    /// @dev The genesis has no parent, so its migration window is exactly 60 days from the fork.
+    /// @dev The genesis has no parent, so its migration window is exactly MIGRATION_DURATION from the fork.
     function _windowOpen() internal view returns (bool) {
-        return ghostNow < uint256(_forkTime()) + MULTIVERSE.SIXTY_DAYS();
+        return ghostNow < uint256(_forkTime()) + MULTIVERSE.MIGRATION_DURATION();
     }
 
     /// @notice Move time forward by a bounded amount.

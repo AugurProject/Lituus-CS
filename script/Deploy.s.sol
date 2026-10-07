@@ -19,6 +19,11 @@ import { IMultiverse } from "src/interfaces/IMultiverse.sol";
 ///      Env vars: PRIVATE_KEY, ZOLTAR_ADDRESS, GENESIS_UNIVERSE_ID (the Zoltar universe id
 ///      treated as the Lituus genesis).
 contract Deploy is Script {
+    // Time periods baked into the Multiverse as immutables.
+    uint256 internal constant MIGRATION_DURATION = 30 days;
+    uint256 internal constant REPORTING_PERIOD = 3 days;
+    uint256 internal constant APPEAL_PERIOD = 1 days;
+
     function run()
         external
         returns (QueryFeeController queryFeeController, QueryTokenizer queryTokenizer, Multiverse multiverse)
@@ -32,7 +37,13 @@ contract Deploy is Script {
         queryFeeController = new QueryFeeController(genesisUniverseId);
         queryTokenizer = new QueryTokenizer();
         multiverse = new Multiverse(
-            zoltar, genesisUniverseId, IQueryFeeController(address(queryFeeController)), address(queryTokenizer)
+            zoltar,
+            genesisUniverseId,
+            IQueryFeeController(address(queryFeeController)),
+            address(queryTokenizer),
+            MIGRATION_DURATION,
+            REPORTING_PERIOD,
+            APPEAL_PERIOD
         );
         queryFeeController.setMultiverse(address(multiverse));
         queryTokenizer.setMultiverse(IMultiverse(address(multiverse)));

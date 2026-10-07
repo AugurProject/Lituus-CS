@@ -36,7 +36,9 @@ abstract contract QueryTokenizerFixtures is MultiverseFixtures {
     /// @dev Deploys the real tokenizer first, then the Multiverse pointing at it (Deploy.s.sol order).
     function _deployMultiverse(IQueryFeeController controller) internal override returns (Multiverse) {
         tokenizer = new QueryTokenizer();
-        return new Multiverse(zoltar, GENESIS_UID, controller, address(tokenizer));
+        return new Multiverse(
+            zoltar, GENESIS_UID, controller, address(tokenizer), MIGRATION_DURATION, REPORTING_PERIOD, APPEAL_PERIOD
+        );
     }
 
     /// @dev Completes the deploy wiring: the tokenizer learns the Multiverse address (once).

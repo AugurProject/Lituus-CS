@@ -11,33 +11,67 @@ import { MultiverseFixtures } from "./Multiverse.fixtures.sol";
 contract MultiverseConstructorTest is MultiverseFixtures {
     function test_RevertWhen_ZoltarIsZero() public {
         vm.expectRevert(Multiverse.ZeroAddress.selector);
-        new Multiverse(IZoltar(address(0)), GENESIS_UID, feeCtl, queryTokenizerStub);
+        new Multiverse(
+            IZoltar(address(0)),
+            GENESIS_UID,
+            feeCtl,
+            queryTokenizerStub,
+            MIGRATION_DURATION,
+            REPORTING_PERIOD,
+            APPEAL_PERIOD
+        );
     }
 
     function test_RevertWhen_QueryFeeControllerIsZero() public {
         vm.expectRevert(Multiverse.ZeroAddress.selector);
-        new Multiverse(zoltar, GENESIS_UID, IQueryFeeController(address(0)), queryTokenizerStub);
+        new Multiverse(
+            zoltar,
+            GENESIS_UID,
+            IQueryFeeController(address(0)),
+            queryTokenizerStub,
+            MIGRATION_DURATION,
+            REPORTING_PERIOD,
+            APPEAL_PERIOD
+        );
     }
 
     function test_RevertWhen_QueryTokenizerIsZero() public {
         vm.expectRevert(Multiverse.ZeroAddress.selector);
-        new Multiverse(zoltar, GENESIS_UID, feeCtl, address(0));
+        new Multiverse(zoltar, GENESIS_UID, feeCtl, address(0), MIGRATION_DURATION, REPORTING_PERIOD, APPEAL_PERIOD);
     }
 
     function test_Constructor_SetsImmutables() public {
         uint256 deployTime = START_TIME + 5 days;
         vm.warp(deployTime);
-        Multiverse newMultiverse = new Multiverse(zoltar, GENESIS_UID, feeCtl, queryTokenizerStub);
+        Multiverse newMultiverse = new Multiverse(
+            zoltar, GENESIS_UID, feeCtl, queryTokenizerStub, MIGRATION_DURATION, REPORTING_PERIOD, APPEAL_PERIOD
+        );
 
         assertEq(address(newMultiverse.ZOLTAR()), address(zoltar));
         assertEq(newMultiverse.GENESIS_UNIVERSE_ID(), GENESIS_UID);
         assertEq(address(newMultiverse.QUERY_FEE_CONTROLLER()), address(feeCtl));
         assertEq(newMultiverse.GENESIS_TIMESTAMP(), deployTime);
         assertEq(address(newMultiverse.QUERY_TOKENIZER()), address(queryTokenizerStub));
+        assertEq(newMultiverse.MIGRATION_DURATION(), MIGRATION_DURATION);
+        assertEq(newMultiverse.REPORTING_PERIOD(), REPORTING_PERIOD);
+        assertEq(newMultiverse.APPEAL_PERIOD(), APPEAL_PERIOD);
+    }
+
+    function test_Constructor_SetsTimePeriods() public {
+        // Values distinct from the fixture defaults, so the assertions prove the immutables come from
+        // the constructor arguments rather than from any baked-in constant.
+        Multiverse newMultiverse =
+            new Multiverse(zoltar, GENESIS_UID, feeCtl, queryTokenizerStub, 30 days, 2 days, 12 hours);
+
+        assertEq(newMultiverse.MIGRATION_DURATION(), 30 days);
+        assertEq(newMultiverse.REPORTING_PERIOD(), 2 days);
+        assertEq(newMultiverse.APPEAL_PERIOD(), 12 hours);
     }
 
     function test_Constructor_InitializesGenesisUniverse() public {
-        Multiverse newMultiverse = new Multiverse(zoltar, GENESIS_UID, feeCtl, queryTokenizerStub);
+        Multiverse newMultiverse = new Multiverse(
+            zoltar, GENESIS_UID, feeCtl, queryTokenizerStub, MIGRATION_DURATION, REPORTING_PERIOD, APPEAL_PERIOD
+        );
 
         (
             ILituusRep repToken,
@@ -88,8 +122,9 @@ contract MultiverseConstructorTest is MultiverseFixtures {
         assertEq(multiverse.MIN_OUTCOMES(), 2);
         assertEq(multiverse.UNRESOLVED(), 0);
         assertEq(multiverse.INVALID(), type(uint256).max);
-        assertEq(multiverse.THREE_DAYS(), 3 days);
-        assertEq(multiverse.ONE_DAY(), 1 days);
+        assertEq(multiverse.APPEAL_PERIOD(), 1 days);
+        assertEq(multiverse.REPORTING_PERIOD(), 3 days);
+        assertEq(multiverse.MIGRATION_DURATION(), 30 days);
         assertEq(multiverse.BURN_DIVIDER(), 5);
     }
 }

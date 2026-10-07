@@ -320,7 +320,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         // The inherited query resolves in a child WITHOUT insolvency: the resolver's fee share is
         // paid from the spawn-time funding.
         // No report lands, so after the reporting window it resolves INVALID with a resolver reward.
-        vm.warp(vm.getBlockTimestamp() + multiverse.THREE_DAYS() + multiverse.THREE_DAYS());
+        vm.warp(vm.getBlockTimestamp() + multiverse.REPORTING_PERIOD() + multiverse.REPORTING_PERIOD());
         uint256 resolverBalanceBefore = multiverse.repTokenOf(child1).balanceOf(bystander);
         vm.prank(bystander);
         multiverse.resolve(child1, openQueryId);
@@ -405,9 +405,9 @@ contract MultiverseForkTest is MultiverseFixtures {
         zoltar.deployChild(GENESIS_UID, OUTCOME_B);
         multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_B);
 
-        // The spawn window closes 60 days after the fork, strictly by clock (unlike migration,
+        // The spawn window closes 30 days after the fork, strictly by clock (unlike migration,
         // which extends until the parent fork resolves — inflow stays possible, spawning does not).
-        vm.warp(vm.getBlockTimestamp() + multiverse.SIXTY_DAYS());
+        vm.warp(vm.getBlockTimestamp() + multiverse.MIGRATION_DURATION());
         vm.expectRevert(Multiverse.SpawnWindowClosed.selector);
         multiverse.spawnChildUniverse(GENESIS_UID, INVALID_OUTCOME);
     }
@@ -483,9 +483,9 @@ contract MultiverseForkTest is MultiverseFixtures {
         vm.prank(user);
         multiverse.migrate(GENESIS_UID, OUTCOME_A, 1 ether);
 
-        // The vote window closes 60 days after the fork, by clock — no state change needed.
+        // The vote window closes 30 days after the fork, by clock — no state change needed.
         // The nested fork case is not tested here.
-        vm.warp(vm.getBlockTimestamp() + multiverse.SIXTY_DAYS());
+        vm.warp(vm.getBlockTimestamp() + multiverse.MIGRATION_DURATION());
         vm.prank(user);
         vm.expectRevert(Multiverse.MigrationWindowClosed.selector);
         multiverse.migrate(GENESIS_UID, OUTCOME_A, 1 ether);
@@ -505,7 +505,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         vm.expectRevert(Multiverse.MigrationWindowNotClosed.selector);
         multiverse.advanceForkState(GENESIS_UID);
 
-        vm.warp(vm.getBlockTimestamp() + multiverse.SIXTY_DAYS());
+        vm.warp(vm.getBlockTimestamp() + multiverse.MIGRATION_DURATION());
         // For now advanceForkState always resolves the fork (the 2/3 check and the supply
         // restoration branch are not implemented yet).
         multiverse.advanceForkState(GENESIS_UID);
@@ -561,7 +561,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         assertEq(multiverse.getOutcome(grandchild, nestedQueryId), OUTCOME_A);
 
         // Root-first ordering: the nested fork cannot advance before the genesis fork resolves.
-        vm.warp(vm.getBlockTimestamp() + multiverse.SIXTY_DAYS());
+        vm.warp(vm.getBlockTimestamp() + multiverse.MIGRATION_DURATION());
         vm.expectRevert(Multiverse.ParentForkNotResolved.selector);
         multiverse.advanceForkState(child1);
 
@@ -619,7 +619,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         assertEq(multiverse.getOutcome(child1, nestedQueryId), 0);
 
         // Both forks settle root-first; the grandchild is child1's settled favoriteChild.
-        vm.warp(vm.getBlockTimestamp() + multiverse.SIXTY_DAYS());
+        vm.warp(vm.getBlockTimestamp() + multiverse.MIGRATION_DURATION());
         multiverse.advanceForkState(GENESIS_UID);
         multiverse.advanceForkState(child1);
         (,,,,, uint248 favoriteChild,,,,,,,) = multiverse.universes(child1);
@@ -656,100 +656,100 @@ contract MultiverseForkTest is MultiverseFixtures {
         ) = multiverse.queryResolutions(universeId, queryId);
     }
 
-    function test_QueryFlow_ExpiredAtForkStaysDeadInChildren() public {
-        // A query expires unreported (window lapses at t0 + 3d, nobody resolves it); the genesis
-        // forks 18 hours into the resolver-reward ramp, which keeps ticking across the fork.
+    function test_QueryFlow_ExpiredBeforeForkRestartsInChildren() public {
+        // A query expires unreported (window lapses at t0 + 3d, nobody resolves it) before the genesis
+        // forks: the fork reopens it. Each child gets a FULL window clocked from the fork, and a second
+        // expiry's resolver ramp is anchored at the restarted deadline, not the original one.
         uint256 deadQueryId = _createDefaultQuery();
-        vm.warp(vm.getBlockTimestamp() + multiverse.THREE_DAYS() + 18 hours);
-        _forkGenesis();
-        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
-        uint248 child1 = _childId(GENESIS_UID, OUTCOME_A);
+        vm.warp(vm.getBlockTimestamp() + multiverse.REPORTING_PERIOD() + 18 hours);
+        (, uint248 child1, uint248 child2) = _forkGenesisWithTwoChildren();
+        uint48 forkTime = uint48(vm.getBlockTimestamp());
 
-        // No revival: the query arrives in the children already dead.
-        vm.prank(user);
-        vm.expectRevert(Multiverse.QueryExpired.selector);
-        multiverse.report(child1, deadQueryId, OUTCOME_A);
-
-        // Immediately resolvable INVALID — no new 3-day wait. The ramp is anchored at the ORIGINAL
-        // expiry (t0 + 3d), not the fork: a prompt resolver earns only 18h / 3d = a quarter of the
-        // fee; the unpaid remainder burns into the child's vault.
+        // Not resolvable: the restarted window is open and unreported.
         vm.prank(bystander);
+        vm.expectRevert(Multiverse.QueryNotReadyToResolve.selector);
         multiverse.resolve(child1, deadQueryId);
-        assertEq(multiverse.getOutcome(child1, deadQueryId), INVALID_OUTCOME);
-        assertEq(multiverse.repTokenOf(child1).balanceOf(bystander), DEFAULT_FEE / 4);
-        assertEq(_totalQueryFees(child1), 0);
 
-        // The SAME flow in the sibling, fully independent: its own revert, its own record, its own
-        // resolver payment from its own fee copy — and its own moment on the shared ramp: resolving
-        // three days later earns the full fee. The first child's consumed state is untouched.
-        // The time is anchored to the original expiry, not to the child's spawn time.
-        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_B);
-        uint248 child2 = _childId(GENESIS_UID, OUTCOME_B);
-        vm.prank(user);
-        vm.expectRevert(Multiverse.QueryExpired.selector);
-        multiverse.report(child2, deadQueryId, OUTCOME_B);
-        vm.warp(vm.getBlockTimestamp() + multiverse.THREE_DAYS());
-        vm.prank(challenger);
+        // Revived: the child accepts a first report, anchored at the fork.
+        ILituusRep child1Rep = multiverse.repTokenOf(child1);
+        vm.startPrank(user);
+        child1Rep.approve(address(multiverse), type(uint256).max);
+        multiverse.report(child1, deadQueryId, OUTCOME_A);
+        vm.stopPrank();
+        ResolutionView memory childRecord = _resolutionIn(child1, deadQueryId);
+        assertEq(childRecord.stakeCount, 1);
+        assertEq(childRecord.queryCreateTime, forkTime);
+
+        // The sibling restarts independently: left unreported, it expires again on the restarted
+        // window and resolves INVALID from its own fee copy. The resolver ramp runs from the
+        // restarted deadline (forkTime + 3d): 18h in earns a quarter of the fee.
+        vm.warp(uint256(forkTime) + multiverse.REPORTING_PERIOD() + 18 hours);
+        vm.prank(bystander);
         multiverse.resolve(child2, deadQueryId);
         assertEq(multiverse.getOutcome(child2, deadQueryId), INVALID_OUTCOME);
-        assertEq(multiverse.repTokenOf(child2).balanceOf(challenger), DEFAULT_FEE);
+        assertEq(_resolutionIn(child2, deadQueryId).queryCreateTime, forkTime);
+        assertEq(multiverse.repTokenOf(child2).balanceOf(bystander), DEFAULT_FEE / 4);
         assertEq(_totalQueryFees(child2), 0);
-        assertEq(_totalQueryFees(child1), 0);
-        assertEq(multiverse.getOutcome(child1, deadQueryId), INVALID_OUTCOME);
+        // The child1 ladder is untouched by the sibling's resolution.
+        assertEq(multiverse.getOutcome(child1, deadQueryId), 0);
+        assertEq(_totalQueryFees(child1), DEFAULT_FEE);
     }
 
-    function test_QueryFlow_SettledLadderResolvesToFrozenOutcomeInChildren() public {
-        // A ladder concludes (appeal lapses) but nobody resolves it before the fork freezes it. The
-        // winning outcome's first report lands 36h in, so the frozen reporter ramp is half the fee.
+    function test_QueryFlow_SettledLadderRestartsInChildren() public {
+        // A ladder concludes (appeal lapses) but nobody resolves it before the fork: the fork reopens
+        // it. Nothing is predetermined — each child starts a brand-new escalation from scratch and may
+        // settle differently; the frozen genesis stakes wait for the claims lane.
         uint256 settledQueryId = _createDefaultQuery();
-        vm.warp(vm.getBlockTimestamp() + 18 hours);
         _report(user, settledQueryId, OUTCOME_A);
-        vm.warp(vm.getBlockTimestamp() + 18 hours);
-        _report(challenger, settledQueryId, OUTCOME_B); // frozen last outcome: B, first reported at +36h
+        _report(challenger, settledQueryId, OUTCOME_B); // last outcome before the fork: B
         _warpPastAppealWindow(settledQueryId);
-        _forkGenesis();
-        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
-        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_B);
-        uint248 child1 = _childId(GENESIS_UID, OUTCOME_A);
-        uint248 child2 = _childId(GENESIS_UID, OUTCOME_B);
+        (, uint248 child1, uint248 child2) = _forkGenesisWithTwoChildren();
+        uint48 forkTime = uint48(vm.getBlockTimestamp());
 
-        // The outcome is predetermined: reporting is rejected outright.
-        vm.prank(user);
-        vm.expectRevert(Multiverse.QueryAlreadySettled.selector);
+        // Not resolvable to the old outcome: the restarted window is open and unreported.
+        vm.prank(bystander);
+        vm.expectRevert(Multiverse.QueryNotReadyToResolve.selector);
+        multiverse.resolve(child1, settledQueryId);
+
+        // A fresh ladder in each child, clocked from the fork, on a cap re-frozen from the child's
+        // own supply.
+        vm.startPrank(user);
+        multiverse.repTokenOf(child1).approve(address(multiverse), type(uint256).max);
         multiverse.report(child1, settledQueryId, OUTCOME_A);
+        vm.stopPrank();
+        vm.startPrank(challenger);
+        multiverse.repTokenOf(child2).approve(address(multiverse), type(uint256).max);
+        multiverse.report(child2, settledQueryId, OUTCOME_B);
+        vm.stopPrank();
+        ResolutionView memory child1Record = _resolutionIn(child1, settledQueryId);
+        assertEq(child1Record.stakeCount, 1);
+        assertEq(child1Record.queryCreateTime, forkTime);
+        assertEq(child1Record.lastReportedOutcome, OUTCOME_A);
+        assertGt(child1Record.cap, 0);
+        assertEq(_resolutionIn(child2, settledQueryId).stakeCount, 1);
 
-        // Resolvable immediately (no window applies). The frozen winning FIRST REPORTER (challenger)
-        // earns the fee share on the frozen pre-fork ramp (36h / 3d = half the fee); the resolve
-        // caller earns nothing — the reporting work was done pre-fork.
+        // Each restarted game resolves on its own terms: the siblings diverge.
+        vm.warp(vm.getBlockTimestamp() + multiverse.APPEAL_PERIOD() + 1);
         vm.prank(bystander);
         multiverse.resolve(child1, settledQueryId);
-        assertEq(multiverse.getOutcome(child1, settledQueryId), OUTCOME_B);
-        assertEq(multiverse.repTokenOf(child1).balanceOf(challenger), DEFAULT_FEE / 2);
-        assertEq(multiverse.repTokenOf(child1).balanceOf(bystander), 0);
-        assertEq(_totalQueryFees(child1), 0);
-        vm.expectRevert(Multiverse.QueryAlreadyResolved.selector);
-        multiverse.resolve(child1, settledQueryId);
-
-        // The sibling settles independently to the SAME frozen outcome from its own fee copy, paying
-        // the same frozen reporter again in that world's wREP.
-        vm.prank(user);
+        vm.prank(bystander);
         multiverse.resolve(child2, settledQueryId);
+        assertEq(multiverse.getOutcome(child1, settledQueryId), OUTCOME_A);
         assertEq(multiverse.getOutcome(child2, settledQueryId), OUTCOME_B);
-        assertEq(multiverse.repTokenOf(child2).balanceOf(challenger), DEFAULT_FEE / 2);
-        assertEq(multiverse.repTokenOf(child2).balanceOf(user), 0);
 
         // The frozen genesis record is untouched: outcome unset there, stakes intact for the future
         // claim-and-migrate lane.
         ResolutionView memory frozen = _resolution(settledQueryId);
         assertEq(frozen.outcome, 0);
+        assertEq(frozen.stakeCount, 2);
         assertEq(frozen.totalStaked, 3 * DEFAULT_FEE);
     }
 
-    function test_QueryFlow_SettledLadderCarriesThroughNestedFork() public {
-        // The frozen ladder's record sits at the GENESIS; child1 never touches it and forks again.
+    function test_QueryFlow_SettledLadderRestartsAtEveryFork() public {
+        // The concluded ladder's record sits at the GENESIS; child1 never touches it and forks again.
+        // Every fork reopens the query: in the grandchild its clock is child1's fork, not the genesis'.
         uint256 settledQueryId = _createDefaultQuery();
-        vm.warp(vm.getBlockTimestamp() + 36 hours);
-        _report(user, settledQueryId, OUTCOME_A); // frozen last outcome: A, first reported at +36h
+        _report(user, settledQueryId, OUTCOME_A);
         _warpPastAppealWindow(settledQueryId);
         (, uint248 child1,) = _forkGenesisWithTwoChildren();
 
@@ -760,26 +760,30 @@ contract MultiverseForkTest is MultiverseFixtures {
         vm.prank(user);
         multiverse.createQuery(child1, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
         _escalateToFork(child1, nestedQueryId, user, user);
+        uint48 child1ForkTime = uint48(vm.getBlockTimestamp());
         vm.prank(bystander);
         multiverse.spawnChildUniverse(child1, OUTCOME_A);
         uint248 grandchild = _childId(child1, OUTCOME_A);
+        vm.prank(user);
+        multiverse.migrate(child1, OUTCOME_A, 150 ether);
         // The settled query's fee copy carries into the grandchild (the nested forking query's own
         // fee is excluded at child1's fork).
         assertEq(_totalQueryFees(grandchild), DEFAULT_FEE);
 
-        // The nearest-record walk finds the frozen ladder two levels up: report rejected, resolve
-        // materializes the frozen outcome in the grandchild and pays the frozen first reporter (user)
-        // on the frozen ramp (36h / 3d = half the fee) — the resolve caller earns nothing.
-        vm.prank(user);
-        vm.expectRevert(Multiverse.QueryAlreadySettled.selector);
-        multiverse.report(grandchild, settledQueryId, OUTCOME_B);
+        // Reopened two levels down: the old outcome is not resolvable, and the grandchild accepts a
+        // fresh first report anchored at child1's fork.
         vm.prank(bystander);
+        vm.expectRevert(Multiverse.QueryNotReadyToResolve.selector);
         multiverse.resolve(grandchild, settledQueryId);
-        assertEq(multiverse.getOutcome(grandchild, settledQueryId), OUTCOME_A);
-        assertEq(multiverse.repTokenOf(grandchild).balanceOf(user), DEFAULT_FEE / 2);
-        assertEq(multiverse.repTokenOf(grandchild).balanceOf(bystander), 0);
-        assertEq(_totalQueryFees(grandchild), 0);
-        // child1 itself never resolved it: mid-chain the query still reads unresolved.
+        vm.startPrank(user);
+        multiverse.repTokenOf(grandchild).approve(address(multiverse), type(uint256).max);
+        multiverse.report(grandchild, settledQueryId, OUTCOME_B);
+        vm.stopPrank();
+        ResolutionView memory grandchildRecord = _resolutionIn(grandchild, settledQueryId);
+        assertEq(grandchildRecord.stakeCount, 1);
+        assertEq(grandchildRecord.queryCreateTime, child1ForkTime);
+        assertEq(grandchildRecord.lastReportedOutcome, OUTCOME_B);
+        // child1 itself never touched it: mid-chain the query still reads unresolved.
         assertEq(multiverse.getOutcome(child1, settledQueryId), 0);
     }
 
@@ -787,7 +791,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         // The reporting window is 1 day in (still open) when the genesis forks: the child gets a
         // FULL window whose clock is the fork, not the remainder and not the child's spawn.
         uint256 openQueryId = _createDefaultQuery();
-        vm.warp(vm.getBlockTimestamp() + multiverse.ONE_DAY());
+        vm.warp(vm.getBlockTimestamp() + multiverse.APPEAL_PERIOD());
         _forkGenesis();
         uint48 forkTime = uint48(vm.getBlockTimestamp());
         multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
@@ -796,7 +800,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         multiverse.migrate(GENESIS_UID, OUTCOME_A, 100 ether);
 
         // Exactly at forkTime + 3 days the window is still open (strict <, mirroring the live check).
-        vm.warp(uint256(forkTime) + multiverse.THREE_DAYS());
+        vm.warp(uint256(forkTime) + multiverse.REPORTING_PERIOD());
         ILituusRep child1Rep = multiverse.repTokenOf(child1);
         vm.startPrank(user);
         child1Rep.approve(address(multiverse), type(uint256).max);
@@ -819,7 +823,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         _forkGenesis();
 
         // The child spawns only after the restarted window (3 days from the FORK) already lapsed.
-        vm.warp(vm.getBlockTimestamp() + multiverse.THREE_DAYS() + 1);
+        vm.warp(vm.getBlockTimestamp() + multiverse.REPORTING_PERIOD() + 1);
         multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
         uint248 child1 = _childId(GENESIS_UID, OUTCOME_A);
 
@@ -832,7 +836,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         vm.expectRevert(Multiverse.QueryExpired.selector);
         multiverse.report(child1, voidedId, OUTCOME_B);
 
-        vm.warp(vm.getBlockTimestamp() + multiverse.THREE_DAYS()); // mature the reward ramp
+        vm.warp(vm.getBlockTimestamp() + multiverse.REPORTING_PERIOD()); // mature the reward ramp
         vm.startPrank(bystander);
         multiverse.resolve(child1, unreportedId);
         multiverse.resolve(child1, voidedId);
@@ -872,7 +876,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         assertEq(childRecord.lastReportedOutcome, OUTCOME_B);
 
         // The restarted game resolves on its own terms; the frozen genesis ladder is untouched.
-        vm.warp(vm.getBlockTimestamp() + multiverse.ONE_DAY() + 1);
+        vm.warp(vm.getBlockTimestamp() + multiverse.APPEAL_PERIOD() + 1);
         vm.prank(bystander);
         multiverse.resolve(child1, voidedId);
         assertEq(multiverse.getOutcome(child1, voidedId), OUTCOME_B);
@@ -881,11 +885,11 @@ contract MultiverseForkTest is MultiverseFixtures {
         assertEq(frozen.outcome, 0);
     }
 
-    function test_QueryFlow_UntouchedMiddleGenerationExpiresQuery() public {
+    function test_QueryFlow_UntouchedMiddleGenerationRestartsQuery() public {
         // Two queries alive at the genesis fork: one never reported, one REPORTED with its appeal
-        // window still open (the ladder is voided by the fork, so its restart clock ticks too).
-        // Neither is touched in child1, which holds them for more than 3 days before forking
-        // itself: both silently expired in that period.
+        // window still open. Neither is touched in child1, which holds them for more than 3 days
+        // before forking itself. The lapse in the untouched generation does not kill them: child1's
+        // fork reopens both in the grandchild with a full window clocked from that fork.
         uint256 strandedId = _createDefaultQuery();
         uint256 reportedStrandedId = _createDefaultQuery();
         // The second query's fee is demand-adjusted upward, so track the aggregate.
@@ -893,7 +897,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         _report(user, reportedStrandedId, OUTCOME_A);
         (, uint248 child1,) = _forkGenesisWithTwoChildren();
 
-        vm.warp(vm.getBlockTimestamp() + multiverse.THREE_DAYS() + 1);
+        vm.warp(vm.getBlockTimestamp() + multiverse.REPORTING_PERIOD() + 1);
         ILituusRep child1Rep = multiverse.repTokenOf(child1);
         vm.prank(user);
         child1Rep.approve(address(multiverse), type(uint256).max);
@@ -901,31 +905,25 @@ contract MultiverseForkTest is MultiverseFixtures {
         vm.prank(user);
         multiverse.createQuery(child1, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
         _escalateToFork(child1, nestedQueryId, user, user);
+        uint48 child1ForkTime = uint48(vm.getBlockTimestamp());
         vm.prank(bystander);
         multiverse.spawnChildUniverse(child1, OUTCOME_A);
         uint248 grandchild = _childId(child1, OUTCOME_A);
+        vm.prank(user);
+        multiverse.migrate(child1, OUTCOME_A, 150 ether);
         assertEq(_totalQueryFees(grandchild), feePot);
 
-        // Both are dead in the grandchild: the check catches the lapse even though no record was
-        // ever materialized in child1 — and the pre-fork report does not save the voided ladder
-        // from expiring in the untouched generation.
-        vm.prank(user);
-        vm.expectRevert(Multiverse.QueryExpired.selector);
+        // Both are open in the grandchild, anchored at child1's fork — the never-reported one and the
+        // one whose pre-fork ladder was voided alike.
+        vm.startPrank(user);
+        multiverse.repTokenOf(grandchild).approve(address(multiverse), type(uint256).max);
         multiverse.report(grandchild, strandedId, OUTCOME_A);
-        vm.prank(user);
-        vm.expectRevert(Multiverse.QueryExpired.selector);
         multiverse.report(grandchild, reportedStrandedId, OUTCOME_B);
-
-        vm.warp(vm.getBlockTimestamp() + multiverse.THREE_DAYS()); // mature the reward ramps
-        vm.prank(bystander);
-        multiverse.resolve(grandchild, strandedId);
-        assertEq(multiverse.getOutcome(grandchild, strandedId), INVALID_OUTCOME);
-        assertEq(multiverse.repTokenOf(grandchild).balanceOf(bystander), DEFAULT_FEE);
-        vm.prank(challenger);
-        multiverse.resolve(grandchild, reportedStrandedId);
-        assertEq(multiverse.getOutcome(grandchild, reportedStrandedId), INVALID_OUTCOME);
-        assertEq(multiverse.repTokenOf(grandchild).balanceOf(challenger), feePot - DEFAULT_FEE);
-        assertEq(_totalQueryFees(grandchild), 0);
+        vm.stopPrank();
+        assertEq(_resolutionIn(grandchild, strandedId).queryCreateTime, child1ForkTime);
+        assertEq(_resolutionIn(grandchild, strandedId).stakeCount, 1);
+        assertEq(_resolutionIn(grandchild, reportedStrandedId).queryCreateTime, child1ForkTime);
+        assertEq(_resolutionIn(grandchild, reportedStrandedId).stakeCount, 1);
 
         // The voided stake is untouched in the frozen genesis record (refund lane = claims phase).
         ResolutionView memory frozen = _resolution(reportedStrandedId);
@@ -933,60 +931,10 @@ contract MultiverseForkTest is MultiverseFixtures {
         assertEq(frozen.outcome, 0);
     }
 
-    function test_QueryFlow_FirstLapsedPeriodAnchorsTheExpiry() public {
-        // Corner case: TWO consecutive untouched generations each barely exceed the reporting
-        // window (3d + 1s). The query truly died in the FIRST one; the second "lapse" is moot (it
-        // was already dead when carried in). The classifier must anchor at the first lapse: the
-        // resolver ramp is then long saturated, so a PROMPT resolution right after the second fork
-        // pays the full fee. Anchored at the second lapse it would pay ~1 second of ramp instead.
-        uint256 strandedId = _createDefaultQuery();
-        (, uint248 child1,) = _forkGenesisWithTwoChildren();
-
-        // Generation 1 (child1): holds the query untouched for 3d + 1, then forks.
-        vm.warp(vm.getBlockTimestamp() + multiverse.THREE_DAYS() + 1);
-        ILituusRep child1Rep = multiverse.repTokenOf(child1);
-        vm.prank(user);
-        child1Rep.approve(address(multiverse), type(uint256).max);
-        uint256 nestedQueryId = multiverse.queryCount();
-        vm.prank(user);
-        multiverse.createQuery(child1, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
-        _escalateToFork(child1, nestedQueryId, user, user);
-        vm.prank(bystander);
-        multiverse.spawnChildUniverse(child1, OUTCOME_A);
-        uint248 grandchild = _childId(child1, OUTCOME_A);
-        vm.prank(user);
-        multiverse.migrate(child1, OUTCOME_A, 150 ether);
-
-        // Generation 2 (grandchild): the same, another untouched 3d + 1 tenure, then forks.
-        vm.warp(vm.getBlockTimestamp() + multiverse.THREE_DAYS() + 1);
-        ILituusRep grandchildRep = multiverse.repTokenOf(grandchild);
-        vm.prank(user);
-        grandchildRep.approve(address(multiverse), type(uint256).max);
-        uint256 deepNestedQueryId = multiverse.queryCount();
-        vm.prank(user);
-        multiverse.createQuery(grandchild, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
-        _escalateToFork(grandchild, deepNestedQueryId, user, user);
-        vm.prank(bystander);
-        multiverse.spawnChildUniverse(grandchild, OUTCOME_A);
-        uint248 greatGrandchild = _childId(grandchild, OUTCOME_A);
-
-        // Dead at birth, and resolved IMMEDIATELY (zero time on the second lapse's would-be ramp):
-        // the full fee proves the anchor is the first lapse — the ramp has been running since the
-        // query became resolvable in child1's tenure, two fork levels ago.
-        vm.prank(user);
-        vm.expectRevert(Multiverse.QueryExpired.selector);
-        multiverse.report(greatGrandchild, strandedId, OUTCOME_A);
-        vm.prank(bystander);
-        multiverse.resolve(greatGrandchild, strandedId);
-        assertEq(multiverse.getOutcome(greatGrandchild, strandedId), INVALID_OUTCOME);
-        assertEq(multiverse.repTokenOf(greatGrandchild).balanceOf(bystander), DEFAULT_FEE);
-        assertEq(_totalQueryFees(greatGrandchild), 0);
-    }
-
     function test_QueryFlow_AncestorResolvedQueryRejectedInChildren() public {
         // A query fully resolved in the genesis BEFORE the fork: children inherit the answer via the
-        // ancestor walk and must reject every attempt to touch it again — this guard now lives in
-        // the classification walk (report/resolve no longer call _findResolution).
+        // ancestor walk and must reject every attempt to touch it again (the _findResolution guard
+        // on the first touch of an inherited query).
         uint256 resolvedId = _createDefaultQuery();
         _report(user, resolvedId, OUTCOME_A);
         _warpPastAppealWindow(resolvedId);
@@ -1046,77 +994,6 @@ contract MultiverseForkTest is MultiverseFixtures {
         multiverse.resolve(child1, openQueryId);
         // The failed attempt materialized nothing: the record is still not materialized in this child.
         assertEq(_resolutionIn(child1, openQueryId).queryCreateTime, 0);
-    }
-
-    function test_QueryFlow_NoStakeClaimsThroughChildSettledRecord() public {
-        // The frozen ladder's stakes live in the GENESIS record only; the child's materialized
-        // settled record carries the outcome but no stakes, so it cannot be used to claim — the
-        // stakes wait for the claim-and-migrate lane against the frozen parent record.
-        uint256 settledQueryId = _createDefaultQuery();
-        _report(user, settledQueryId, OUTCOME_A);
-        _report(challenger, settledQueryId, OUTCOME_B); // frozen winner: B (challenger's stake)
-        _warpPastAppealWindow(settledQueryId);
-        _forkGenesis();
-        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
-        uint248 child1 = _childId(GENESIS_UID, OUTCOME_A);
-
-        vm.prank(bystander);
-        multiverse.resolve(child1, settledQueryId);
-        assertEq(multiverse.getOutcome(child1, settledQueryId), OUTCOME_B);
-
-        // No double-dip through the child's record; the gated parent stays claim-locked too.
-        vm.prank(challenger);
-        vm.expectRevert(Multiverse.NothingToClaim.selector);
-        multiverse.claim(child1, settledQueryId);
-        vm.prank(challenger);
-        vm.expectRevert(Multiverse.InvalidUniverseState.selector);
-        multiverse.claim(GENESIS_UID, settledQueryId);
-    }
-
-    function test_QueryFlow_ExactForkBoundariesFreezeAsStillOpen() public {
-        // The freeze comparisons are strictly `<`, mirroring the live checks: a window that lapses
-        // EXACTLY at the fork moment was not yet lapsed at it. Both queries restart in the child.
-        // (a) unreported, created exactly 3 days before the fork -> not expired at fork;
-        // (b) reported, last stake exactly 1 day before the fork -> voided, not settled.
-        uint256 unreportedId = _createDefaultQuery();
-        uint256 reportedId = _createDefaultQuery();
-        vm.warp(vm.getBlockTimestamp() + multiverse.THREE_DAYS() - multiverse.ONE_DAY());
-        _report(user, reportedId, OUTCOME_A);
-        vm.warp(vm.getBlockTimestamp() + multiverse.ONE_DAY());
-        (, uint248 child1,) = _forkGenesisWithTwoChildren();
-        uint48 forkTime = uint48(vm.getBlockTimestamp());
-
-        ILituusRep child1Rep = multiverse.repTokenOf(child1);
-        vm.startPrank(user);
-        child1Rep.approve(address(multiverse), type(uint256).max);
-        // Neither is settled nor dead: both accept a fresh first report, clocked from the fork.
-        multiverse.report(child1, unreportedId, OUTCOME_A);
-        multiverse.report(child1, reportedId, OUTCOME_B);
-        vm.stopPrank();
-        assertEq(_resolutionIn(child1, unreportedId).queryCreateTime, forkTime);
-        assertEq(_resolutionIn(child1, unreportedId).stakeCount, 1);
-        assertEq(_resolutionIn(child1, reportedId).queryCreateTime, forkTime);
-        assertEq(_resolutionIn(child1, reportedId).stakeCount, 1);
-    }
-
-    function test_QueryFlow_SettledLadderWithInvalidOutcome() public {
-        // INVALID (max-uint) is an ordinary frozen outcome: a ladder whose last report was INVALID and
-        // whose appeal lapsed before the fork settles every child to INVALID.
-        uint256 settledQueryId = _createDefaultQuery();
-        _report(user, settledQueryId, OUTCOME_A);
-        _report(challenger, settledQueryId, INVALID_OUTCOME);
-        _warpPastAppealWindow(settledQueryId);
-        _forkGenesis();
-        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
-        uint248 child1 = _childId(GENESIS_UID, OUTCOME_A);
-
-        vm.prank(user);
-        vm.expectRevert(Multiverse.QueryAlreadySettled.selector);
-        multiverse.report(child1, settledQueryId, OUTCOME_A);
-        vm.prank(bystander);
-        multiverse.resolve(child1, settledQueryId);
-        assertEq(multiverse.getOutcome(child1, settledQueryId), INVALID_OUTCOME);
-        assertEq(_totalQueryFees(child1), 0);
     }
 
     /* ============================================= FORK PAYOUTS ============================================= */
@@ -1196,7 +1073,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         (uint256 forkQueryId,,) = _forkGenesisAndSpawn();
 
         // The claim is a counted vote, so it closes with the migration window, like migrate().
-        vm.warp(vm.getBlockTimestamp() + multiverse.SIXTY_DAYS());
+        vm.warp(vm.getBlockTimestamp() + multiverse.MIGRATION_DURATION());
         vm.prank(user);
         vm.expectRevert(Multiverse.MigrationWindowClosed.selector);
         multiverse.migrateStake(GENESIS_UID, forkQueryId, OUTCOME_A, OUTCOME_A);
@@ -1223,9 +1100,9 @@ contract MultiverseForkTest is MultiverseFixtures {
         multiverse.spawnChildUniverse(child1, OUTCOME_B);
         uint248 grandchildA = _childId(child1, OUTCOME_A);
 
-        // 60 days later child1's own window has lapsed, but the genesis fork is not resolved yet, so
+        // 30 days later child1's own window has lapsed, but the genesis fork is not resolved yet, so
         // child1 keeps migrating and the claim still lands.
-        vm.warp(vm.getBlockTimestamp() + multiverse.SIXTY_DAYS());
+        vm.warp(vm.getBlockTimestamp() + multiverse.MIGRATION_DURATION());
         vm.prank(user);
         multiverse.migrateStake(child1, nestedQueryId, OUTCOME_A, OUTCOME_A);
         assertGt(multiverse.repTokenOf(grandchildA).balanceOf(user), 0);
@@ -1337,7 +1214,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         // The first reports land halfway through the reporting window, so each outcome's first reporter
         // earned half the fee.
         uint256 queryId = _createDefaultQuery();
-        vm.warp(vm.getBlockTimestamp() + multiverse.THREE_DAYS() / 2);
+        vm.warp(vm.getBlockTimestamp() + multiverse.REPORTING_PERIOD() / 2);
         _escalateToFork(GENESIS_UID, queryId, user, challenger);
         uint248 child1 = _childId(GENESIS_UID, OUTCOME_A);
         uint248 child2 = _childId(GENESIS_UID, OUTCOME_B);

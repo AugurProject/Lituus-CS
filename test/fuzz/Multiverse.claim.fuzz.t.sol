@@ -84,7 +84,7 @@ contract MultiverseClaimFuzzTest is MultiverseFuzzFixtures {
         feeCtl.setFee(fee);
 
         (uint256 queryId, uint256 totalStaked, uint256 stakedOnOne, uint256 stakedOnTwo) = _buildTrackedLadder(rounds);
-        vm.warp(vm.getBlockTimestamp() + multiverse.ONE_DAY() + 1);
+        vm.warp(vm.getBlockTimestamp() + multiverse.APPEAL_PERIOD() + 1);
         vm.prank(resolver);
         multiverse.resolve(GENESIS_UID, queryId);
 
@@ -116,7 +116,7 @@ contract MultiverseClaimFuzzTest is MultiverseFuzzFixtures {
         feeCtl.setFee(MAX_LADDER_FEE);
 
         uint256 queryId = _buildLadder(rounds);
-        vm.warp(vm.getBlockTimestamp() + multiverse.ONE_DAY() + 1);
+        vm.warp(vm.getBlockTimestamp() + multiverse.APPEAL_PERIOD() + 1);
         vm.prank(resolver);
         multiverse.resolve(GENESIS_UID, queryId);
 
@@ -148,7 +148,7 @@ contract MultiverseClaimFuzzTest is MultiverseFuzzFixtures {
         for (uint256 i = 0; i < queryCount; i++) {
             queryIds[i] = _buildLadder(rounds);
         }
-        vm.warp(vm.getBlockTimestamp() + multiverse.ONE_DAY() + 1);
+        vm.warp(vm.getBlockTimestamp() + multiverse.APPEAL_PERIOD() + 1);
         for (uint256 i = 0; i < queryCount; i++) {
             vm.prank(resolver);
             multiverse.resolve(GENESIS_UID, queryIds[i]);
@@ -212,7 +212,7 @@ contract MultiverseClaimFuzzTest is MultiverseFuzzFixtures {
         internal
         returns (uint256 winnerStaked, uint256 totalDistributable, uint256 paidOut, uint256 claimants)
     {
-        vm.warp(vm.getBlockTimestamp() + multiverse.ONE_DAY() + 1);
+        vm.warp(vm.getBlockTimestamp() + multiverse.APPEAL_PERIOD() + 1);
         vm.prank(resolver);
         multiverse.resolve(GENESIS_UID, queryId);
 
@@ -240,7 +240,7 @@ contract MultiverseClaimFuzzTest is MultiverseFuzzFixtures {
         feeCtl.setFee(fee);
 
         uint256 queryId = _buildLadder(rounds);
-        vm.warp(vm.getBlockTimestamp() + multiverse.ONE_DAY() + 1);
+        vm.warp(vm.getBlockTimestamp() + multiverse.APPEAL_PERIOD() + 1);
         vm.prank(resolver);
         multiverse.resolve(GENESIS_UID, queryId);
 

@@ -25,7 +25,7 @@ contract MultiverseReportFuzzTest is MultiverseFuzzFixtures {
 
     /// @dev Property: a first report any time up to and including the deadline succeeds.
     function testFuzz_Report_WithinReportingWindow(uint256 delay) public {
-        delay = bound(delay, 0, multiverse.THREE_DAYS());
+        delay = bound(delay, 0, multiverse.REPORTING_PERIOD());
         uint256 queryId = _createQuery();
 
         vm.warp(vm.getBlockTimestamp() + delay);
@@ -37,7 +37,7 @@ contract MultiverseReportFuzzTest is MultiverseFuzzFixtures {
 
     /// @dev Property: a first report any time past the deadline always reverts.
     function testFuzz_Report_RevertsAfterReportingWindow(uint256 delay) public {
-        delay = bound(delay, multiverse.THREE_DAYS() + 1, 365 days);
+        delay = bound(delay, multiverse.REPORTING_PERIOD() + 1, 365 days);
         uint256 queryId = _createQuery();
 
         vm.warp(vm.getBlockTimestamp() + delay);
@@ -93,7 +93,7 @@ contract MultiverseReportFuzzTest is MultiverseFuzzFixtures {
 
     /// @dev Property: an escalation any time up to and including the appeal deadline succeeds.
     function testFuzz_Report_WithinAppealWindow(uint256 delay) public {
-        delay = bound(delay, 0, multiverse.ONE_DAY());
+        delay = bound(delay, 0, multiverse.APPEAL_PERIOD());
         uint256 queryId = _createQuery();
         vm.prank(user);
         multiverse.report(GENESIS_UID, queryId, 1);
@@ -107,7 +107,7 @@ contract MultiverseReportFuzzTest is MultiverseFuzzFixtures {
 
     /// @dev Property: an escalation any time past the appeal deadline always reverts.
     function testFuzz_Report_RevertsAfterAppealWindow(uint256 delay) public {
-        delay = bound(delay, multiverse.ONE_DAY() + 1, 365 days);
+        delay = bound(delay, multiverse.APPEAL_PERIOD() + 1, 365 days);
         uint256 queryId = _createQuery();
         vm.prank(user);
         multiverse.report(GENESIS_UID, queryId, 1);

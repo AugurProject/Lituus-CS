@@ -36,6 +36,11 @@ abstract contract MultiverseDeployFixture is Test {
     string internal constant DEFAULT_QUESTION = "John Doe's pet?[CAT,DOG,SHARK]";
     // Fixed timestamp so queryCreateTime / forkTime assertions are deterministic.
     uint256 internal constant START_TIME = 1_000_000;
+    // The Multiverse's time periods (constructor immutables): the fork-migration window, the
+    // first-report window (also the fee-ramp and the profit-bucket width), and the appeal window.
+    uint256 internal constant MIGRATION_DURATION = 30 days;
+    uint256 internal constant REPORTING_PERIOD = 3 days;
+    uint256 internal constant APPEAL_PERIOD = 1 days;
 
     MockERC20 internal underlying;
     MockZoltarQuestionData internal zoltarQuestionData;
@@ -138,7 +143,9 @@ abstract contract MultiverseDeployFixture is Test {
     /// @dev Multiverse deploy hook: the production contract by default. Suites that need a test
     ///      harness (e.g. exposing internal views) override this.
     function _deployMultiverse(IQueryFeeController controller) internal virtual returns (Multiverse) {
-        return new Multiverse(zoltar, GENESIS_UID, controller, queryTokenizerStub);
+        return new Multiverse(
+            zoltar, GENESIS_UID, controller, queryTokenizerStub, MIGRATION_DURATION, REPORTING_PERIOD, APPEAL_PERIOD
+        );
     }
 
     /// @dev Creates an already-ended categorical Zoltar question with `numberOfLabels` placeholder labels.
@@ -275,13 +282,13 @@ abstract contract MultiverseFixtures is MultiverseDeployFixture {
     /// @dev Warps to one second past the query's 3-day reporting window — the earliest moment an
     ///      unreported query becomes resolvable (as INVALID).
     function _warpPastReportingWindow(uint256 queryId) internal {
-        vm.warp(uint256(_resolution(queryId).queryCreateTime) + multiverse.THREE_DAYS() + 1);
+        vm.warp(uint256(_resolution(queryId).queryCreateTime) + multiverse.REPORTING_PERIOD() + 1);
     }
 
     /// @dev Warps to one second past the last stake's 1-day appeal window — the earliest moment a
     ///      reported query becomes resolvable.
     function _warpPastAppealWindow(uint256 queryId) internal {
-        vm.warp(uint256(_resolution(queryId).lastStakeTime) + multiverse.ONE_DAY() + 1);
+        vm.warp(uint256(_resolution(queryId).lastStakeTime) + multiverse.APPEAL_PERIOD() + 1);
     }
 
     /// @dev Expired query fixture: `user` creates a default query that is never reported, then time
@@ -329,7 +336,7 @@ abstract contract MultiverseFixtures is MultiverseDeployFixture {
     ///      winning stakes (user fee, bystander 3*fee: A totals 4*fee) and one losing stake
     ///      (challenger 2*fee); `user` is the first winning reporter, so resolve() will push-pay them
     ///      the reporter reward. The first report lands 18 hours in, so the reward ramp is exactly
-    ///      a quarter of the fee (18h / THREE_DAYS) and reward-derived literals stay clean.
+    ///      a quarter of the fee (18h / REPORTING_PERIOD) and reward-derived literals stay clean.
     /// @return queryId The id of the reported, resolvable query.
     function _createReportedLadder() internal returns (uint256 queryId) {
         queryId = _createDefaultQuery();
