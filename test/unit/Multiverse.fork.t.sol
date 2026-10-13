@@ -5,6 +5,7 @@ import { Multiverse } from "src/Multiverse.sol";
 import { LituusRep } from "src/LituusRep.sol";
 import { ILituusRep } from "src/interfaces/ILituusRep.sol";
 import { MultiverseFixtures } from "./Multiverse.fixtures.sol";
+import { QueryFeeMirror } from "./QueryFee.mirror.sol";
 
 /// @notice Minimal forking flow: trigger inside report(), lazy spawn, migration voting, resolution, and
 ///         the forking query's payouts in the children.
@@ -18,37 +19,6 @@ contract MultiverseForkTest is MultiverseFixtures {
     // On the fixture ladder the two capped outcomes are the only ones staked, so the losing side of the cap
     // is the other cap less what Zoltar burned: a winner's payout in its own child is its 32 plus 32 - 12.8.
     uint256 internal constant WINNER_PAYOUT = 32 ether + (32 ether - FORK_BURN);
-
-    /// @dev Escalates a query in `universeId` until the fork fires (the second outcome reaches the
-    ///      per-outcome cap inside report()), alternating OUTCOME_A/OUTCOME_B from
-    ///      `reporterA`/`reporterB`. Returns the trigger stake (the stake that landed the second
-    ///      outcome on the cap, recorded in full like any other).
-    function _escalateToFork(uint248 universeId, uint256 queryId, address reporterA, address reporterB)
-        internal
-        returns (uint256 triggerStake)
-    {
-        uint256 i = 0;
-        while (true) {
-            uint256 outcome = i % 2 == 0 ? OUTCOME_A : OUTCOME_B;
-            triggerStake = multiverse.getNextRequiredStake(universeId, queryId, outcome);
-            vm.prank(i % 2 == 0 ? reporterA : reporterB);
-            multiverse.report(universeId, queryId, outcome);
-            if (_universeState(universeId) == Multiverse.UniverseState.Migration) return triggerStake;
-            i++;
-        }
-    }
-
-    /// @dev Forks the genesis universe on a fresh default query and returns (queryId, triggerStake).
-    ///      On the fixture grid (cap = 32*fee) the ladder is 1, 2, 3, 6, 12, 24 (B at the cap),
-    ///      then the 16*fee rung on A triggers.
-    function _forkGenesis() internal returns (uint256 queryId, uint256 triggerStake) {
-        queryId = _createDefaultQuery();
-        triggerStake = _escalateToFork(GENESIS_UID, queryId, user, challenger);
-    }
-
-    function _childId(uint248 parentId, uint256 outcome) internal view returns (uint248) {
-        return zoltar.getChildUniverseId(parentId, outcome);
-    }
 
     /// @dev Forks the genesis into two spawned children with the standard vote split: user migrates
     ///      320 ether to the OUTCOME_A child, challenger 400 ether to the OUTCOME_B child — child2
@@ -65,10 +35,6 @@ contract MultiverseForkTest is MultiverseFixtures {
         multiverse.migrate(GENESIS_UID, OUTCOME_A, 320 ether);
         vm.prank(challenger);
         multiverse.migrate(GENESIS_UID, OUTCOME_B, 400 ether);
-    }
-
-    function _universeState(uint248 universeId) internal view returns (Multiverse.UniverseState state) {
-        (, state,,,,,,,,,,,) = multiverse.universes(universeId);
     }
 
     /// @dev Forks the genesis on a fresh default query and spawns the OUTCOME_A and OUTCOME_B children
@@ -367,7 +333,11 @@ contract MultiverseForkTest is MultiverseFixtures {
         uint256 nestedQueryId = multiverse.queryCount();
         vm.prank(user);
         multiverse.createQuery(child1, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
-        assertEq(_totalQueryFees(child1), 2 * DEFAULT_FEE);
+        // The child inherits the genesis demand history (vol[0] = 2: the open and the forking query), so its fee
+        // is demand-adjusted: at window 0, f = 0, recent 2 + bootstrap 3 = 5 over a bootstrap-filled sixty.
+        (,, uint256 nestedFee,,) = multiverse.queries(nestedQueryId);
+        assertEq(nestedFee, QueryFeeMirror.expectedFee(multiverse, DEFAULT_FEE, 0, 0, 2, 0, 0, 0));
+        assertEq(_totalQueryFees(child1), DEFAULT_FEE + nestedFee);
         _escalateToFork(child1, nestedQueryId, user, user);
 
         // At child1's own fork the nested forking query's fee is excluded; the genesis-era fee
