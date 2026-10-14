@@ -194,6 +194,19 @@ abstract contract MultiverseDeployFixture is Test {
         vm.stopPrank();
     }
 
+    /// @dev Funding tool for a child universe: hand `account` `amount` of the child's Zoltar REP (a migration at
+    ///      the Zoltar level, outside Lituus), wrap it into the child's Lituus vault, approve the multiverse.
+    function _wrapFromZoltar(uint248 universeId, address account, uint256 amount) internal {
+        MockERC20 zoltarRep = MockERC20(address(zoltar.childRepTokens(universeId)));
+        ILituusRep repToken = multiverse.repTokenOf(universeId);
+        zoltarRep.mint(account, amount);
+        vm.startPrank(account);
+        zoltarRep.approve(address(repToken), type(uint256).max);
+        multiverse.wrap(universeId, amount, 0);
+        repToken.approve(address(multiverse), type(uint256).max);
+        vm.stopPrank();
+    }
+
     /// @dev The claim payout the contract owes `staker` on a resolved query, from the per-outcome totals.
     ///      NOTE: this re-derives the contract's own payout formula, so it can never catch a bug
     ///      in that formula — it exists for dynamic-fee and fuzz cases where a literal cannot be

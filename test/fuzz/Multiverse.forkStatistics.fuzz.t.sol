@@ -9,10 +9,11 @@ import { QueryFeeMirror } from "../unit/QueryFee.mirror.sol";
 
 /// @notice Property-based test for the history a child inherits at spawn: a random parent history (volume and
 ///         profit over the 25 windows before a random fork window), a random trigger moment inside the fork
-///         window and a random spawn delay inside the migration window. The child must hold the parent's real
-///         buckets for the 21 windows ending at its spawn window, with the frozen gap between the trigger and
-///         the spawn filled from the parent's per-window volume and profit as of the trigger, the cache those
-///         buckets sum to, and the mirror's fee off them.
+///         window and a random spawn delay: inside the migration window or long after it, into the resolved fork.
+///         The child must hold the parent's real buckets for the 21 windows ending at its spawn window, with the
+///         frozen gap between the trigger and the spawn filled from the parent's per-window volume and profit as
+///         of the trigger (a late enough spawn is fill through and through), the cache those buckets sum to, and
+///         the mirror's fee off them.
 /// @dev The parent is frozen from the trigger, so its buckets and its profit view at the trigger are read after
 ///      the fact to build the expectation. The fill rule is restated here; the unit suite pins it with literals.
 contract MultiverseForkStatisticsFuzzTest is MultiverseFuzzFixtures {
@@ -91,7 +92,8 @@ contract MultiverseForkStatisticsFuzzTest is MultiverseFuzzFixtures {
         forkWindow = bound(forkWindow, 0, MAX_FORK_WINDOW);
         // Anywhere in the fork window after its history is seeded (one day and an hour in).
         triggerOffset = bound(triggerOffset, _historyEnd() + 1, multiverse.THREE_DAYS() - 1);
-        delay = bound(delay, 0, MIGRATION_DURATION - 1);
+        // Up to three migration windows after the trigger: past the first one the fork is resolved before the spawn.
+        delay = bound(delay, 0, 3 * MIGRATION_DURATION);
 
         // Random history over the windows before the fork (and the fork window itself, before the trigger).
         uint256 firstWindow = forkWindow >= HISTORY_WINDOWS ? forkWindow - HISTORY_WINDOWS : 0;
@@ -120,6 +122,7 @@ contract MultiverseForkStatisticsFuzzTest is MultiverseFuzzFixtures {
         uint256 parentRecentVolume = harness.exposed_recentVolume(GENESIS_UID);
 
         vm.warp(forkTime + delay);
+        if (delay >= MIGRATION_DURATION) multiverse.advanceForkState(GENESIS_UID);
         multiverse.spawnChildUniverse(GENESIS_UID, 1);
         uint248 child = _childId(GENESIS_UID, 1);
         fill.spawnWindow = (vm.getBlockTimestamp() - START_TIME) / multiverse.THREE_DAYS();

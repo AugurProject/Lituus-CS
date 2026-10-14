@@ -427,6 +427,45 @@ contract MultiverseForkStatisticsTest is ForkStatisticsFixtures {
         assertEq(childSixty, 5);
     }
 
+    function test_Spawn_AfterTheForkResolvesFillsTheWholeHorizonAtTheTriggerRates() public {
+        // Profit p in window 38 (one query), vol[39] = 4, the forking query a quarter into window 40 (vol[40] = 1).
+        // Fill at the trigger: volume vol[39] = 4 per window, profit p / 10. The fork resolves after its 30 days
+        // and the child spawns at the start of window 70, thirty windows after the trigger: every real bucket is
+        // beyond the 21-window horizon, so the child's whole history is the fill.
+        uint256 p = _seedProfitAt(38);
+        _seedVolumeAt(39, 4);
+        _warpToWindow(40, multiverse.THREE_DAYS() / 4);
+        _forkGenesisWithPreview();
+        uint256 profitPerWindow = p / 10;
+
+        vm.warp(vm.getBlockTimestamp() + multiverse.MIGRATION_DURATION());
+        multiverse.advanceForkState(GENESIS_UID);
+        _warpToWindow(70, 0);
+        uint248 child = _spawn(GENESIS_UID, OUTCOME_A);
+
+        // Windows 50..69 whole at the rates; the spawn window has no elapsed share (f = 0) and stays empty, and so
+        // does everything older than 50: the real buckets 38..40 are not copied.
+        _assertBucketEmpty(child, 38);
+        _assertBucketEmpty(child, 39);
+        _assertBucketEmpty(child, 40);
+        _assertBucketEmpty(child, 49);
+        _assertBucket(child, 50, profitPerWindow, 4);
+        _assertBucket(child, 60, profitPerWindow, 4);
+        _assertBucket(child, 69, profitPerWindow, 4);
+        _assertBucketEmpty(child, 70);
+        (uint256 childSixty, uint256 childLast) = _stats(child);
+        assertEq(childLast, 70);
+        assertEq(childSixty, 20 * 4);
+
+        // A steady state at the trigger rates: recent = 0 + vol[69] = 4 over sixty 80 (ratio exactly 1, the branch
+        // boundary — the mirror with those volumes is the readable expectation), and both profit months read the
+        // parent's trigger-time 30-day profit: ten windows at a tenth of it each.
+        assertEq(_uncappedFee(child), QueryFeeMirror.expectedFee(multiverse, DEFAULT_FEE, 70, 0, 0, 4, 80, 4));
+        (uint256 currentProfit, uint256 lastProfit) = harness.exposed_getProfits(child);
+        assertEq(currentProfit, 10 * profitPerWindow);
+        assertEq(lastProfit, 10 * profitPerWindow);
+    }
+
     function test_Spawn_IdleParentRecomputesTheCacheFromRealBuckets() public {
         // The parent's only activity (vol[5] = 3) is 25 windows before the fork: the forking query's own creation
         // hits the recompute branch (gap >= 20), so the parent's cache is 0 at 30 and window 5 is outside the horizon.

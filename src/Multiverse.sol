@@ -275,7 +275,6 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     error ZeroFee();
     error ExactlyOneAmountRequired();
     error QueryNotInherited();
-    error SpawnWindowClosed();
     error MigrationWindowClosed();
     error MigrationWindowNotClosed();
     error ParentForkNotResolved();
@@ -1705,20 +1704,25 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
 
     /**
      * @notice Spawns the child universe for one outcome of a forking universe. Permissionless.
-     * @dev Lazy per-child deployment: only outcomes somebody pays to spawn get a universe, and only
-     *      during the migration window (use-it-or-lose-it). The outcome must be a valid outcome of
-     *      the forking query: 1..numberOfOutcomes or INVALID for a Lituus fork; for a mirrored Zoltar
-     *      fork any answer Zoltar deems well-formed (categorical 0 = Invalid, 1..n; scalar encodings).
+     * @dev Lazy per-child deployment: only outcomes somebody pays to spawn get a universe, at any time
+     *      after the fork — the spawn window never closes. A child spawned after the migration window
+     *      closes can no longer receive counted migrations, so it can never be the favorite child or
+     *      canonical, but it is a full universe: Zoltar REP wraps into it and it runs queries and forks
+     *      of its own. Spawning stays sequential: the parent must itself be a forked Lituus universe, so
+     *      a Zoltar lineage with no Lituus record is walked one level at a time (mirror, spawn, mirror, ...).
+     *      The outcome must be a valid outcome of the forking query: 1..numberOfOutcomes or INVALID for a
+     *      Lituus fork; for a mirrored Zoltar fork any answer Zoltar deems well-formed (categorical
+     *      0 = Invalid, 1..n; scalar encodings).
      *      Beyond the vault deployment, the spawner pays for seeding the child's demand/profit history
      *      (see _seedChildStatistics): one storage write per non-empty window of the 21 copied.
-     * @param universeId The forking universe (must be in Migration).
+     * @param universeId The forked universe (any state past Active: Migration or later).
      * @param outcome The forking query's outcome this child stands for (a Zoltar answer for a mirrored fork).
      */
     function spawnChildUniverse(uint248 universeId, uint256 outcome) external nonReentrant {
         Universe storage universe = universes[universeId];
-        if (universe.universeState != UniverseState.Migration) revert InvalidUniverseState();
-        // The spawn window is the migration window, self-enforced by clock.
-        if (block.timestamp >= uint256(universe.forkTime) + MIGRATION_DURATION) revert SpawnWindowClosed();
+        // The spawn window never closes: a child can be spawned at any time after the fork.
+        if (universe.universeState == UniverseState.NotExisting) revert InvalidUniverse();
+        if (universe.universeState == UniverseState.Active) revert InvalidUniverseState();
 
         uint256 forkQueryId = universe.forkQuery;
         // TODO: map outcomeId to Zoltar outcomes.

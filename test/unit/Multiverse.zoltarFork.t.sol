@@ -358,4 +358,77 @@ contract MultiverseZoltarForkTest is MultiverseFixtures {
         multiverse.resolve(child1, freshId);
         assertEq(multiverse.getOutcome(child1, freshId), multiverse.INVALID());
     }
+
+    /* ========================================== STRANDED LINEAGE =========================================== */
+
+    function test_Mirror_StrandedLineageIsReachableLevelByLevel() public {
+        // A query is open in the genesis when, outside Lituus, the genesis forks natively, its outcome-1 child is
+        // deployed and forks natively in turn, and that child's outcome-2 grandchild is deployed. Lituus sees
+        // none of it, for a year.
+        uint256 openQueryId = _createDefaultQuery();
+        _forkZoltarNatively(_createZoltarCategoricalQuestion(2));
+        uint248 child1 = _childId(1);
+        zoltar.deployChild(GENESIS_UID, 1);
+        MockERC20(address(zoltar.childRepTokens(child1))).mint(address(this), zoltar.getForkThreshold(child1));
+        zoltar.forkUniverse(child1, _createZoltarCategoricalQuestion(2));
+        zoltar.deployChild(child1, 2);
+        uint248 grandchild = zoltar.getChildUniverseId(child1, 2);
+        vm.warp(vm.getBlockTimestamp() + 365 days);
+
+        // No Lituus vault: nothing wraps. No Lituus parent: the grandchild cannot be spawned directly.
+        vm.prank(user);
+        vm.expectRevert();
+        multiverse.wrap(grandchild, 10 ether, 0);
+        vm.prank(user);
+        vm.expectRevert(Multiverse.InvalidUniverse.selector);
+        multiverse.spawnChildUniverse(child1, 2);
+
+        // The descent, one level at a time and all in one block: mirror the genesis (still Active, nothing resolved
+        // there since the native fork), spawn child1, mirror child1's native fork, spawn the grandchild.
+        vm.startPrank(user);
+        multiverse.mirrorZoltarFork(GENESIS_UID);
+        multiverse.spawnChildUniverse(GENESIS_UID, 1);
+        multiverse.mirrorZoltarFork(child1);
+        multiverse.spawnChildUniverse(child1, 2);
+        vm.stopPrank();
+        uint256 forkQuery1 = _universe(GENESIS_UID).forkQuery;
+        uint256 forkQuery2 = _universe(child1).forkQuery;
+
+        // The grandchild sits on the real Zoltar lineage and answers both fork questions.
+        UniverseView memory g = _universe(grandchild);
+        assertEq(uint8(g.state), uint8(Multiverse.UniverseState.Active));
+        assertEq(g.parent, child1);
+        assertEq(_universe(child1).parent, GENESIS_UID);
+        assertEq(multiverse.getOutcome(grandchild, forkQuery1), 1);
+        assertEq(multiverse.getOutcome(grandchild, forkQuery2), 2);
+        // The genesis fee pot was carried through the intermediate level: parked at child1's mirror, copied again
+        // at the grandchild's spawn.
+        assertEq(_universe(child1).unmigratedSupply, DEFAULT_FEE);
+        assertEq(g.totalQueryFees, DEFAULT_FEE);
+
+        // A user who migrated to the grandchild at the Zoltar level now wraps in, and the grandchild runs queries.
+        // The genesis-era query is inherited there, reopened with a full window clocked from child1's mirror, not
+        // from the year-old fork.
+        _wrapFromZoltar(grandchild, user, 10 ether);
+        uint256 queryId = multiverse.queryCount();
+        vm.startPrank(user);
+        multiverse.createQuery(grandchild, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
+        multiverse.report(grandchild, openQueryId, OUTCOME_A);
+        vm.stopPrank();
+        assertEq(multiverse.queryCount(), queryId + 1);
+        (uint48 inheritedCreateTime,, uint16 inheritedStakeCount,,,,,,) =
+            multiverse.queryResolutions(grandchild, openQueryId);
+        assertEq(inheritedCreateTime, _universe(child1).forkTime);
+        assertEq(inheritedStakeCount, 1);
+
+        // The intermediate levels settle root-first on their own clocks with nobody voting: no favorite child at
+        // either level, and the canonical timeline dead-ends at the genesis.
+        vm.warp(vm.getBlockTimestamp() + multiverse.MIGRATION_DURATION());
+        multiverse.advanceForkState(GENESIS_UID);
+        multiverse.advanceForkState(child1);
+        assertEq(_universe(GENESIS_UID).favoriteChild, 0);
+        assertEq(_universe(child1).favoriteChild, 0);
+        assertEq(multiverse.canonicalHeir(), GENESIS_UID);
+        assertFalse(_universe(grandchild).isCanonical);
+    }
 }
