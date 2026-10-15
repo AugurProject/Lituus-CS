@@ -319,7 +319,7 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
                         payout = amount + amount * (losers - losers / multiverse.BURN_DIVIDER()) / winnerStaked;
                     }
 
-                    ILituusRep childRep = multiverse.repTokenOf(_childId(outcomes[childIndex]));
+                    ILituusRep childRep = multiverse.repTokenOf(_childId(GENESIS_UID, outcomes[childIndex]));
                     uint256 payoutAssets = genesisRep.convertToAssets(payout);
                     uint256 balanceBefore = childRep.balanceOf(reporters[r]);
                     vm.prank(reporters[r]);
@@ -358,7 +358,7 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
             for (uint256 r = 0; r < reporters.length; r++) {
                 forkVotes += genesisRep.convertToAssets(forkStaked[r][o]);
             }
-            (,,,,,,, uint128 totalIn,,,,,) = multiverse.universes(_childId(outcomes[o]));
+            (,,,,,,, uint128 totalIn,,,,,) = multiverse.universes(_childId(GENESIS_UID, outcomes[o]));
             assertEq(totalIn, forkVotes + sideVotes[o]);
             totalVotes += sideVotes[o];
             assertLe(zoltar.splitPerChild(address(multiverse), GENESIS_UID, outcomes[o]), parked);
