@@ -194,6 +194,8 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         uint128 lastWindowId;
     }
 
+    // Real values only, with one exception: the windows a child inherits for the frozen gap between its parent's
+    // fork trigger and its own spawn are filled at the parent's rates (see _seedChildStatistics).
     struct ThreeDayInfo {
         // The 3-day profit of the universe for this specific 3-day info.
         uint128 threeDayProfit;
@@ -273,7 +275,6 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     error ZeroFee();
     error ExactlyOneAmountRequired();
     error QueryNotInherited();
-    error SpawnWindowClosed();
     error MigrationWindowClosed();
     error MigrationWindowNotClosed();
     error ParentForkNotResolved();
@@ -869,7 +870,8 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     function updateBaseFee(uint248 universeId) external {
         if (universes[universeId].universeState != UniverseState.Active) revert InvalidUniverseState();
 
-        (uint256 currentProfit, uint256 lastProfit) = _getProfits(universeId);
+        (uint256 currentProfit, uint256 lastProfit) =
+            _getProfits(universeId, _getCurrentThreeDayWindow(), _windowFraction(block.timestamp));
         QUERY_FEE_CONTROLLER.changeBaseFee(universeId, currentProfit, lastProfit);
     }
 
@@ -880,7 +882,8 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * @dev Demand is a live rolling 3-day window rebuilt from discrete buckets, so the fee neither ramps
      *      within a window nor goes stale. `w` is the current window, `vol[x]` a real stored bucket, and
      *      `f` the fraction of `w` elapsed. Bootstrap volume for pre-genesis windows is NEVER stored; it
-     *      is added only to the local values below, so storage always holds real volume only.
+     *      is added only to the local values below, so storage holds real volume only (the one exception
+     *      being a child's rate-filled fork gap, see _seedChildStatistics).
      *
      *        lastThreeDayVolume = vol[w] + (1 - f) * prevWindowVolume
      *        lastSixtyDayVolume = vol[w] + sixtyDayVolume - f * oldestWindowVolume        (w >= 20)
@@ -903,16 +906,13 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         _rollVolumeWindow(stats, currentThreeDayWindow);
 
         // fraction of the current window elapsed, in [0, SCALE)
-        uint256 proportionOfCurrentWindow = ((block.timestamp - GENESIS_TIMESTAMP) % THREE_DAYS) * SCALE / THREE_DAYS;
+        uint256 proportionOfCurrentWindow = _windowFraction(block.timestamp);
 
         uint256 currentVolume = stats.threeDayInfo[currentThreeDayWindow].threeDayVolume;
 
-        // previous window (w-1): real volume, or bootstrap if it predates genesis. Check done here, before the read
-        uint256 previousVolume =
-            currentThreeDayWindow >= 1 ? stats.threeDayInfo[currentThreeDayWindow - 1].threeDayVolume : BOOT_VOLUME;
-
         // recent 3-day (local): current partial + tail of the previous window
-        uint256 lastThreeDayVolume = currentVolume + (SCALE - proportionOfCurrentWindow) * previousVolume / SCALE;
+        uint256 lastThreeDayVolume =
+            _recentVolume(stats, currentThreeDayWindow, proportionOfCurrentWindow, currentVolume);
 
         // 60-day (local): current + real running sum, then trim the oldest window's rolled-out tail.
         // Bootstrap stays local only. In both branches the oldest window (real for w >= 20, bootstrap for
@@ -981,8 +981,9 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
 
     /**
      * @notice Rolls a cached 60-day volume from `lastWindow` up to `currentThreeDayWindow`, read-only.
-     * @dev Storage holds REAL volume only — bootstrap is never stored, so nothing bootstrap-related is
-     *      added or subtracted here. Shared by the mutating `_rollVolumeWindow` (which persists the result)
+     * @dev Storage holds no bootstrap volume (only real counts, plus a child's rate-filled fork gap, see
+     *      _seedChildStatistics), so nothing bootstrap-related is added or subtracted here. Shared by the
+     *      mutating `_rollVolumeWindow` (which persists the result)
      *      and the `view` `_previewFee` (which cannot persist), keeping the window math in exactly one place.
      * @param stats The universe's statistics storage.
      * @param currentThreeDayWindow The window to roll the cache up to.
@@ -1044,14 +1045,12 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         uint256 sixtyDayVolume =
             _rolledSixtyDayVolume(stats, currentThreeDayWindow, stats.lastWindowId, stats.sixtyDayVolume);
 
-        uint256 proportionOfCurrentWindow = ((block.timestamp - GENESIS_TIMESTAMP) % THREE_DAYS) * SCALE / THREE_DAYS;
+        uint256 proportionOfCurrentWindow = _windowFraction(block.timestamp);
         uint256 currentVolume = stats.threeDayInfo[currentThreeDayWindow].threeDayVolume;
-        // previous window (w-1): real volume, or bootstrap if it predates genesis. Check done here, before the read
-        uint256 previousVolume =
-            currentThreeDayWindow >= 1 ? stats.threeDayInfo[currentThreeDayWindow - 1].threeDayVolume : BOOT_VOLUME;
 
         // recent 3-day (local): current partial + tail of the previous window
-        uint256 lastThreeDayVolume = currentVolume + (SCALE - proportionOfCurrentWindow) * previousVolume / SCALE;
+        uint256 lastThreeDayVolume =
+            _recentVolume(stats, currentThreeDayWindow, proportionOfCurrentWindow, currentVolume);
 
         // 60-day (local): current + real running sum, then trim the oldest window's rolled-out tail.
         // Bootstrap stays local only. In both branches the oldest window (real for w >= 20, bootstrap for
@@ -1116,24 +1115,28 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     }
 
     /**
-     * @notice Realized profit of the current and previous ~30-day periods for a universe, as live rolling
-     *         windows, for the controller's monthly base-fee hill-climb.
-     * @dev Same interpolation as the volume path. With `c` the current window and `f` the fraction of it
-     *      elapsed, `currentProfit` is the 30 days ending now and `lastProfit` the 30 days before that:
+     * @notice Realized profit of the ~30-day period ending at a given moment and of the ~30 days before it, as
+     *         live rolling windows, for the controller's monthly base-fee hill-climb.
+     * @dev With `c` the moment's window and `f` the fraction of it
+     *      elapsed, `currentProfit` is the 30 days ending at the moment and `lastProfit` the 30 days before:
      *        currentProfit = profit[c] + sum(profit[c-1..c-9]) + (1 - f) * profit[c-10]
      *        lastProfit    = f * profit[c-10] + sum(profit[c-11..c-19]) + (1 - f) * profit[c-20]
      *      The boundary window c-10 is split between the two periods; the oldest window c-20 contributes
      *      only its (1 - f) tail. Windows predating genesis fall back to BOOT_PROFIT (checked before each
-     *      read). Profit only — no division here, so a zero period is harmless to the controller.
+     *      read). Profit only — no division here, so a zero period is harmless to the controller. The moment
+     *      is a parameter (callers pass now, or the fork trigger for the fork-gap fill's profit rate).
      * @param universeId The universe to read.
-     * @return currentProfit Rolling realized profit over the last 30 days.
+     * @param currentThreeDayWindow The window of the moment.
+     * @param proportionOfCurrentWindow The fraction of that window elapsed, SCALE-scaled, in [0, SCALE).
+     * @return currentProfit Rolling realized profit over the 30 days ending at the moment.
      * @return lastProfit Rolling realized profit over the 30 days before those.
      */
-    function _getProfits(uint248 universeId) internal view returns (uint256 currentProfit, uint256 lastProfit) {
+    function _getProfits(uint248 universeId, uint256 currentThreeDayWindow, uint256 proportionOfCurrentWindow)
+        internal
+        view
+        returns (uint256 currentProfit, uint256 lastProfit)
+    {
         UniverseStatistics storage stats = universeStatistics[universeId];
-        uint256 currentThreeDayWindow = _getCurrentThreeDayWindow();
-        // fraction of the current window elapsed, in [0, SCALE)
-        uint256 proportionOfCurrentWindow = ((block.timestamp - GENESIS_TIMESTAMP) % THREE_DAYS) * SCALE / THREE_DAYS;
 
         // Current month: current window's partial profit + the 9 completed windows behind it.
         currentProfit = stats.threeDayInfo[currentThreeDayWindow].threeDayProfit;
@@ -1701,18 +1704,25 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
 
     /**
      * @notice Spawns the child universe for one outcome of a forking universe. Permissionless.
-     * @dev Lazy per-child deployment: only outcomes somebody pays to spawn get a universe, and only
-     *      during the migration window (use-it-or-lose-it). The outcome must be a valid outcome of
-     *      the forking query: 1..numberOfOutcomes or INVALID for a Lituus fork; for a mirrored Zoltar
-     *      fork any answer Zoltar deems well-formed (categorical 0 = Invalid, 1..n; scalar encodings).
-     * @param universeId The forking universe (must be in Migration).
+     * @dev Lazy per-child deployment: only outcomes somebody pays to spawn get a universe, at any time
+     *      after the fork — the spawn window never closes. A child spawned after the migration window
+     *      closes can no longer receive counted migrations, so it can never be the favorite child or
+     *      canonical, but it is a full universe: Zoltar REP wraps into it and it runs queries and forks
+     *      of its own. Spawning stays sequential: the parent must itself be a forked Lituus universe, so
+     *      a Zoltar lineage with no Lituus record is walked one level at a time (mirror, spawn, mirror, ...).
+     *      The outcome must be a valid outcome of the forking query: 1..numberOfOutcomes or INVALID for a
+     *      Lituus fork; for a mirrored Zoltar fork any answer Zoltar deems well-formed (categorical
+     *      0 = Invalid, 1..n; scalar encodings).
+     *      Beyond the vault deployment, the spawner pays for seeding the child's demand/profit history
+     *      (see _seedChildStatistics): one storage write per non-empty window of the 21 copied.
+     * @param universeId The forked universe (any state past Active: Migration or later).
      * @param outcome The forking query's outcome this child stands for (a Zoltar answer for a mirrored fork).
      */
     function spawnChildUniverse(uint248 universeId, uint256 outcome) external nonReentrant {
         Universe storage universe = universes[universeId];
-        if (universe.universeState != UniverseState.Migration) revert InvalidUniverseState();
-        // The spawn window is the migration window, self-enforced by clock.
-        if (block.timestamp >= uint256(universe.forkTime) + MIGRATION_DURATION) revert SpawnWindowClosed();
+        // The spawn window never closes: a child can be spawned at any time after the fork.
+        if (universe.universeState == UniverseState.NotExisting) revert InvalidUniverse();
+        if (universe.universeState == UniverseState.Active) revert InvalidUniverseState();
 
         uint256 forkQueryId = universe.forkQuery;
         // TODO: map outcomeId to Zoltar outcomes.
@@ -1737,7 +1747,8 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * @notice Creates one child universe for a forking branch and links it into the fork tree.
      * @dev Deploys the Zoltar-side child if needed, then the child's Lituus REP vault at the parent's
      *      rate (so accrued appreciation carries over), approves the vault to pull migrated underlying
-     *      from this contract, seeds the child's fee state with the parent's base fee, and resolves the
+     *      from this contract, seeds the child's fee state with the parent's base fee and its demand/profit
+     *      history with the parent's (see _seedChildStatistics), and resolves the
      *      forking query to the CHILD'S OWN outcome — every child answers the forking query its own way.
      *      Children spawn Active (fully functional immediately) and non-canonical.
      * @param universeId The parent universe forking.
@@ -1791,6 +1802,9 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
 
         // Inherit the parent's base fee so the child can charge nonzero query fees from birth
         QUERY_FEE_CONTROLLER.initializeFeeState(childUniverseId, QUERY_FEE_CONTROLLER.getQueryFee(universeId));
+        // Seed the child's demand/profit history from the parent's, so the fee ramp and the hill-climb
+        // continue across the fork (see _seedChildStatistics).
+        _seedChildStatistics(universeId, childUniverseId, parentUniverse.forkTime);
 
         // Fund the child with the parent's whole fee aggregate: split from the parked migration
         // balance (a full copy per child — Zoltar's per-child escrow makes the duplication legal)
@@ -1821,6 +1835,130 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         if (parentUniverse.isLituusFork) {
             _payForkReporter(universeId, childUniverseId, childUniverseRepToken, queryId, outcome);
         }
+    }
+
+    /**
+     * @notice Seeds a child's demand/profit history from its parent's at spawn.
+     * @dev Calendar-anchored: for the 21 windows ending at the spawn window, bucket w of the child is bucket w
+     *      of the parent, so the child quotes what the parent would quote now, and a spawn in the trigger's
+     *      own block is a plain copy. The parent is frozen since the fork trigger, so the time between the
+     *      trigger and the spawn holds nothing; left empty it would open the child at the down-curve floor
+     *      (an empty recent window) and hand its first hill-climb an empty baseline month. That time is
+     *      filled from the parent's per-window values as of the trigger instead: for volume the count of the
+     *      window before the trigger window, for profit a tenth of the 30-day profit its hill-climb read. The
+     *      fill covers the frozen part of the trigger window (to the spawn, or to the window's end), every
+     *      whole frozen window, and the elapsed share of a later spawn window. The volume fill is the last
+     *      complete window: a finished count that neither the trigger moment nor the trigger window's own
+     *      queries can move, so the forker's choice of when to trigger cannot push a child's opening fee down.
+     *      Completing the trigger window from it is also what the fee path was already extrapolating (it reads
+     *      a window as its count plus the unelapsed share of the previous window's), so a child spawned inside
+     *      the trigger window is priced as the parent was; from the second window after the trigger a child is
+     *      priced on the previous window's count, whatever the spawn moment. The profit fill has no invariant
+     *      of that kind (the 30-day sum necessarily drifts as the fill replaces windows rolling out of it).
+     *      These are the only stored bucket values that are not real counts; nothing but the fee curve and
+     *      the hill-climb reads them.
+     *      The cache is the sum of the 20 windows before the spawn window, exactly as the roll would produce
+     *      it from the child's buckets. The anchor is the CURRENT window, not the parent's `lastWindowId`:
+     *      that only moves on query creation, so a resolve between the parent's last query and the trigger
+     *      books profit into a window above it, which an anchor on `lastWindowId` would miss.
+     * @param parentId The forking parent.
+     * @param childId The child being spawned.
+     * @param forkTime The parent's fork trigger time.
+     */
+    function _seedChildStatistics(uint248 parentId, uint248 childId, uint256 forkTime) internal {
+        UniverseStatistics storage parentStats = universeStatistics[parentId];
+        UniverseStatistics storage childStats = universeStatistics[childId];
+        uint256 spawnWindow = _getCurrentThreeDayWindow();
+        uint256 triggerWindow = _windowOf(forkTime);
+        uint256 spawnFraction = _windowFraction(block.timestamp);
+        uint256 triggerFraction = _windowFraction(forkTime);
+        uint256 volumePerWindow;
+        uint256 profitPerWindow;
+        // Any frozen time between the trigger and the spawn is filled from the parent's per-window volume and
+        // profit as of the trigger.
+        if (block.timestamp > forkTime) {
+            (volumePerWindow, profitPerWindow) = _fillPerWindowAt(parentId, triggerWindow, triggerFraction);
+        }
+
+        uint256 sixtyDayVolume;
+        for (uint256 i = 0; i <= 20;) {
+            if (spawnWindow >= i) {
+                uint256 windowId = spawnWindow - i;
+                ThreeDayInfo memory info;
+                // The parent holds real values up to the trigger window and nothing after it (not read).
+                if (windowId <= triggerWindow) info = parentStats.threeDayInfo[windowId];
+                // From the trigger window on, the window's frozen span is filled: it starts at the trigger in
+                // the trigger window (at the window start after it) and ends at the spawn in the spawn window
+                // (at the window end before it). Empty for a spawn in the trigger's own block.
+                if (windowId >= triggerWindow) {
+                    uint256 frozenEnd = windowId == spawnWindow ? spawnFraction : SCALE;
+                    uint256 frozenStart = windowId == triggerWindow ? triggerFraction : 0;
+                    uint256 frozen = frozenEnd - frozenStart;
+                    // a per-window query count, far below the uint128 max
+                    // forge-lint: disable-next-line(unsafe-typecast)
+                    info.threeDayVolume += uint128(volumePerWindow * frozen / SCALE);
+                    // a REP amount bounded by max supply, within uint128
+                    // forge-lint: disable-next-line(unsafe-typecast)
+                    info.threeDayProfit += uint128(profitPerWindow * frozen / SCALE);
+                }
+                if (info.threeDayVolume != 0 || info.threeDayProfit != 0) childStats.threeDayInfo[windowId] = info;
+                if (i >= 1) sixtyDayVolume += info.threeDayVolume;
+            }
+            unchecked {
+                i += 1;
+            }
+        }
+        // running query count over the window range, far below the uint128 max
+        // forge-lint: disable-next-line(unsafe-typecast)
+        childStats.sixtyDayVolume = uint128(sixtyDayVolume);
+        // 3-day window index since genesis, far below the uint128 max
+        // forge-lint: disable-next-line(unsafe-typecast)
+        childStats.lastWindowId = uint128(spawnWindow);
+    }
+
+    /**
+     * @notice The per-window values a child's fork gap is filled with, as of a past moment of the parent.
+     * @dev The volume is the count of the window before the moment's (bootstrap if it predates genesis): the
+     *      last complete window. The profit is a tenth of the 30-day realized profit the hill-climb reads at
+     *      the moment.
+     * @param universeId The universe to read.
+     * @param windowId The window of the moment.
+     * @param fraction The fraction of that window elapsed at the moment, SCALE-scaled.
+     * @return volumePerWindow Queries per whole frozen window.
+     * @return profitPerWindow Realized profit per whole frozen window.
+     */
+    function _fillPerWindowAt(uint248 universeId, uint256 windowId, uint256 fraction)
+        internal
+        view
+        returns (uint256 volumePerWindow, uint256 profitPerWindow)
+    {
+        volumePerWindow = _previousWindowVolume(universeStatistics[universeId], windowId);
+        (uint256 currentProfit,) = _getProfits(universeId, windowId, fraction);
+        profitPerWindow = currentProfit / 10; // currentProfit is for 30 days, a window is 3
+    }
+
+    /// @dev The count of the window before `windowId`: real volume, or bootstrap if it predates genesis
+    ///      (checked before the read).
+    function _previousWindowVolume(UniverseStatistics storage stats, uint256 windowId) internal view returns (uint256) {
+        return windowId >= 1 ? stats.threeDayInfo[windowId - 1].threeDayVolume : BOOT_VOLUME;
+    }
+
+    /**
+     * @notice The 3-day volume a universe is priced on at a moment: the moment's window so far plus the
+     *         unelapsed tail of the previous window.
+     * @dev The one definition behind the fee path and its preview.
+     * @param stats The universe's statistics storage.
+     * @param windowId The window of the moment.
+     * @param fraction The fraction of that window elapsed, SCALE-scaled, in [0, SCALE).
+     * @param currentVolume The volume of `windowId`, already read by the caller.
+     * @return currentVolume + (1 - fraction) * previousWindowVolume, floored.
+     */
+    function _recentVolume(UniverseStatistics storage stats, uint256 windowId, uint256 fraction, uint256 currentVolume)
+        internal
+        view
+        returns (uint256)
+    {
+        return currentVolume + (SCALE - fraction) * _previousWindowVolume(stats, windowId) / SCALE;
     }
 
     /// @dev Whether a forking universe still takes migrations into its children. The window closes in
@@ -2178,6 +2316,22 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * @return currentThreeDayWindow The current 3-day window id.
      */
     function _getCurrentThreeDayWindow() internal view returns (uint256 currentThreeDayWindow) {
-        currentThreeDayWindow = (block.timestamp - GENESIS_TIMESTAMP) / THREE_DAYS;
+        currentThreeDayWindow = _windowOf(block.timestamp);
+    }
+
+    /**
+     * @notice The 3-day window `timestamp` falls in, counted from genesis.
+     * @param timestamp A moment at or after genesis.
+     */
+    function _windowOf(uint256 timestamp) internal view returns (uint256) {
+        return (timestamp - GENESIS_TIMESTAMP) / THREE_DAYS;
+    }
+
+    /**
+     * @notice The fraction of its 3-day window that `timestamp` has elapsed, SCALE-scaled, in [0, SCALE).
+     * @param timestamp A moment at or after genesis.
+     */
+    function _windowFraction(uint256 timestamp) internal view returns (uint256) {
+        return ((timestamp - GENESIS_TIMESTAMP) % THREE_DAYS) * SCALE / THREE_DAYS;
     }
 }

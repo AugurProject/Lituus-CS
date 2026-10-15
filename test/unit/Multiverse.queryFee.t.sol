@@ -10,19 +10,14 @@ import { MockERC20 } from "src/mock/MockERC20.sol";
 import { MockZoltar } from "src/mock/MockZoltar.sol";
 import { MockZoltarQuestionData } from "src/mock/MockZoltarQuestionData.sol";
 import { MultiverseDeployFixture } from "./Multiverse.fixtures.sol";
+import { QueryFeeMirror } from "./QueryFee.mirror.sol";
 
-/// @notice Shared expected-fee math for the query fee suites.
-/// @dev Mirrors the contract's integer operations (same order, same floors), so expected values are
-///      derived from scenario parameters instead of being hardcoded.
+/// @notice Shared helper for the query fee suites. The expected-fee mirror is the shared
+///         `QueryFeeMirror` library; the window warp lives in the fixtures.
 abstract contract QueryFeeTestHelpers is MultiverseDeployFixture {
     /// @dev The single funded payer holds the whole supply; the stress suite pins a larger one.
     function _genesisSupply() internal view virtual override returns (uint256) {
         return USER_REP_BALANCE;
-    }
-
-    /// @dev Warps to window `window` with `elapsed` seconds of it gone by.
-    function _warpToWindow(uint256 window, uint256 elapsed) internal {
-        vm.warp(multiverse.GENESIS_TIMESTAMP() + window * multiverse.THREE_DAYS() + elapsed);
     }
 
     /// @dev Creates a query as `user` and returns the fee actually charged (balance delta).
@@ -31,65 +26,6 @@ abstract contract QueryFeeTestHelpers is MultiverseDeployFixture {
         vm.prank(user);
         multiverse.createQuery(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
         chargedFee = balanceBefore - genesisRep.balanceOf(user);
-    }
-
-    /// @dev Mirror of `_calculateCurveModifier`.
-    function _curveModifier(uint256 sixty, uint256 recent) internal view returns (uint256 modifier_) {
-        uint256 scale = multiverse.SCALE();
-        uint256 ratio = sixty == 0 ? scale : 20 * recent * scale / sixty;
-
-        if (ratio >= scale) {
-            modifier_ = (4 * scale) / 5 + ratio / 5;
-        } else {
-            uint256 shortage = scale - ratio;
-            uint256 powered = scale;
-            for (uint256 i = 0; i < 6; i++) {
-                powered = powered * shortage / scale;
-            }
-            modifier_ = scale * scale / (scale + 100 * powered);
-        }
-    }
-
-    /// @dev The deepest down-curve point: an empty recent window over any nonzero sixty.
-    function _floorModifier() internal view returns (uint256) {
-        return _curveModifier(1, 0);
-    }
-
-    /// @dev Mirror of `_calculateFeeAndApplyVolume`'s local-volume math, both regimes. Volumes are
-    ///      the test-known query counts. The mirror predicts the UNCAPPED fee: the half-fork-threshold
-    ///      cap applied by createQuery is asserted directly in the fee-cap tests, never mirrored.
-    /// @param baseFee The controller base fee the modifier applies to.
-    /// @param windowId The current window id.
-    /// @param fractionElapsed Fraction of the current window elapsed, SCALE-scaled.
-    /// @param currentVol Real query count already in window `windowId`.
-    /// @param prevVol Real query count in window `windowId-1` (ignored for windowId == 0: bootstrap is used).
-    /// @param sixtyStorage The real running sum of windows windowId-1..windowId-20 (universeStatistics value).
-    /// @param oldestVol Real query count in window `windowId-20` (only read in the real regime, windowId >= 20).
-    function _expectedFee(
-        uint256 baseFee,
-        uint256 windowId,
-        uint256 fractionElapsed,
-        uint256 currentVol,
-        uint256 prevVol,
-        uint256 sixtyStorage,
-        uint256 oldestVol
-    ) internal view returns (uint256) {
-        uint256 scale = multiverse.SCALE();
-        uint256 boot = multiverse.BOOT_VOLUME();
-
-        uint256 previous = windowId >= 1 ? prevVol : boot;
-        uint256 recent = currentVol + (scale - fractionElapsed) * previous / scale;
-
-        uint256 sixty = currentVol + sixtyStorage;
-        if (windowId >= 20) {
-            // Real regime: the oldest window's elapsed tail has rolled out of the 60-day span.
-            sixty -= fractionElapsed * oldestVol / scale;
-        } else {
-            // Bootstrap regime: top up the missing pre-genesis windows, oldest one trimmed.
-            sixty += (20 - windowId - 1) * boot + (scale - fractionElapsed) * boot / scale;
-        }
-
-        return baseFee * _curveModifier(sixty, recent) / scale;
     }
 }
 
@@ -126,7 +62,7 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
         // The first query is now in the current bucket: one real query on top of the bootstrap.
         uint256 second = _chargedFee();
 
-        assertEq(second, _expectedFee(DEFAULT_FEE, 0, 0, 1, 0, 0, 0));
+        assertEq(second, QueryFeeMirror.expectedFee(multiverse, DEFAULT_FEE, 0, 0, 1, 0, 0, 0));
         assertGt(second, first);
     }
 
@@ -146,7 +82,7 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
 
         uint256 charged = _chargedFee();
 
-        assertEq(charged, _expectedFee(DEFAULT_FEE, 0, multiverse.SCALE() / 2, 0, 0, 0, 0));
+        assertEq(charged, QueryFeeMirror.expectedFee(multiverse, DEFAULT_FEE, 0, multiverse.SCALE() / 2, 0, 0, 0, 0));
         // Hand-derived anchor: recent = floor(0.5 * 3) = 1, sixty = 57 + floor(0.5 * 3) = 58,
         // ratio = 20/58, modifier = 1e36 / (1e18 + 100 * (1e18 - 20e18/58)^6 / 1e18^5), every
         // intermediate floored -> fee = 112243280195776293 wei.
@@ -168,7 +104,7 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
         _warpToWindow(1, 0);
         uint256 charged = _chargedFee();
 
-        assertEq(charged, _expectedFee(DEFAULT_FEE, 1, 0, 0, 3, 3, 0));
+        assertEq(charged, QueryFeeMirror.expectedFee(multiverse, DEFAULT_FEE, 1, 0, 0, 3, 3, 0));
         assertEq(charged, DEFAULT_FEE);
 
         (uint128 sixtyDayVolume, uint128 lastWindowId) = multiverse.universeStatistics(GENESIS_UID);
@@ -187,8 +123,8 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
         _warpToWindow(3, 0);
         uint256 charged = _chargedFee();
 
-        assertEq(charged, _expectedFee(DEFAULT_FEE, 3, 0, 0, 0, 2, 0));
-        assertEq(charged, DEFAULT_FEE * _floorModifier() / multiverse.SCALE());
+        assertEq(charged, QueryFeeMirror.expectedFee(multiverse, DEFAULT_FEE, 3, 0, 0, 0, 2, 0));
+        assertEq(charged, DEFAULT_FEE * QueryFeeMirror.floorModifier(multiverse) / multiverse.SCALE());
 
         (uint128 sixtyDayVolume, uint128 lastWindowId) = multiverse.universeStatistics(GENESIS_UID);
         assertEq(sixtyDayVolume, 2);
@@ -220,8 +156,8 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
 
         uint256 charged = _chargedFee();
 
-        assertEq(charged, _expectedFee(DEFAULT_FEE, 5, 0, 0, 0, 0, 0));
-        assertEq(charged, DEFAULT_FEE * _floorModifier() / multiverse.SCALE());
+        assertEq(charged, QueryFeeMirror.expectedFee(multiverse, DEFAULT_FEE, 5, 0, 0, 0, 0, 0));
+        assertEq(charged, DEFAULT_FEE * QueryFeeMirror.floorModifier(multiverse) / multiverse.SCALE());
 
         (uint128 sixtyDayVolume, uint128 lastWindowId) = multiverse.universeStatistics(GENESIS_UID);
         assertEq(sixtyDayVolume, 0);
@@ -245,7 +181,7 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
         _warpToWindow(20, multiverse.THREE_DAYS() / 2);
         uint256 charged = _chargedFee();
 
-        assertEq(charged, _expectedFee(DEFAULT_FEE, 20, multiverse.SCALE() / 2, 0, 3, 5, 2));
+        assertEq(charged, QueryFeeMirror.expectedFee(multiverse, DEFAULT_FEE, 20, multiverse.SCALE() / 2, 0, 3, 5, 2));
         // Hand-derived anchor: recent = floor(0.5 * 3) = 1, sixty = 5 - floor(0.5 * 2) = 4,
         // ratio = 20 * 1 / 4 = 5.0 -> modifier = 0.8 + 5.0 / 5 = 1.8 -> fee = 1.8 REP.
         assertEq(charged, 1.8 ether);
@@ -269,7 +205,7 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
         _warpToWindow(4, 0);
         uint256 charged = _chargedFee();
 
-        assertEq(charged, _expectedFee(DEFAULT_FEE, 4, 0, 0, 1, 3, 0));
+        assertEq(charged, QueryFeeMirror.expectedFee(multiverse, DEFAULT_FEE, 4, 0, 0, 1, 3, 0));
 
         (uint128 sixtyDayVolume, uint128 lastWindowId) = multiverse.universeStatistics(GENESIS_UID);
         assertEq(sixtyDayVolume, 3);
@@ -287,11 +223,13 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
 
         _warpToWindow(1, multiverse.THREE_DAYS() / 4);
         uint256 earlyProbe = _chargedFee();
-        assertEq(earlyProbe, _expectedFee(DEFAULT_FEE, 1, multiverse.SCALE() / 4, 0, 4, 4, 0));
+        assertEq(earlyProbe, QueryFeeMirror.expectedFee(multiverse, DEFAULT_FEE, 1, multiverse.SCALE() / 4, 0, 4, 4, 0));
 
         _warpToWindow(1, 3 * multiverse.THREE_DAYS() / 4);
         uint256 lateProbe = _chargedFee();
-        assertEq(lateProbe, _expectedFee(DEFAULT_FEE, 1, 3 * multiverse.SCALE() / 4, 1, 4, 4, 0));
+        assertEq(
+            lateProbe, QueryFeeMirror.expectedFee(multiverse, DEFAULT_FEE, 1, 3 * multiverse.SCALE() / 4, 1, 4, 4, 0)
+        );
         // Hand-derived anchor: recent = 1 + floor(0.25 * 4) = 2, sixty = 1 + 4 + 54 + floor(0.25 * 3)
         // = 59, ratio = 40/59 on the down-branch -> fee = 899657120952168936 wei.
         assertEq(lateProbe, 899_657_120_952_168_936);
@@ -309,7 +247,7 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
         _warpToWindow(20, 0);
         uint256 charged = _chargedFee();
 
-        assertEq(charged, DEFAULT_FEE * _floorModifier() / multiverse.SCALE());
+        assertEq(charged, DEFAULT_FEE * QueryFeeMirror.floorModifier(multiverse) / multiverse.SCALE());
     }
 
     function test_QueryFee_EmptySixtyBoundary_AfterTheCliff() public {
@@ -400,7 +338,7 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
         feeCtl.setFee(base);
 
         uint256 volume = 0;
-        while (_expectedFee(base, 0, 0, volume, 0, 0, 0) < cap) {
+        while (QueryFeeMirror.expectedFee(multiverse, base, 0, 0, volume, 0, 0, 0) < cap) {
             _chargedFee();
             volume++;
         }
@@ -420,7 +358,7 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
         feeCtl.setFee(DEFAULT_FEE);
         uint256 chargedFee = _chargedFee();
 
-        assertEq(chargedFee, _expectedFee(DEFAULT_FEE, 0, 0, 1, 0, 0, 0));
+        assertEq(chargedFee, QueryFeeMirror.expectedFee(multiverse, DEFAULT_FEE, 0, 0, 1, 0, 0, 0));
         assertGt(chargedFee, DEFAULT_FEE);
     }
 
@@ -504,7 +442,9 @@ contract MultiverseQueryFeeStressTest is QueryFeeTestHelpers {
         _warpToWindow(1, 0);
 
         uint256 scale = multiverse.SCALE();
-        uint256 minBase = (scale + _floorModifier() - 1) / _floorModifier(); // ceil(SCALE / floorMod)
+        // ceil(SCALE / floorModifier)
+        uint256 floorModifier = QueryFeeMirror.floorModifier(multiverse);
+        uint256 minBase = (scale + floorModifier - 1) / floorModifier;
 
         feeCtl.setFee(minBase - 1);
         vm.prank(user);
@@ -525,7 +465,7 @@ contract MultiverseQueryFeeStressTest is QueryFeeTestHelpers {
         feeCtl.setFee(base);
 
         uint256 volume = 0;
-        while (_expectedFee(base, 0, 0, volume, 0, 0, 0) < cap) {
+        while (QueryFeeMirror.expectedFee(multiverse, base, 0, 0, volume, 0, 0, 0) < cap) {
             _chargedFee();
             volume++;
         }
@@ -541,7 +481,7 @@ contract MultiverseQueryFeeStressTest is QueryFeeTestHelpers {
         _warpToWindow(1, 0);
 
         uint256 charged = _chargedFee();
-        assertEq(charged, DEFAULT_FEE * _floorModifier() / multiverse.SCALE());
+        assertEq(charged, DEFAULT_FEE * QueryFeeMirror.floorModifier(multiverse) / multiverse.SCALE());
         // Hand-derived anchor: ratio 0 -> modifier = 1e36 / (101e18) = 9900990099009900 (floored),
         // fee = 1e18 * 9900990099009900 / 1e18 = 9900990099009900 wei (~base / 101).
         assertEq(charged, 9_900_990_099_009_900);
@@ -627,7 +567,7 @@ contract MultiverseUpdateBaseFeeTest is QueryFeeTestHelpers {
 
         uint256 charged = _chargedFee();
 
-        assertEq(charged, newBase * _floorModifier() / multiverse.SCALE());
+        assertEq(charged, newBase * QueryFeeMirror.floorModifier(multiverse) / multiverse.SCALE());
 
         (,, uint256 storedFee,,) = multiverse.queries(0);
         assertEq(storedFee, charged);
