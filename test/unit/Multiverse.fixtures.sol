@@ -6,32 +6,41 @@ import { Test } from "forge-std/Test.sol";
 import { Multiverse } from "src/Multiverse.sol";
 import { ILituusRep } from "src/interfaces/ILituusRep.sol";
 import { IReputationToken } from "src/interfaces/IReputationToken.sol";
+import { IZoltarQuestionData } from "src/interfaces/IZoltar.sol";
 import { IQueryFeeController } from "src/interfaces/IQueryFeeController.sol";
 import { MockERC20 } from "src/mock/MockERC20.sol";
 import { MockZoltar } from "src/mock/MockZoltar.sol";
 import { MockZoltarQuestionData } from "src/mock/MockZoltarQuestionData.sol";
 import { MockQueryFeeController } from "src/mock/MockQueryFeeController.sol";
 
-/// @notice Protocol deployment fixture: mocks + Multiverse wired at START_TIME, no funding.
-/// @dev The bottom fixture layer. It deploys the protocol and nothing else — balances are the
+/// @notice Protocol deployment fixture: mocks + Multiverse wired at START_TIME, no actor funding.
+/// @dev The bottom fixture layer. It deploys the protocol and nothing else — actor balances are the
 ///      responsibility of the layers (or suites) above, so a suite's economics can never drift
-///      because an unrelated suite changed the shared funding. Suites that need a different fee
-///      controller override `_deployFeeController` (and `_afterProtocolDeploy` for post-wiring)
-///      instead of rewriting the deployment.
+///      because an unrelated suite changed the shared funding. The one economic input it needs is
+///      the genesis REP supply (`_genesisSupply`), minted to this contract as a pool BEFORE the
+///      Zoltar mock is deployed: like real Zoltar, the mock snapshots the genesis supply once at
+///      construction, and genesis REP is never minted afterwards — actors are funded from the pool.
+///      Suites that need a different fee controller override `_deployFeeController` (and
+///      `_afterProtocolDeploy` for post-wiring) instead of rewriting the deployment.
 abstract contract MultiverseDeployFixture is Test {
     // Nonzero on purpose: Lituus universe ids mirror Zoltar universe ids, and a nonzero genesis
     // catches any code path that wrongly assumes the genesis universe lives at id 0.
     uint248 internal constant GENESIS_UID = 42;
-    uint256 internal constant DEFAULT_FEE = 1 ether;
-    uint256 internal constant USER_REP_BALANCE = 1000 ether;
+    uint128 internal constant DEFAULT_FEE = 1 ether;
+    uint128 internal constant USER_REP_BALANCE = 1000 ether;
     uint8 internal constant DEFAULT_NUMBER_OF_OUTCOMES = 3;
     // Readable outcomes for escalation ping-pong (all valid for the default query).
-    uint8 internal constant OUTCOME_A = 1;
-    uint8 internal constant OUTCOME_B = 2;
-    uint8 internal constant OUTCOME_C = 3;
+    uint256 internal constant OUTCOME_A = 1;
+    uint256 internal constant OUTCOME_B = 2;
+    uint256 internal constant OUTCOME_C = 3;
     string internal constant DEFAULT_QUESTION = "John Doe's pet?[CAT,DOG,SHARK]";
     // Fixed timestamp so queryCreateTime / forkTime assertions are deterministic.
     uint256 internal constant START_TIME = 1_000_000;
+    // The Multiverse's time periods (constructor immutables): the fork-migration window, the
+    // first-report window (also the fee-ramp and the profit-bucket width), and the appeal window.
+    uint256 internal constant MIGRATION_DURATION = 30 days;
+    uint256 internal constant REPORTING_PERIOD = 3 days;
+    uint256 internal constant APPEAL_PERIOD = 1 days;
 
     MockERC20 internal underlying;
     MockZoltarQuestionData internal zoltarQuestionData;
@@ -61,33 +70,36 @@ abstract contract MultiverseDeployFixture is Test {
 
     /// @dev The genesis universe's per-outcome stake cap in wREP shares (1% of the REP supply), derived
     ///      independently of the Multiverse's own conversion (straight through Zoltar + the vault).
+    /// @dev The per-outcome cap as the contract derives it: 1% of the supply in shares, rounded up.
     function _capWrep() internal view returns (uint256) {
-        return genesisRep.convertToShares(zoltar.getUniverseTheoreticalSupply(GENESIS_UID) / multiverse.CAP_DIVISOR());
+        return genesisRep.convertToSharesUp(zoltar.getUniverseTheoreticalSupply(GENESIS_UID) / multiverse.CAP_DIVISOR());
     }
 
     /// @dev The scalar fields of a query's resolution record in the genesis universe, as a struct. The
     ///      per-outcome and per-staker mappings are read through getOutcomeStakes / getUserStake.
     struct ResolutionView {
         uint48 queryCreateTime;
-        uint8 outcome;
         uint48 lastStakeTime;
-        uint8 lastReportedOutcome;
         uint16 stakeCount;
         uint96 totalStaked;
-        uint96 cap;
         uint8 noOfOutcomesAtCap;
+        uint96 cap;
+        uint96 forkBurn;
+        uint256 outcome;
+        uint256 lastReportedOutcome;
     }
 
     function _resolution(uint256 queryId) internal view returns (ResolutionView memory r) {
         (
             r.queryCreateTime,
-            r.outcome,
             r.lastStakeTime,
-            r.lastReportedOutcome,
             r.stakeCount,
             r.totalStaked,
+            r.noOfOutcomesAtCap,
             r.cap,
-            r.noOfOutcomesAtCap
+            r.forkBurn,
+            r.outcome,
+            r.lastReportedOutcome
         ) = multiverse.queryResolutions(GENESIS_UID, queryId);
     }
 
@@ -97,13 +109,17 @@ abstract contract MultiverseDeployFixture is Test {
         (fee,,) = multiverse.getMintPricing(GENESIS_UID);
     }
 
-    /// @dev Deploys the protocol at START_TIME. Funds nothing.
+    /// @dev The genesis REP supply the layer pins; every REP an actor ever holds comes out of it.
+    function _genesisSupply() internal view virtual returns (uint256);
+
+    /// @dev Deploys the protocol at START_TIME with the genesis supply pooled here. Funds no actor.
     function setUp() public virtual {
         vm.warp(START_TIME);
 
         underlying = new MockERC20("Underlying", "U");
+        underlying.mint(address(this), _genesisSupply());
         zoltarQuestionData = new MockZoltarQuestionData();
-        zoltar = new MockZoltar(IReputationToken(address(underlying)), zoltarQuestionData);
+        zoltar = new MockZoltar(IReputationToken(address(underlying)), zoltarQuestionData, GENESIS_UID);
         IQueryFeeController controller = _deployFeeController();
         multiverse = _deployMultiverse(controller);
 
@@ -127,12 +143,43 @@ abstract contract MultiverseDeployFixture is Test {
     /// @dev Multiverse deploy hook: the production contract by default. Suites that need a test
     ///      harness (e.g. exposing internal views) override this.
     function _deployMultiverse(IQueryFeeController controller) internal virtual returns (Multiverse) {
-        return new Multiverse(zoltar, GENESIS_UID, controller, queryTokenizerStub);
+        return new Multiverse(
+            zoltar, GENESIS_UID, controller, queryTokenizerStub, MIGRATION_DURATION, REPORTING_PERIOD, APPEAL_PERIOD
+        );
     }
 
-    /// @dev Funding tool (not invoked here): mint underlying, wrap into REP, approve the multiverse.
+    /// @dev Creates an already-ended categorical Zoltar question with `numberOfLabels` placeholder labels.
+    function _createZoltarCategoricalQuestion(uint8 numberOfLabels) internal returns (uint256 questionId) {
+        string[] memory labels = new string[](numberOfLabels);
+        for (uint256 i = 0; i < numberOfLabels; i++) {
+            labels[i] = vm.toString(i + 1);
+        }
+        return _createZoltarQuestion(labels);
+    }
+
+    /// @dev Creates an already-ended label-less Zoltar question: the mock's scalar placeholder, whose answers
+    ///      are opaque numbers (no encoding is asserted anywhere — the scalar format may still change).
+    function _createZoltarScalarQuestion() internal returns (uint256 questionId) {
+        return _createZoltarQuestion(new string[](0));
+    }
+
+    function _createZoltarQuestion(string[] memory labels) internal returns (uint256 questionId) {
+        IZoltarQuestionData.QuestionData memory data;
+        data.title = "Native Zoltar question";
+        data.startTime = vm.getBlockTimestamp() - 2 days;
+        data.endTime = vm.getBlockTimestamp() - 1 days;
+        return zoltarQuestionData.createQuestion(data, labels);
+    }
+
+    /// @dev Forks the genesis natively, at the Zoltar level and outside Lituus, on `questionId`.
+    function _forkZoltarNatively(uint256 questionId) internal {
+        zoltar.forkUniverse(GENESIS_UID, questionId);
+    }
+
+    /// @dev Funding tool (not invoked here): hand out underlying from the genesis pool, wrap into REP,
+    ///      approve the multiverse.
     function _fundWithRep(address account, uint256 amount) internal {
-        underlying.mint(account, amount);
+        underlying.transfer(account, amount);
         vm.startPrank(account);
         underlying.approve(address(genesisRep), type(uint256).max);
         genesisRep.approve(address(multiverse), type(uint256).max);
@@ -161,16 +208,19 @@ abstract contract MultiverseDeployFixture is Test {
 ///      actors with enough REP; suites with economic assumptions (stress, spikes) must NOT inherit
 ///      this layer — they extend MultiverseDeployFixture and pin their own economy.
 abstract contract MultiverseFixtures is MultiverseDeployFixture {
+    /// @dev 3200 ether: the three actors' balances plus a 200 ether remainder in the pool, so the per-outcome
+    ///      cap is 32 ether = 2^5 * DEFAULT_FEE: the default fee then sits exactly on the cap grid, the first
+    ///      stake equals the fee, and every ladder amount in these suites is a whole multiple of it.
+    function _genesisSupply() internal view virtual override returns (uint256) {
+        return 3 * USER_REP_BALANCE + 200 ether;
+    }
+
     function setUp() public virtual override {
         super.setUp();
 
         _fundWithRep(user, USER_REP_BALANCE);
         _fundWithRep(bystander, USER_REP_BALANCE);
         _fundWithRep(challenger, USER_REP_BALANCE);
-        // Top the supply up to 3200 ether so the per-outcome cap is 32 ether = 2^5 * DEFAULT_FEE: the default
-        // fee then sits exactly on the cap grid, the first stake equals the fee, and every ladder amount in
-        // these suites is a whole multiple of it.
-        underlying.mint(address(this), 200 ether);
         assertEq(_capWrep(), 32 * DEFAULT_FEE, "fixture supply must put the default fee on the cap grid");
     }
 
@@ -195,7 +245,7 @@ abstract contract MultiverseFixtures is MultiverseDeployFixture {
     ///      the required stake, the head fields move to this report, a first stake on the outcome records
     ///      its reporter) and the REP movement (reporter pays exactly the required stake, the multiverse
     ///      receives it).
-    function _report(address reporter, uint256 queryId, uint8 outcome) internal {
+    function _report(address reporter, uint256 queryId, uint256 outcome) internal {
         uint256 requiredStake = multiverse.getNextRequiredStake(GENESIS_UID, queryId, outcome);
         uint256 reporterBalanceBefore = genesisRep.balanceOf(reporter);
         uint256 multiverseBalanceBefore = genesisRep.balanceOf(address(multiverse));
@@ -224,7 +274,7 @@ abstract contract MultiverseFixtures is MultiverseDeployFixture {
 
     /// @dev Reported query fixture: `user` creates a default query and places the first report on it.
     /// @return queryId The id of the created and reported query.
-    function _createReportedQuery(uint8 outcome) internal returns (uint256 queryId) {
+    function _createReportedQuery(uint256 outcome) internal returns (uint256 queryId) {
         queryId = _createDefaultQuery();
         _report(user, queryId, outcome);
     }
@@ -232,13 +282,13 @@ abstract contract MultiverseFixtures is MultiverseDeployFixture {
     /// @dev Warps to one second past the query's 3-day reporting window — the earliest moment an
     ///      unreported query becomes resolvable (as INVALID).
     function _warpPastReportingWindow(uint256 queryId) internal {
-        vm.warp(uint256(_resolution(queryId).queryCreateTime) + multiverse.THREE_DAYS() + 1);
+        vm.warp(uint256(_resolution(queryId).queryCreateTime) + multiverse.REPORTING_PERIOD() + 1);
     }
 
     /// @dev Warps to one second past the last stake's 1-day appeal window — the earliest moment a
     ///      reported query becomes resolvable.
     function _warpPastAppealWindow(uint256 queryId) internal {
-        vm.warp(uint256(_resolution(queryId).lastStakeTime) + multiverse.ONE_DAY() + 1);
+        vm.warp(uint256(_resolution(queryId).lastStakeTime) + multiverse.APPEAL_PERIOD() + 1);
     }
 
     /// @dev Expired query fixture: `user` creates a default query that is never reported, then time
@@ -252,7 +302,7 @@ abstract contract MultiverseFixtures is MultiverseDeployFixture {
     /// @dev Resolvable reported query fixture: `user` creates a default query, places the first
     ///      report on it, and time passes the appeal window, so it is resolvable to `outcome`.
     /// @return queryId The id of the created, reported, and resolvable query.
-    function _createResolvableReportedQuery(uint8 outcome) internal returns (uint256 queryId) {
+    function _createResolvableReportedQuery(uint256 outcome) internal returns (uint256 queryId) {
         queryId = _createReportedQuery(outcome);
         _warpPastAppealWindow(queryId);
     }
@@ -260,7 +310,7 @@ abstract contract MultiverseFixtures is MultiverseDeployFixture {
     /// @dev Resolve fixture: `resolver` resolves `queryId` in the genesis universe, asserting the
     ///      resolution record left UNRESOLVED and that getOutcome agrees with it.
     /// @return outcome The outcome the query resolved to.
-    function _resolve(address resolver, uint256 queryId) internal returns (uint8 outcome) {
+    function _resolve(address resolver, uint256 queryId) internal returns (uint256 outcome) {
         vm.prank(resolver);
         multiverse.resolve(GENESIS_UID, queryId);
 
@@ -271,7 +321,7 @@ abstract contract MultiverseFixtures is MultiverseDeployFixture {
 
     /// @dev Escalation ladder fixture: each reporter in turn reports their outcome on `queryId`,
     ///      12 hours after the previous step — within the first-report window and every appeal window.
-    function _escalateChain(uint256 queryId, address[] memory reporters, uint8[] memory outcomes) internal {
+    function _escalateChain(uint256 queryId, address[] memory reporters, uint256[] memory outcomes) internal {
         assertEq(reporters.length, outcomes.length, "escalateChain: length mismatch");
         for (uint256 i = 0; i < reporters.length; i++) {
             vm.warp(vm.getBlockTimestamp() + 12 hours);
@@ -286,7 +336,7 @@ abstract contract MultiverseFixtures is MultiverseDeployFixture {
     ///      winning stakes (user fee, bystander 3*fee: A totals 4*fee) and one losing stake
     ///      (challenger 2*fee); `user` is the first winning reporter, so resolve() will push-pay them
     ///      the reporter reward. The first report lands 18 hours in, so the reward ramp is exactly
-    ///      a quarter of the fee (18h / THREE_DAYS) and reward-derived literals stay clean.
+    ///      a quarter of the fee (18h / REPORTING_PERIOD) and reward-derived literals stay clean.
     /// @return queryId The id of the reported, resolvable query.
     function _createReportedLadder() internal returns (uint256 queryId) {
         queryId = _createDefaultQuery();

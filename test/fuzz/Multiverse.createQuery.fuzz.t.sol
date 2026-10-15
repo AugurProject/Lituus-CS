@@ -13,7 +13,7 @@ contract MultiverseCreateQueryFuzzTest is MultiverseFuzzFixtures {
         vm.prank(user);
         multiverse.createQuery(GENESIS_UID, "q", n);
 
-        (uint8 numberOfOutcomes,,,) = multiverse.queries(0);
+        (uint8 numberOfOutcomes,,,,) = multiverse.queries(0);
         assertEq(numberOfOutcomes, n);
         assertEq(multiverse.queryCount(), 1);
     }
@@ -51,7 +51,7 @@ contract MultiverseCreateQueryFuzzTest is MultiverseFuzzFixtures {
         vm.prank(user);
         multiverse.createQuery(GENESIS_UID, "q", 3);
 
-        (,, uint256 storedFee,) = multiverse.queries(0);
+        (,, uint256 storedFee,,) = multiverse.queries(0);
         assertEq(storedFee, chargedFee);
         assertLe(storedFee, cap);
         assertEq(genesisRep.balanceOf(address(multiverse)), chargedFee);

@@ -21,7 +21,7 @@ abstract contract QueryTokenizerFixtures is MultiverseFixtures {
     // that aligns the fee with the cap grid), so MockZoltar's fork threshold is 3200 / 20 = 160 REP.
     // Half of it — the cap on both the tokenizer's mint price and the direct-path query fee — is
     // the single derivation every cap assertion builds on.
-    uint256 internal constant HALF_FORK_THRESHOLD = 80 ether;
+    uint256 internal constant HALF_FORK_THRESHOLD = 32 ether;
 
     QueryTokenizer internal tokenizer;
 
@@ -36,7 +36,9 @@ abstract contract QueryTokenizerFixtures is MultiverseFixtures {
     /// @dev Deploys the real tokenizer first, then the Multiverse pointing at it (Deploy.s.sol order).
     function _deployMultiverse(IQueryFeeController controller) internal override returns (Multiverse) {
         tokenizer = new QueryTokenizer();
-        return new Multiverse(zoltar, GENESIS_UID, controller, address(tokenizer));
+        return new Multiverse(
+            zoltar, GENESIS_UID, controller, address(tokenizer), MIGRATION_DURATION, REPORTING_PERIOD, APPEAL_PERIOD
+        );
     }
 
     /// @dev Completes the deploy wiring: the tokenizer learns the Multiverse address (once).
@@ -110,7 +112,7 @@ abstract contract QueryTokenizerFixtures is MultiverseFixtures {
         assertEq(genesisRep.balanceOf(address(multiverse)), multiverseRepBefore + price);
 
         assertEq(multiverse.queryCount(), queryId + 1);
-        (uint8 numberOfOutcomes, uint248 originUniverse, uint256 fee, string memory question) =
+        (uint8 numberOfOutcomes, uint248 originUniverse, uint256 fee, string memory question,) =
             multiverse.queries(queryId);
         assertEq(numberOfOutcomes, DEFAULT_NUMBER_OF_OUTCOMES);
         assertEq(originUniverse, GENESIS_UID);
@@ -119,7 +121,7 @@ abstract contract QueryTokenizerFixtures is MultiverseFixtures {
 
         ResolutionView memory r = _resolution(queryId);
         uint48 queryCreateTime = r.queryCreateTime;
-        uint8 outcome = r.outcome;
+        uint256 outcome = r.outcome;
         assertEq(queryCreateTime, uint48(vm.getBlockTimestamp()));
         assertEq(outcome, multiverse.UNRESOLVED());
     }
