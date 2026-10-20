@@ -619,43 +619,23 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * @param outcome The reported outcome (1..numberOfOutcomes, or INVALID).
      */
     function report(uint248 universeId, uint256 queryId, uint256 outcome) external nonReentrant {
-        // Check all conditions (universe exists, query exists, outcome is valid, report is within time, etc.)
-        // Reports can only be placed in an existing and active universe.
-        Universe storage universe = _checkUniverseState(universeId);
-
-        Query storage query = queries[queryId];
-        if (queryId >= queryCount) revert InvalidQuery();
-
-        QueryResolution storage resolution = queryResolutions[universeId][queryId];
-        if (resolution.outcome != UNRESOLVED) revert QueryAlreadyResolved();
+        (Universe storage universe, QueryResolution storage resolution, uint48 queryCreateTime) =
+            _checkReportable(universeId, queryId, outcome);
         uint16 stakeCount = resolution.stakeCount;
 
-        // Outcome should be between 1 and numberOfOutcomes unless the query should be reported as INVALID
-        if (outcome == UNRESOLVED) revert InvalidOutcome();
-        if ((outcome > query.numberOfOutcomes) && (outcome != INVALID)) revert InvalidOutcome();
-
-        // A query resolved in an ancestor universe is inherited by this lineage (via getOutcome), so it
-        // cannot be reported on again here. The ancestor set is fixed per lineage, so this only needs to
-        // be checked on the first touch of an inherited query (no local record yet).
-        if (resolution.queryCreateTime == 0 && _findResolution(universeId, queryId) != UNRESOLVED) {
-            revert QueryAlreadyResolved();
-        }
-
-        uint48 queryCreateTime = _getAndUpdateQueryCreateTime(universeId, queryId);
-
-        // check that the reporting window for the query is not over yet
-        if (stakeCount == 0 && queryCreateTime + REPORTING_PERIOD < block.timestamp) revert QueryExpired();
-
+        uint256 cap = resolution.cap;
         if (stakeCount == 0) {
+            // Only a query without a stake can lack a local record: the first touch of an inherited query stores
+            // the clock it inherited (for any other query this rewrites the same value).
+            resolution.queryCreateTime = queryCreateTime;
             // Freeze the per-outcome cap: the whole ladder is measured against this one value.
             // a fraction of the REP supply, bounded by max supply (100M * 1e18), within uint96
+            cap = _capShares(universe.repToken, universeId);
             // forge-lint: disable-next-line(unsafe-typecast)
-            resolution.cap = uint96(_capShares(universe.repToken, universeId));
-        } else if (resolution.lastStakeTime + APPEAL_PERIOD < block.timestamp) {
-            revert AppealPeriodOver();
+            resolution.cap = uint96(cap);
         }
 
-        uint256 stake = _requiredStake(resolution, query.fee, outcome);
+        uint256 stake = _requiredStake(resolution, queries[queryId].fee, outcome, cap);
         universe.repToken.safeTransferFrom(msg.sender, address(this), stake);
 
         // bounded by the cap, itself a uint96
@@ -1345,9 +1325,11 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     /**
      * @notice The stake the next report on `outcome` must place for `queryId` in `universeId`.
      * @dev Before the first report the cap is not frozen yet, so the estimate uses the live cap and can shift with
-     *      the vault rate until the first stake lands. Applies report()'s gates — resolved here or in an
-     *      ancestor, not inherited, expired — so a quote is only returned when report() would accept
-     *      the stake (the appeal-window timing aside).
+     *      the vault rate until the first stake lands. Runs report()'s gates (see _checkReportable), so a quote
+     *      is returned exactly when report() would accept the stake, and reverts with report()'s error otherwise.
+     *      It's still possible that the report will be rejected because someone else reports first or
+     *      the report/appeal timer expires between quoting and actual reporting, but the returned stake is
+     *      guaranteed to be enough if the report is accepted.
      * @param universeId The universe to report in.
      * @param queryId The query to report on.
      * @param outcome The outcome the next report would stake on.
@@ -1358,27 +1340,12 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         view
         returns (uint256 requiredStake)
     {
-        if (queryId >= queryCount) revert InvalidQuery();
-        Universe storage universe = _checkUniverseState(universeId);
-        QueryResolution storage resolution = queryResolutions[universeId][queryId];
-        if (resolution.outcome != UNRESOLVED) revert QueryAlreadyResolved();
+        (Universe storage universe, QueryResolution storage resolution,) =
+            _checkReportable(universeId, queryId, outcome);
 
-        // Mirror report()'s gates so the quote never contradicts it: reject a query resolved in an
-        // ancestor, and read the inherited clock of a query with no local record yet (view: nothing
-        // is stored).
-        if (resolution.queryCreateTime == 0 && _findResolution(universeId, queryId) != UNRESOLVED) {
-            revert QueryAlreadyResolved();
-        }
-        uint48 queryCreateTime = _inheritedQueryCreateTime(universeId, queryId);
-
-        uint256 fee = queries[queryId].fee;
-        if (resolution.stakeCount == 0) {
-            if (queryCreateTime + REPORTING_PERIOD < block.timestamp) revert QueryExpired();
-            uint256 cap = _capShares(universe.repToken, universeId);
-            uint256 firstStakeCap = cap / FIRST_STAKE_CAP_DIVISOR;
-            return _roundToPowerOfTwoStep(fee > firstStakeCap ? firstStakeCap : fee, cap);
-        }
-        return _requiredStake(resolution, fee, outcome);
+        // Before the first report the cap is not frozen yet: quote against the one report() would freeze now.
+        uint256 cap = resolution.stakeCount == 0 ? _capShares(universe.repToken, universeId) : resolution.cap;
+        return _requiredStake(resolution, queries[queryId].fee, outcome, cap);
     }
 
     /* ========================================= ANCESTRY FUNCTIONS =========================================== */
@@ -1477,17 +1444,57 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         if (amount * amount > 2 * step * step) step <<= 1;
     }
 
+    /// @dev The gates a report on `outcome` must pass, shared by report() and getNextRequiredStake() so the quote
+    ///      never contradicts the report: the universe is Active, the query exists and is unresolved here and
+    ///      along the lineage, the outcome is valid, this universe inherited the query, and the report lands in
+    ///      the reporting window (first report) or the appeal window (later ones). The stake-specific gate
+    ///      (CannotStakeOnOutcome) lives in _requiredStake, which both also share. Returns the query's clock in
+    ///      this universe, inherited from the lineage when there is no local record yet; storing it is the
+    ///      caller's.
+    function _checkReportable(uint248 universeId, uint256 queryId, uint256 outcome)
+        internal
+        view
+        returns (Universe storage universe, QueryResolution storage resolution, uint48 queryCreateTime)
+    {
+        // Reports can only be placed in an existing and active universe.
+        universe = _checkUniverseState(universeId);
+        if (queryId >= queryCount) revert InvalidQuery();
+
+        resolution = queryResolutions[universeId][queryId];
+        if (resolution.outcome != UNRESOLVED) revert QueryAlreadyResolved();
+
+        // Outcome should be between 1 and numberOfOutcomes unless the query should be reported as INVALID
+        if (outcome == UNRESOLVED) revert InvalidOutcome();
+        if ((outcome > queries[queryId].numberOfOutcomes) && (outcome != INVALID)) revert InvalidOutcome();
+
+        // A query resolved in an ancestor universe is inherited by this lineage (via getOutcome), so it
+        // cannot be reported on again here. The ancestor set is fixed per lineage, so this only needs to
+        // be checked on the first touch of an inherited query (no local record yet).
+        if (resolution.queryCreateTime == 0 && _findResolution(universeId, queryId) != UNRESOLVED) {
+            revert QueryAlreadyResolved();
+        }
+
+        queryCreateTime = _inheritedQueryCreateTime(universeId, queryId);
+
+        if (resolution.stakeCount == 0) {
+            // check that the reporting window for the query is not over yet
+            if (queryCreateTime + REPORTING_PERIOD < block.timestamp) revert QueryExpired();
+        } else if (resolution.lastStakeTime + APPEAL_PERIOD < block.timestamp) {
+            revert AppealPeriodOver();
+        }
+    }
+
     /// @dev The exact stake the next report on `outcome` must place.
     ///      First stake: the query fee, bounded to `cap / FIRST_STAKE_CAP_DIVISOR` and rounded to a step.
     ///      Later stakes: the amount that brings the outcome to exactly twice the total of every other outcome,
     ///      bounded by the cap. An outcome that already holds that share cannot be staked on: it is the
-    ///      outcome the last report backed.
-    function _requiredStake(QueryResolution storage resolution, uint256 fee, uint256 outcome)
+    ///      outcome the last report backed. `cap` is the ladder's frozen cap, or before the first report the
+    ///      one the first report freezes.
+    function _requiredStake(QueryResolution storage resolution, uint256 fee, uint256 outcome, uint256 cap)
         internal
         view
         returns (uint256 stake)
     {
-        uint256 cap = resolution.cap;
         if (resolution.stakeCount == 0) {
             uint256 firstStakeCap = cap / FIRST_STAKE_CAP_DIVISOR;
             return _roundToPowerOfTwoStep(fee > firstStakeCap ? firstStakeCap : fee, cap);
@@ -2098,7 +2105,6 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
 
         // The child is keyed by the outcome exactly as spawnChildUniverse keyed it, and it must exist: spawn
         // it first (permissionless) if this outcome has none yet.
-        // TODO: maybe spawn the child universe here if needed
         childUniverseId = ZOLTAR.getChildUniverseId(universeId, childOutcome);
         childUniverse = universes[childUniverseId];
         if (childUniverse.universeState == UniverseState.NotExisting) revert InvalidUniverse();

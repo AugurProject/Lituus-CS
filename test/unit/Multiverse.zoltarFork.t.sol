@@ -149,7 +149,7 @@ contract MultiverseZoltarForkTest is MultiverseFixtures {
         assertEq(multiverse.getUserStake(GENESIS_UID, queryId, bystander, OUTCOME_A), 3 * DEFAULT_FEE);
 
         // The same tx mirrored the fork, so the parent is no longer Active: claim() is closed here for good.
-        // The winners' recourse is the claim-and-migrate lane (not built yet): their value is parked, not lost.
+        // The winners' recourse is migrateStake into a child: their value is parked, not lost.
         vm.prank(user);
         vm.expectRevert(Multiverse.InvalidUniverseState.selector);
         multiverse.claim(GENESIS_UID, queryId);
@@ -357,6 +357,97 @@ contract MultiverseZoltarForkTest is MultiverseFixtures {
         vm.prank(bystander);
         multiverse.resolve(child1, freshId);
         assertEq(multiverse.getOutcome(child1, freshId), multiverse.INVALID());
+    }
+
+    /* =========================================== RETURN OF STAKES ========================================== */
+
+    function _totalMigratedOut(uint248 universeId) internal view returns (uint128 totalOut) {
+        (,,,,,,,,,, totalOut,,) = multiverse.universes(universeId);
+    }
+
+    /// @dev Asserts `staker` got its `parentShares` payout as child wREP: assets at the parent's frozen rate,
+    ///      shares at the child's rate.
+    function _assertPaidInto(uint248 childId, address staker, uint256 parentShares) internal view {
+        ILituusRep childRep = _repOf(childId);
+        assertEq(childRep.balanceOf(staker), childRep.convertToShares(genesisRep.convertToAssets(parentShares)));
+    }
+
+    function test_Mirror_MigrateStakePaysWinnersAndRefundsOpenStakes() public {
+        // Before the native fork: a ladder resolved to A (user 1 and bystander 3 win, challenger's 2 loses; its
+        // burn moved the rate off 1), and a six-rung ladder left open, near the cap, with every actor on both
+        // sides. A mirrored fork has no forking-query stakes and no burn: the parked pot is the whole balance.
+        uint256 resolvedQueryId = _createResolvedLadder();
+        uint256 openQueryId = _createDefaultQuery();
+        address[6] memory reporters = [user, challenger, bystander, user, challenger, bystander];
+        for (uint256 i = 0; i < reporters.length; i++) {
+            _report(reporters[i], openQueryId, i % 2 == 0 ? OUTCOME_A : OUTCOME_B);
+        }
+        _forkZoltarNatively(_createZoltarCategoricalQuestion(2));
+        uint256 forkQuery = _mirror();
+        uint128 pot = _universe(GENESIS_UID).unmigratedSupply;
+        _spawn(ZOLTAR_INVALID);
+        _spawn(1);
+        _spawn(2);
+        uint248 childInvalid = _childId(ZOLTAR_INVALID);
+
+        // Nobody staked on the mirrored forking query: there is nothing to pay out for it in any child.
+        vm.prank(user);
+        vm.expectRevert(Multiverse.NothingToClaim.selector);
+        multiverse.migrateStake(GENESIS_UID, forkQuery, 1, 1);
+
+        // The resolved query's winners are paid what claim() would have paid, into any child, the one keyed
+        // by Zoltar's Invalid (0) included: bystander 3 + 3/4 of 80% of 2, user 1 + 1/4 of it.
+        uint256 bystanderPayout = 3 * DEFAULT_FEE + 3 * DEFAULT_FEE * (2 * DEFAULT_FEE * 4 / 5) / (4 * DEFAULT_FEE);
+        uint256 userPayout = DEFAULT_FEE + DEFAULT_FEE * (2 * DEFAULT_FEE * 4 / 5) / (4 * DEFAULT_FEE);
+        vm.expectEmit(true, true, true, true, address(multiverse));
+        emit Multiverse.StakeMigrated(
+            bystander, GENESIS_UID, childInvalid, resolvedQueryId, genesisRep.convertToAssets(bystanderPayout)
+        );
+        vm.prank(bystander);
+        multiverse.migrateStake(GENESIS_UID, resolvedQueryId, OUTCOME_A, ZOLTAR_INVALID);
+        _assertPaidInto(childInvalid, bystander, bystanderPayout);
+        vm.prank(user);
+        multiverse.migrateStake(GENESIS_UID, resolvedQueryId, OUTCOME_A, 1);
+        _assertPaidInto(_childId(1), user, userPayout);
+        // The losing side was paid out at resolution, to the winners.
+        vm.prank(challenger);
+        vm.expectRevert(Multiverse.NotAWinningOutcome.selector);
+        multiverse.migrateStake(GENESIS_UID, resolvedQueryId, OUTCOME_B, 2);
+        uint256 votes = genesisRep.convertToAssets(bystanderPayout) + genesisRep.convertToAssets(userPayout);
+
+        // The open ladder is refunded at face value, the side at the cap too: nothing about it was decided, and
+        // only the mirrored query is the forking one. Each actor takes both its stakes into the child 2 in one
+        // batch.
+        uint256[] memory queryIds = new uint256[](2);
+        uint256[] memory outcomes = new uint256[](2);
+        queryIds[0] = openQueryId;
+        queryIds[1] = openQueryId;
+        outcomes[0] = OUTCOME_A;
+        outcomes[1] = OUTCOME_B;
+        address[3] memory stakers = [user, challenger, bystander];
+        for (uint256 i = 0; i < stakers.length; i++) {
+            uint256 stakeA = multiverse.getUserStake(GENESIS_UID, openQueryId, stakers[i], OUTCOME_A);
+            uint256 stakeB = multiverse.getUserStake(GENESIS_UID, openQueryId, stakers[i], OUTCOME_B);
+            uint256 refund = genesisRep.convertToAssets(stakeA) + genesisRep.convertToAssets(stakeB);
+            vm.prank(stakers[i]);
+            multiverse.migrateStakes(GENESIS_UID, queryIds, outcomes, 2);
+            assertEq(_repOf(_childId(2)).balanceOf(stakers[i]), _repOf(_childId(2)).convertToShares(refund));
+            assertEq(multiverse.getUserStake(GENESIS_UID, openQueryId, stakers[i], OUTCOME_A), 0);
+            assertEq(multiverse.getUserStake(GENESIS_UID, openQueryId, stakers[i], OUTCOME_B), 0);
+            votes += refund;
+        }
+
+        // Every lane voted its whole payout out of the parked pot. What stays parked is the open query's fee,
+        // copied to each child at spawn, and the rounding of the per-stake conversions.
+        assertEq(_totalMigratedOut(GENESIS_UID), votes);
+        uint128 unmigrated = _universe(GENESIS_UID).unmigratedSupply;
+        assertEq(unmigrated, pot - votes);
+        (,, uint256 openFee,,) = multiverse.queries(openQueryId);
+        assertApproxEqAbs(unmigrated, genesisRep.convertToAssets(openFee), 10);
+        assertGe(unmigrated, genesisRep.convertToAssets(openFee));
+        uint256 parked = zoltar.getMigrationRepBalance(address(multiverse), GENESIS_UID);
+        assertLe(zoltar.splitPerChild(address(multiverse), GENESIS_UID, 2), parked);
+        assertLe(zoltar.splitPerChild(address(multiverse), GENESIS_UID, ZOLTAR_INVALID), parked);
     }
 
     /* ========================================== STRANDED LINEAGE =========================================== */
