@@ -6,7 +6,7 @@ import { ILituusRep } from "./ILituusRep.sol";
 /// @notice The subset of the Multiverse the QueryTokenizer (and deploy script) depend on.
 interface IMultiverse {
     /// @notice Creates a query paying a tokenizer-supplied price (the redeemed token's pooled average).
-    ///         Never forwards to the heir: reverts unless the universe itself is Active/Forming.
+    ///         Never forwards to the heir: reverts unless the universe itself is Active.
     ///         `creator` (the redeemer) is emitted as QueryCreated's creator.
     function createQueryFromTokenizer(
         uint248 universeId,
@@ -19,7 +19,7 @@ interface IMultiverse {
     /// @notice One-call mint pricing for the QueryTokenizer: the uncapped query fee (base × demand
     ///         modifier, read-only) and the fee cap (half the fork threshold), both in wREP, plus the
     ///         universe's wREP token. Never forwards to the heir: reverts unless the universe itself
-    ///         is Active/Forming.
+    ///         is Active.
     function getMintPricing(uint248 universeId)
         external
         view
