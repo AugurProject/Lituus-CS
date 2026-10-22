@@ -49,14 +49,6 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
         outcomes = [1, 2, 3, INVALID_OUTCOME];
     }
 
-    function _childId(uint256 outcome) internal view returns (uint248) {
-        return zoltar.getChildUniverseId(GENESIS_UID, outcome);
-    }
-
-    function _universeState(uint248 universeId) internal view returns (Multiverse.UniverseState state) {
-        (, state,,,,,,,,,,,) = multiverse.universes(universeId);
-    }
-
     /// @dev Builds a random ladder on a fresh query until it forks. Returns the query and the stake each
     ///      reporter placed on each outcome, indexed like `reporters` and `outcomes`.
     function _buildRandomForkingLadder(uint256 seed) internal returns (uint256 queryId, uint256[4][3] memory staked) {
@@ -136,7 +128,7 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
                 assertEq(multiverse.getUserStake(GENESIS_UID, queryId, reporters[r], outcomes[o]), amount);
                 if (amount == 0) continue;
 
-                ILituusRep childRep = multiverse.repTokenOf(_childId(outcomes[o]));
+                ILituusRep childRep = multiverse.repTokenOf(_childId(GENESIS_UID, outcomes[o]));
                 uint256 balanceBefore = childRep.balanceOf(reporters[r]);
                 uint256 expected =
                     childRep.convertToShares(genesisRep.convertToAssets(_expectedChildPayout(queryId, amount)));
@@ -245,7 +237,7 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
         for (uint256 o = 0; o < outcomes.length; o++) {
             Multiverse.OutcomeStakes memory side = multiverse.getOutcomeStakes(GENESIS_UID, queryId, outcomes[o]);
             multiverse.spawnChildUniverse(GENESIS_UID, outcomes[o]);
-            ILituusRep childRep = multiverse.repTokenOf(_childId(outcomes[o]));
+            ILituusRep childRep = multiverse.repTokenOf(_childId(GENESIS_UID, outcomes[o]));
             if (side.firstReporter == address(0)) {
                 // Nothing drawn for this child: no fee copy (the forking query's fee is excluded) and
                 // no reporter.
@@ -327,7 +319,7 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
                         payout = amount + amount * (losers - losers / multiverse.BURN_DIVIDER()) / winnerStaked;
                     }
 
-                    ILituusRep childRep = multiverse.repTokenOf(_childId(outcomes[childIndex]));
+                    ILituusRep childRep = multiverse.repTokenOf(_childId(GENESIS_UID, outcomes[childIndex]));
                     uint256 payoutAssets = genesisRep.convertToAssets(payout);
                     uint256 balanceBefore = childRep.balanceOf(reporters[r]);
                     vm.prank(reporters[r]);
@@ -366,7 +358,7 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
             for (uint256 r = 0; r < reporters.length; r++) {
                 forkVotes += genesisRep.convertToAssets(forkStaked[r][o]);
             }
-            (,,,,,,, uint128 totalIn,,,,,) = multiverse.universes(_childId(outcomes[o]));
+            (,,,,,,, uint128 totalIn,,,,,) = multiverse.universes(_childId(GENESIS_UID, outcomes[o]));
             assertEq(totalIn, forkVotes + sideVotes[o]);
             totalVotes += sideVotes[o];
             assertLe(zoltar.splitPerChild(address(multiverse), GENESIS_UID, outcomes[o]), parked);

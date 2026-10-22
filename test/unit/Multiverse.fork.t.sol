@@ -5,11 +5,12 @@ import { Multiverse } from "src/Multiverse.sol";
 import { LituusRep } from "src/LituusRep.sol";
 import { ILituusRep } from "src/interfaces/ILituusRep.sol";
 import { MultiverseFixtures } from "./Multiverse.fixtures.sol";
+import { QueryFeeMirror } from "./QueryFee.mirror.sol";
 
 /// @notice Minimal forking flow: trigger inside report(), lazy spawn, migration voting, resolution, and
 ///         the forking query's payouts in the children.
 /// @dev Runs against MockZoltar (unique keccak child ids, per-child REP, credit-only migration
-///      stubs). Refunds of the other queries and SupplyRestoration are later phases and not tested here.
+///      stubs). SupplyRestoration is a later phase and not tested here.
 contract MultiverseForkTest is MultiverseFixtures {
     uint256 internal constant INVALID_OUTCOME = type(uint256).max;
     // The fork bond Zoltar takes on the fixture supply (2% of 3200 ether) and what it keeps of it (a fifth).
@@ -18,37 +19,6 @@ contract MultiverseForkTest is MultiverseFixtures {
     // On the fixture ladder the two capped outcomes are the only ones staked, so the losing side of the cap
     // is the other cap less what Zoltar burned: a winner's payout in its own child is its 32 plus 32 - 12.8.
     uint256 internal constant WINNER_PAYOUT = 32 ether + (32 ether - FORK_BURN);
-
-    /// @dev Escalates a query in `universeId` until the fork fires (the second outcome reaches the
-    ///      per-outcome cap inside report()), alternating OUTCOME_A/OUTCOME_B from
-    ///      `reporterA`/`reporterB`. Returns the trigger stake (the stake that landed the second
-    ///      outcome on the cap, recorded in full like any other).
-    function _escalateToFork(uint248 universeId, uint256 queryId, address reporterA, address reporterB)
-        internal
-        returns (uint256 triggerStake)
-    {
-        uint256 i = 0;
-        while (true) {
-            uint256 outcome = i % 2 == 0 ? OUTCOME_A : OUTCOME_B;
-            triggerStake = multiverse.getNextRequiredStake(universeId, queryId, outcome);
-            vm.prank(i % 2 == 0 ? reporterA : reporterB);
-            multiverse.report(universeId, queryId, outcome);
-            if (_universeState(universeId) == Multiverse.UniverseState.Migration) return triggerStake;
-            i++;
-        }
-    }
-
-    /// @dev Forks the genesis universe on a fresh default query and returns (queryId, triggerStake).
-    ///      On the fixture grid (cap = 32*fee) the ladder is 1, 2, 3, 6, 12, 24 (B at the cap),
-    ///      then the 16*fee rung on A triggers.
-    function _forkGenesis() internal returns (uint256 queryId, uint256 triggerStake) {
-        queryId = _createDefaultQuery();
-        triggerStake = _escalateToFork(GENESIS_UID, queryId, user, challenger);
-    }
-
-    function _childId(uint248 parentId, uint256 outcome) internal view returns (uint248) {
-        return zoltar.getChildUniverseId(parentId, outcome);
-    }
 
     /// @dev Forks the genesis into two spawned children with the standard vote split: user migrates
     ///      320 ether to the OUTCOME_A child, challenger 400 ether to the OUTCOME_B child — child2
@@ -65,10 +35,6 @@ contract MultiverseForkTest is MultiverseFixtures {
         multiverse.migrate(GENESIS_UID, OUTCOME_A, 320 ether);
         vm.prank(challenger);
         multiverse.migrate(GENESIS_UID, OUTCOME_B, 400 ether);
-    }
-
-    function _universeState(uint248 universeId) internal view returns (Multiverse.UniverseState state) {
-        (, state,,,,,,,,,,,) = multiverse.universes(universeId);
     }
 
     /// @dev Forks the genesis on a fresh default query and spawns the OUTCOME_A and OUTCOME_B children
@@ -367,7 +333,11 @@ contract MultiverseForkTest is MultiverseFixtures {
         uint256 nestedQueryId = multiverse.queryCount();
         vm.prank(user);
         multiverse.createQuery(child1, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
-        assertEq(_totalQueryFees(child1), 2 * DEFAULT_FEE);
+        // The child inherits the genesis demand history (vol[0] = 2: the open and the forking query), so its fee
+        // is demand-adjusted: at window 0, f = 0, recent 2 + bootstrap 3 = 5 over a bootstrap-filled sixty.
+        (,, uint256 nestedFee,,) = multiverse.queries(nestedQueryId);
+        assertEq(nestedFee, QueryFeeMirror.expectedFee(multiverse, DEFAULT_FEE, 0, 0, 2, 0, 0, 0));
+        assertEq(_totalQueryFees(child1), DEFAULT_FEE + nestedFee);
         _escalateToFork(child1, nestedQueryId, user, user);
 
         // At child1's own fork the nested forking query's fee is excluded; the genesis-era fee
@@ -382,6 +352,11 @@ contract MultiverseForkTest is MultiverseFixtures {
     }
 
     function test_Spawn_Reverts() public {
+        // No such universe.
+        uint248 unspawned = _childId(GENESIS_UID, OUTCOME_A);
+        vm.expectRevert(Multiverse.InvalidUniverse.selector);
+        multiverse.spawnChildUniverse(unspawned, OUTCOME_A);
+
         // Not forking yet.
         vm.expectRevert(Multiverse.InvalidUniverseState.selector);
         multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
@@ -405,11 +380,10 @@ contract MultiverseForkTest is MultiverseFixtures {
         zoltar.deployChild(GENESIS_UID, OUTCOME_B);
         multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_B);
 
-        // The spawn window closes 30 days after the fork, strictly by clock (unlike migration,
-        // which extends until the parent fork resolves — inflow stays possible, spawning does not).
+        // The spawn window never closes: a child still spawns after the migration window has lapsed.
         vm.warp(vm.getBlockTimestamp() + multiverse.MIGRATION_DURATION());
-        vm.expectRevert(Multiverse.SpawnWindowClosed.selector);
         multiverse.spawnChildUniverse(GENESIS_UID, INVALID_OUTCOME);
+        assertEq(uint8(_universeState(_childId(GENESIS_UID, INVALID_OUTCOME))), uint8(Multiverse.UniverseState.Active));
     }
 
     /* ============================================== MIGRATION ============================================== */
@@ -1485,6 +1459,129 @@ contract MultiverseForkTest is MultiverseFixtures {
         );
     }
 
+    function test_MigrateStake_PaysAnInvalidStakeOnTheForkingQueryInTheInvalidChild() public {
+        // The default ladder with INVALID in place of B: user A 1, challenger INVALID 2, ... challenger INVALID
+        // 24 (INVALID at the cap), user A 16 (A at the cap, fork). Each side holds 32.
+        uint256 queryId = _createDefaultQuery();
+        for (uint256 i = 0; _universeState(GENESIS_UID) != Multiverse.UniverseState.Migration; i++) {
+            vm.prank(i % 2 == 0 ? user : challenger);
+            multiverse.report(GENESIS_UID, queryId, i % 2 == 0 ? OUTCOME_A : INVALID_OUTCOME);
+        }
+        assertEq(multiverse.getUserStake(GENESIS_UID, queryId, challenger, INVALID_OUTCOME), 32 ether);
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
+        multiverse.spawnChildUniverse(GENESIS_UID, INVALID_OUTCOME);
+        uint248 childInvalid = _childId(GENESIS_UID, INVALID_OUTCOME);
+
+        // The INVALID stake loses in the A child and wins in its own, keyed by the sentinel as spawned.
+        vm.prank(challenger);
+        vm.expectRevert(Multiverse.NotAWinningOutcome.selector);
+        multiverse.migrateStake(GENESIS_UID, queryId, INVALID_OUTCOME, OUTCOME_A);
+        vm.expectEmit(true, true, true, true);
+        emit Multiverse.StakeMigrated(challenger, GENESIS_UID, childInvalid, queryId, WINNER_PAYOUT);
+        vm.prank(challenger);
+        multiverse.migrateStake(GENESIS_UID, queryId, INVALID_OUTCOME, INVALID_OUTCOME);
+        assertEq(multiverse.repTokenOf(childInvalid).balanceOf(challenger), WINNER_PAYOUT);
+        assertEq(multiverse.getOutcome(childInvalid, queryId), INVALID_OUTCOME);
+        assertEq(multiverse.getUserStake(GENESIS_UID, queryId, challenger, INVALID_OUTCOME), 0);
+
+        // The principal votes for the INVALID child, like any other outcome's.
+        (,,,,,,, uint128 totalIn,,,,,) = multiverse.universes(childInvalid);
+        assertEq(totalIn, 32 ether);
+
+        // The A side is paid the same return in its own child.
+        vm.prank(user);
+        multiverse.migrateStake(GENESIS_UID, queryId, OUTCOME_A, OUTCOME_A);
+        assertEq(multiverse.repTokenOf(_childId(GENESIS_UID, OUTCOME_A)).balanceOf(user), WINNER_PAYOUT);
+    }
+
+    function test_MigrateStake_EveryLaneIntoOneChildFitsTheParkedBalance() public {
+        // The worst case for one child's draw: every lane paid from the parked balance goes into the A child.
+        // challenger is owed 2.8 on the resolved query, the open ladder holds user A 1 and challenger B 2, and
+        // the forking query's first reports land halfway through its reporting window, so the A child pays its
+        // first reporter half the fee. The resolution moved the rate off 1, so amounts are read off the records.
+        uint256 resolvedQueryId = _createResolvedQuery();
+        uint256 openQueryId = _createTwoStakeQuery();
+        uint256 forkQueryId = _createDefaultQuery();
+        (,, uint256 forkFee,,) = multiverse.queries(forkQueryId);
+        vm.warp(vm.getBlockTimestamp() + multiverse.REPORTING_PERIOD() / 2);
+        _escalateToFork(GENESIS_UID, forkQueryId, user, challenger);
+        assertTrue(genesisRep.rate() != 1 ether);
+
+        // The spawn draws the open query's fee copy and the fork reporter reward.
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
+        assertGt(_drawnIntoChild(GENESIS_UID, OUTCOME_A), 0);
+
+        vm.prank(user);
+        multiverse.migrateStake(GENESIS_UID, forkQueryId, OUTCOME_A, OUTCOME_A);
+        vm.prank(user);
+        multiverse.migrateStake(GENESIS_UID, openQueryId, OUTCOME_A, OUTCOME_A);
+        vm.prank(challenger);
+        multiverse.migrateStake(GENESIS_UID, resolvedQueryId, OUTCOME_B, OUTCOME_A);
+        vm.prank(challenger);
+        multiverse.migrateStake(GENESIS_UID, openQueryId, OUTCOME_B, OUTCOME_A);
+
+        // Everything is out but the half of the forking query's fee the reporter ramp did not pay, which
+        // stays parked for good, and the rounding of the per-stake conversions.
+        uint256 parked = zoltar.getMigrationRepBalance(address(multiverse), GENESIS_UID);
+        uint256 left = parked - _drawnIntoChild(GENESIS_UID, OUTCOME_A);
+        assertGe(left, genesisRep.convertToAssets(forkFee - forkFee / 2));
+        assertApproxEqAbs(left, genesisRep.convertToAssets(forkFee - forkFee / 2), 10);
+
+        // A plain wREP migration brings its own REP into the parked balance and draws exactly that: it never
+        // eats into what the stake lanes can draw.
+        uint256 bystanderShares = genesisRep.balanceOf(bystander);
+        vm.prank(bystander);
+        multiverse.migrate(GENESIS_UID, OUTCOME_A, bystanderShares);
+        assertEq(
+            zoltar.getMigrationRepBalance(address(multiverse), GENESIS_UID) - _drawnIntoChild(GENESIS_UID, OUTCOME_A),
+            left
+        );
+    }
+
+    function test_MigrateStakes_MatchesSingleClaimsAtARateAboveOne() public {
+        // challenger holds B on the resolved query, the open one and the forking one, at a rate above 1.
+        uint256 resolvedQueryId = _createResolvedQuery();
+        uint256 openQueryId = _createTwoStakeQuery();
+        (uint256 forkQueryId,, uint248 child2) = _forkGenesisAndSpawn();
+        assertGt(genesisRep.rate(), 1 ether);
+        ILituusRep child2Rep = multiverse.repTokenOf(child2);
+
+        uint256[] memory queryIds = new uint256[](3);
+        uint256[] memory outcomes = new uint256[](3);
+        queryIds[0] = forkQueryId;
+        queryIds[1] = resolvedQueryId;
+        queryIds[2] = openQueryId;
+        outcomes[0] = OUTCOME_B;
+        outcomes[1] = OUTCOME_B;
+        outcomes[2] = OUTCOME_B;
+
+        uint256 snapshot = vm.snapshotState();
+        vm.startPrank(challenger);
+        for (uint256 i = 0; i < queryIds.length; i++) {
+            multiverse.migrateStake(GENESIS_UID, queryIds[i], outcomes[i], OUTCOME_B);
+        }
+        vm.stopPrank();
+        uint256 singlesShares = child2Rep.balanceOf(challenger);
+        (,,,,,,,,,, uint128 singlesOut,,) = multiverse.universes(GENESIS_UID);
+        uint128 singlesUnmigrated = _unmigratedSupply(GENESIS_UID);
+        uint256 singlesDrawn = _drawnIntoChild(GENESIS_UID, OUTCOME_B);
+
+        vm.revertToState(snapshot);
+        vm.prank(challenger);
+        multiverse.migrateStakes(GENESIS_UID, queryIds, outcomes, OUTCOME_B);
+
+        // Each stake converts to assets on its own either way: the same votes and the same draw.
+        (,,,,,,,,,, uint128 batchOut,,) = multiverse.universes(GENESIS_UID);
+        assertEq(batchOut, singlesOut);
+        assertEq(_unmigratedSupply(GENESIS_UID), singlesUnmigrated);
+        assertEq(_drawnIntoChild(GENESIS_UID, OUTCOME_B), singlesDrawn);
+        // The batch converts the total to child shares once, so it keeps at most a wei per extra stake that
+        // the single claims round away.
+        uint256 batchShares = child2Rep.balanceOf(challenger);
+        assertGe(batchShares, singlesShares);
+        assertLe(batchShares, singlesShares + queryIds.length - 1);
+    }
+
     function test_MigrateStakes_Reverts() public {
         uint256 openQueryId = _createTwoStakeQuery();
         (uint256 forkQueryId,,) = _forkGenesisAndSpawn();
@@ -1519,5 +1616,189 @@ contract MultiverseForkTest is MultiverseFixtures {
         vm.expectRevert(Multiverse.NothingToClaim.selector);
         multiverse.migrateStakes(GENESIS_UID, queryIds, outcomes, OUTCOME_A);
         assertEq(multiverse.getUserStake(GENESIS_UID, openQueryId, user, OUTCOME_A), 1 ether);
+    }
+
+    /* ============================================== LATE SPAWN ============================================== */
+
+    function test_Spawn_AfterTheForkResolves() public {
+        // The genesis fork settles with child2 as the winner; a third child spawns only afterwards.
+        (uint256 forkQueryId,, uint248 child2) = _forkGenesisWithTwoChildren();
+        vm.warp(vm.getBlockTimestamp() + multiverse.MIGRATION_DURATION());
+        multiverse.advanceForkState(GENESIS_UID);
+        assertEq(uint8(_universeState(GENESIS_UID)), uint8(Multiverse.UniverseState.PostFork));
+
+        uint248 child3 = _childId(GENESIS_UID, OUTCOME_C);
+        vm.expectEmit(true, true, true, true, address(multiverse));
+        emit Multiverse.QueryResolved(bystander, child3, forkQueryId, OUTCOME_C);
+        vm.expectEmit(true, true, true, true, address(multiverse));
+        emit Multiverse.ChildUniverseSpawned(GENESIS_UID, child3, OUTCOME_C);
+        vm.prank(bystander);
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_C);
+
+        // A full universe on the fork tree: Active, parented to the genesis, answering the forking query its
+        // own way, at the parent's rate with unwrap open.
+        (
+            ILituusRep child3Rep,
+            Multiverse.UniverseState universeState,
+            uint48 forkTime,
+            bool isCanonical,
+            uint248 parent,,,,,,,,
+        ) = multiverse.universes(child3);
+        assertEq(uint8(universeState), uint8(Multiverse.UniverseState.Active));
+        assertEq(parent, GENESIS_UID);
+        assertEq(forkTime, 0);
+        assertEq(child3Rep.rate(), genesisRep.rate());
+        assertFalse(child3Rep.unwrapPaused());
+        assertEq(multiverse.getOutcome(child3, forkQueryId), OUTCOME_C);
+
+        // The settled fork is untouched: the winner and the canonical timeline stay where they were, and the
+        // late child is neither.
+        assertFalse(isCanonical);
+        (,,,,, uint248 favoriteChild,,,,,,,) = multiverse.universes(GENESIS_UID);
+        assertEq(favoriteChild, child2);
+        assertEq(multiverse.canonicalHeir(), child2);
+        assertEq(multiverse.getOutcome(GENESIS_UID, forkQueryId), OUTCOME_B);
+
+        // No counted migration reaches it: the parent is no longer migrating at all.
+        vm.prank(user);
+        vm.expectRevert(Multiverse.InvalidUniverseState.selector);
+        multiverse.migrate(GENESIS_UID, OUTCOME_C, 1 ether);
+        vm.prank(user);
+        vm.expectRevert(Multiverse.InvalidUniverseState.selector);
+        multiverse.migrateStake(GENESIS_UID, forkQueryId, OUTCOME_C, OUTCOME_C);
+
+        // Its electorate enters from the Zoltar level: child REP wraps in and the universe runs queries. None
+        // of it is a vote.
+        _wrapFromZoltar(child3, bystander, 10 ether);
+        assertEq(child3Rep.balanceOf(bystander), 10 ether);
+        uint256 queryId = multiverse.queryCount();
+        vm.prank(bystander);
+        multiverse.createQuery(child3, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
+        assertEq(multiverse.queryCount(), queryId + 1);
+        assertLt(child3Rep.balanceOf(bystander), 10 ether);
+        (,,,,,,, uint128 totalIn,,,,,) = multiverse.universes(child3);
+        assertEq(totalIn, 0);
+    }
+
+    function test_Spawn_InTheExtendedWindowStillTakesVotes() public {
+        // Genesis forks; user migrates into child1, which forks on its own query in the same block. Both 30-day
+        // clocks lapse together, but child1's window stays open until the genesis fork resolves.
+        (, uint248 child1,) = _forkGenesisWithTwoChildren();
+        ILituusRep child1Rep = multiverse.repTokenOf(child1);
+        vm.prank(user);
+        child1Rep.approve(address(multiverse), type(uint256).max);
+        uint256 nestedQueryId = multiverse.queryCount();
+        vm.prank(user);
+        multiverse.createQuery(child1, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
+        _escalateToFork(child1, nestedQueryId, user, user);
+        multiverse.spawnChildUniverse(child1, OUTCOME_A);
+
+        // Past child1's clock, with the genesis still migrating: a sibling spawns late and the vote it takes makes
+        // it the running leader.
+        vm.warp(vm.getBlockTimestamp() + multiverse.MIGRATION_DURATION() + 1);
+        vm.prank(bystander);
+        multiverse.spawnChildUniverse(child1, OUTCOME_B);
+        uint248 grandchildB = _childId(child1, OUTCOME_B);
+        vm.prank(user);
+        multiverse.migrate(child1, OUTCOME_B, 100 ether);
+        (,,,,, uint248 favoriteChild,,, uint128 maxOut,,,,) = multiverse.universes(child1);
+        assertEq(favoriteChild, grandchildB);
+        assertEq(maxOut, 100 ether);
+
+        // Resolving the genesis fork closes child1's window: no more votes, and child1's fork settles on the
+        // late-spawned leader.
+        multiverse.advanceForkState(GENESIS_UID);
+        vm.prank(user);
+        vm.expectRevert(Multiverse.MigrationWindowClosed.selector);
+        multiverse.migrate(child1, OUTCOME_B, 1 ether);
+        multiverse.advanceForkState(child1);
+        (,,,,, favoriteChild,,,,,,,) = multiverse.universes(child1);
+        assertEq(favoriteChild, grandchildB);
+        assertEq(multiverse.getOutcome(child1, nestedQueryId), OUTCOME_B);
+    }
+
+    function test_Spawn_LateChildForksOnItsOwn() public {
+        (,, uint248 child2) = _forkGenesisWithTwoChildren();
+        vm.warp(vm.getBlockTimestamp() + multiverse.MIGRATION_DURATION());
+        multiverse.advanceForkState(GENESIS_UID);
+        assertEq(uint8(_universeState(GENESIS_UID)), uint8(Multiverse.UniverseState.PostFork));
+        vm.prank(bystander);
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_C);
+        uint248 child3 = _childId(GENESIS_UID, OUTCOME_C);
+        ILituusRep child3Rep = multiverse.repTokenOf(child3);
+
+        // Its electorate enters from the Zoltar level, and a query escalates to the fork: the bond is two caps
+        // of the child's Zoltar supply, which the ladder holds.
+        _wrapFromZoltar(child3, user, 200 ether);
+        uint256 nestedQueryId = multiverse.queryCount();
+        vm.prank(user);
+        multiverse.createQuery(child3, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
+        _escalateToFork(child3, nestedQueryId, user, user);
+        assertEq(uint8(_universeState(child3)), uint8(Multiverse.UniverseState.Migration));
+        assertTrue(child3Rep.unwrapPaused());
+
+        // A plain nested fork from here: spawn, vote, and resolve by clock alone, since the parent is PostFork
+        // and nothing extends the window.
+        vm.prank(bystander);
+        multiverse.spawnChildUniverse(child3, OUTCOME_A);
+        uint248 grandchild = _childId(child3, OUTCOME_A);
+        vm.prank(user);
+        multiverse.migrate(child3, OUTCOME_A, 50 ether);
+        vm.expectRevert(Multiverse.MigrationWindowNotClosed.selector);
+        multiverse.advanceForkState(child3);
+        vm.warp(vm.getBlockTimestamp() + multiverse.MIGRATION_DURATION());
+        multiverse.advanceForkState(child3);
+        assertEq(uint8(_universeState(child3)), uint8(Multiverse.UniverseState.PostFork));
+        (,,,,, uint248 favoriteChild,,,,,,,) = multiverse.universes(child3);
+        assertEq(favoriteChild, grandchild);
+        assertEq(multiverse.getOutcome(child3, nestedQueryId), OUTCOME_A);
+
+        // A non-canonical line: the canonical timeline never moved.
+        (,,, bool isCanonical,,,,,,,,,) = multiverse.universes(grandchild);
+        assertFalse(isCanonical);
+        assertEq(multiverse.canonicalHeir(), child2);
+    }
+
+    function test_Spawn_LateChildReceivesTheFeePotAndReporterReward() public {
+        // An open query's fee is in the pot; the forking query's first reports land halfway through its reporting
+        // window, so each outcome's first reporter earned half its fee.
+        uint256 openQueryId = _createDefaultQuery();
+        uint256 forkQueryId = _createDefaultQuery();
+        (,, uint256 forkFee,,) = multiverse.queries(forkQueryId);
+        vm.warp(vm.getBlockTimestamp() + multiverse.REPORTING_PERIOD() / 2);
+        _escalateToFork(GENESIS_UID, forkQueryId, user, challenger);
+        // The open query's fee; the forking query's own is excluded.
+        uint256 feePot = _totalQueryFees(GENESIS_UID);
+        assertEq(feePot, DEFAULT_FEE);
+
+        // Child A on time, child B only after the fork resolved.
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
+        uint256 drawnIntoA = _drawnIntoChild(GENESIS_UID, OUTCOME_A);
+        vm.warp(vm.getBlockTimestamp() + multiverse.MIGRATION_DURATION());
+        multiverse.advanceForkState(GENESIS_UID);
+        uint248 child2 = _childId(GENESIS_UID, OUTCOME_B);
+        vm.expectEmit(true, true, true, true, address(multiverse));
+        emit Multiverse.ReporterRewardPaid(challenger, child2, forkQueryId, forkFee / 2);
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_B);
+
+        // The late child is funded exactly like an on-time one — the fee pot copy and its first reporter's
+        // reward — from the parked balance, whose per-child escrow leaves the sibling's draw untouched.
+        ILituusRep child2Rep = multiverse.repTokenOf(child2);
+        assertEq(_totalQueryFees(child2), feePot);
+        assertEq(child2Rep.balanceOf(challenger), forkFee / 2);
+        assertEq(child2Rep.totalAssets(), feePot + forkFee / 2);
+        assertEq(_drawnIntoChild(GENESIS_UID, OUTCOME_B), feePot + forkFee / 2);
+        assertEq(_drawnIntoChild(GENESIS_UID, OUTCOME_A), drawnIntoA);
+        assertLe(
+            _drawnIntoChild(GENESIS_UID, OUTCOME_B), zoltar.getMigrationRepBalance(address(multiverse), GENESIS_UID)
+        );
+
+        // The inherited query arrived expired (its window restarted at the fork, 30 days ago): it resolves
+        // INVALID and the fee copy pays the resolver in full.
+        vm.prank(bystander);
+        multiverse.resolve(child2, openQueryId);
+        assertEq(multiverse.getOutcome(child2, openQueryId), INVALID_OUTCOME);
+        assertEq(child2Rep.balanceOf(bystander), feePot);
+        assertEq(_totalQueryFees(child2), 0);
     }
 }

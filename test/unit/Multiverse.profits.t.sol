@@ -2,36 +2,9 @@
 pragma solidity ^0.8.35;
 
 import { Multiverse } from "src/Multiverse.sol";
-import { IZoltar } from "src/interfaces/IZoltar.sol";
 import { IQueryFeeController } from "src/interfaces/IQueryFeeController.sol";
 import { MultiverseDeployFixture } from "./Multiverse.fixtures.sol";
-
-/// @notice Test harness exposing the internal profit view as an external function.
-contract MultiverseHarness is Multiverse {
-    constructor(
-        IZoltar zoltar,
-        uint248 genesisUniverseId,
-        IQueryFeeController queryFeeController,
-        address queryTokenizer,
-        uint256 migrationDuration,
-        uint256 reportingPeriod,
-        uint256 appealPeriod
-    )
-        Multiverse(
-            zoltar,
-            genesisUniverseId,
-            queryFeeController,
-            queryTokenizer,
-            migrationDuration,
-            reportingPeriod,
-            appealPeriod
-        )
-    { }
-
-    function exposed_getProfits(uint248 universeId) external view returns (uint256, uint256) {
-        return _getProfits(universeId);
-    }
-}
+import { MultiverseHarness } from "./Multiverse.harness.sol";
 
 /// @notice Unit suite for _getProfits: month bucketing, the currentWindow-10 boundary split, sum conservation
 ///         across the boundary migration, the currentWindow-20 tail, and the pre-genesis BOOT_PROFIT fallback.
@@ -173,22 +146,24 @@ contract MultiverseProfitsTest is MultiverseDeployFixture {
         //   A @ window25: no prior volume anywhere -> sixty = 0 -> neutral  -> fee = 1e18 exactly.
         //   B @ window30: sixty = {window25} = 1, recent = vol[29] = 0 -> floor  -> fee = 1e18 / 101 floored
         //            = 9900990099009900.
-        //   C @ window33: sixty = 2, recent = 0 -> floor -> 9900990099009900.
-        //   D @ window37: sixty = 3, recent = 0 -> floor -> 9900990099009900.
+        //   C @ window33: sixty = 2, recent = 0 -> floor -> 9900990099009900 (FLOOR_FEE).
+        //   D @ window37: sixty = 3, recent = 0 -> floor -> 9900990099009900 (FLOOR_FEE).
         // Read at window 40, fraction = 0.5: the current month holds C + D + half of boundary-window B;
         // the previous month holds the other half of B plus A (i = 15); the oldest window window20 is
         // empty. Hand-summed:
         //   current = 9900990099009900 * 2 + 4950495049504950 = 24752475247524750
+        //   (2 * FLOOR_FEE + FLOOR_FEE / 2)
         //   last    = 1000000000000000000 + 4950495049504950  = 1004950495049504950
+        //   (1 ether + FLOOR_FEE / 2)
         uint256 seedA = _seedProfitAt(25, 2 days);
         uint256 seedB = _seedProfitAt(30, 2 days);
         uint256 seedC = _seedProfitAt(33, 2 days);
         uint256 seedD = _seedProfitAt(37, 2 days);
 
         assertEq(seedA, 1 ether);
-        assertEq(seedB, 9_900_990_099_009_900);
-        assertEq(seedC, 9_900_990_099_009_900);
-        assertEq(seedD, 9_900_990_099_009_900);
+        assertEq(seedB, FLOOR_FEE);
+        assertEq(seedC, FLOOR_FEE);
+        assertEq(seedD, FLOOR_FEE);
 
         _warpTo(40, multiverse.THREE_DAYS() / 2);
         (uint256 currentProfit, uint256 lastProfit) = harness.exposed_getProfits(GENESIS_UID);

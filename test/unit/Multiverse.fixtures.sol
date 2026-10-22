@@ -27,6 +27,13 @@ abstract contract MultiverseDeployFixture is Test {
     // catches any code path that wrongly assumes the genesis universe lives at id 0.
     uint248 internal constant GENESIS_UID = 42;
     uint128 internal constant DEFAULT_FEE = 1 ether;
+    // The fee at the down-curve floor for the 1 REP default base: an empty previous window over any nonzero
+    // sixty -> recent 0, ratio 0, shortage 1e18, (1e18)^6 re-floored stays 1e18 -> modifier = 1e36 / (1e18 +
+    // 100e18) = 1e18 / 101 floored. The modifier is SCALE-scaled, so at a 1e18 base the fee in wei equals it,
+    // and at a k REP base it is k times it.
+    // Equals DEFAULT_FEE * QueryFeeMirror.floorModifier(multiverse) / SCALE,
+    // pinned as a literal so the floor can be asserted without the mirror.
+    uint256 internal constant FLOOR_FEE = 9_900_990_099_009_900;
     uint128 internal constant USER_REP_BALANCE = 1000 ether;
     uint8 internal constant DEFAULT_NUMBER_OF_OUTCOMES = 3;
     // Readable outcomes for escalation ping-pong (all valid for the default query).
@@ -187,6 +194,19 @@ abstract contract MultiverseDeployFixture is Test {
         vm.stopPrank();
     }
 
+    /// @dev Funding tool for a child universe: hand `account` `amount` of the child's Zoltar REP (a migration at
+    ///      the Zoltar level, outside Lituus), wrap it into the child's Lituus vault, approve the multiverse.
+    function _wrapFromZoltar(uint248 universeId, address account, uint256 amount) internal {
+        MockERC20 zoltarRep = MockERC20(address(zoltar.childRepTokens(universeId)));
+        ILituusRep repToken = multiverse.repTokenOf(universeId);
+        zoltarRep.mint(account, amount);
+        vm.startPrank(account);
+        zoltarRep.approve(address(repToken), type(uint256).max);
+        multiverse.wrap(universeId, amount, 0);
+        repToken.approve(address(multiverse), type(uint256).max);
+        vm.stopPrank();
+    }
+
     /// @dev The claim payout the contract owes `staker` on a resolved query, from the per-outcome totals.
     ///      NOTE: this re-derives the contract's own payout formula, so it can never catch a bug
     ///      in that formula — it exists for dynamic-fee and fuzz cases where a literal cannot be
@@ -199,6 +219,50 @@ abstract contract MultiverseDeployFixture is Test {
         uint256 totalLoserStakes = uint256(r.totalStaked) - winnerStaked;
         uint256 totalDistributable = totalLoserStakes - totalLoserStakes / multiverse.BURN_DIVIDER();
         return amount + amount * totalDistributable / winnerStaked;
+    }
+
+    /// @dev Warps to window `window` with `elapsed` seconds of it gone by (windows are GENESIS_TIMESTAMP-anchored).
+    function _warpToWindow(uint256 window, uint256 elapsed) internal {
+        vm.warp(multiverse.GENESIS_TIMESTAMP() + window * multiverse.THREE_DAYS() + elapsed);
+    }
+
+    /* ============================================ FORK HELPERS ============================================ */
+
+    function _universeState(uint248 universeId) internal view returns (Multiverse.UniverseState state) {
+        (, state,,,,,,,,,,,) = multiverse.universes(universeId);
+    }
+
+    function _childId(uint248 parentId, uint256 outcome) internal view returns (uint248) {
+        return zoltar.getChildUniverseId(parentId, outcome);
+    }
+
+    /// @dev Escalates a query in `universeId` until the fork fires (the second outcome reaches the
+    ///      per-outcome cap inside report()), alternating OUTCOME_A/OUTCOME_B from
+    ///      `reporterA`/`reporterB`, all in one block. Returns the trigger stake (the stake that landed the
+    ///      second outcome on the cap, recorded in full like any other).
+    function _escalateToFork(uint248 universeId, uint256 queryId, address reporterA, address reporterB)
+        internal
+        returns (uint256 triggerStake)
+    {
+        return _escalateToFork(universeId, queryId, reporterA, reporterB, 0);
+    }
+
+    /// @dev Same ladder, with `pace` seconds between the rungs (keep it inside APPEAL_PERIOD so every rung is
+    ///      an appeal). Lets the fork fire windows after the query's creation.
+    function _escalateToFork(uint248 universeId, uint256 queryId, address reporterA, address reporterB, uint256 pace)
+        internal
+        returns (uint256 triggerStake)
+    {
+        uint256 i = 0;
+        while (true) {
+            vm.warp(vm.getBlockTimestamp() + pace);
+            uint256 outcome = i % 2 == 0 ? OUTCOME_A : OUTCOME_B;
+            triggerStake = multiverse.getNextRequiredStake(universeId, queryId, outcome);
+            vm.prank(i % 2 == 0 ? reporterA : reporterB);
+            multiverse.report(universeId, queryId, outcome);
+            if (_universeState(universeId) == Multiverse.UniverseState.Migration) return triggerStake;
+            i++;
+        }
     }
 }
 
@@ -404,5 +468,13 @@ abstract contract MultiverseFixtures is MultiverseDeployFixture {
         assertEq(multiverse.getUserStake(GENESIS_UID, queryId, claimant, _resolution(queryId).outcome), 0);
 
         return expectedPayout;
+    }
+
+    /// @dev Forks the genesis universe on a fresh default query and returns (queryId, triggerStake).
+    ///      On the fixture grid (cap = 32*fee) the ladder is 1, 2, 3, 6, 12, 24 (B at the cap),
+    ///      then the 16*fee rung on A triggers.
+    function _forkGenesis() internal returns (uint256 queryId, uint256 triggerStake) {
+        queryId = _createDefaultQuery();
+        triggerStake = _escalateToFork(GENESIS_UID, queryId, user, challenger);
     }
 }

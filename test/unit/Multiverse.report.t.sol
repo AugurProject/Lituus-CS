@@ -802,6 +802,65 @@ contract MultiverseReportTest is MultiverseFixtures {
         multiverse.getNextRequiredStake(GENESIS_UID, 999, OUTCOME_A);
     }
 
+    /// @dev Asserts the quote and the report it would price reject the same input with the same error.
+    function _assertQuoteRevertsLikeReport(uint248 universeId, uint256 queryId, uint256 outcome, bytes4 selector)
+        internal
+    {
+        vm.expectRevert(selector);
+        multiverse.getNextRequiredStake(universeId, queryId, outcome);
+        vm.prank(bystander);
+        vm.expectRevert(selector);
+        multiverse.report(universeId, queryId, outcome);
+    }
+
+    function test_GetNextRequiredStake_RevertsExactlyLikeReport() public {
+        // An open query with no report, and one with a single report on A, both created now.
+        uint256 openQueryId = _createDefaultQuery();
+        uint256 reportedQueryId = _createReportedQuery(OUTCOME_A);
+
+        // The universe is checked before the query, in both.
+        _assertQuoteRevertsLikeReport(1, openQueryId, OUTCOME_A, Multiverse.InvalidUniverse.selector);
+        _assertQuoteRevertsLikeReport(1, 999, OUTCOME_A, Multiverse.InvalidUniverse.selector);
+        _assertQuoteRevertsLikeReport(GENESIS_UID, 999, OUTCOME_A, Multiverse.InvalidQuery.selector);
+
+        // Outcomes outside 1..numberOfOutcomes and INVALID, before and after the first report.
+        _assertQuoteRevertsLikeReport(GENESIS_UID, openQueryId, 0, Multiverse.InvalidOutcome.selector);
+        _assertQuoteRevertsLikeReport(
+            GENESIS_UID, openQueryId, DEFAULT_NUMBER_OF_OUTCOMES + 1, Multiverse.InvalidOutcome.selector
+        );
+        _assertQuoteRevertsLikeReport(GENESIS_UID, openQueryId, 254, Multiverse.InvalidOutcome.selector);
+        _assertQuoteRevertsLikeReport(GENESIS_UID, reportedQueryId, 0, Multiverse.InvalidOutcome.selector);
+        _assertQuoteRevertsLikeReport(
+            GENESIS_UID, reportedQueryId, DEFAULT_NUMBER_OF_OUTCOMES + 1, Multiverse.InvalidOutcome.selector
+        );
+
+        // Restating the latest outcome is not an appeal.
+        _assertQuoteRevertsLikeReport(GENESIS_UID, reportedQueryId, OUTCOME_A, Multiverse.CannotStakeOnOutcome.selector);
+
+        // Past the appeal window the ladder is closed to appeals, though nobody has resolved it yet.
+        _warpPastAppealWindow(reportedQueryId);
+        _assertQuoteRevertsLikeReport(GENESIS_UID, reportedQueryId, OUTCOME_B, Multiverse.AppealPeriodOver.selector);
+        // The open query is still in its reporting window: both price and accept its first report.
+        multiverse.getNextRequiredStake(GENESIS_UID, openQueryId, OUTCOME_A);
+
+        // Past the reporting window the unreported query is expired.
+        _warpPastReportingWindow(openQueryId);
+        _assertQuoteRevertsLikeReport(GENESIS_UID, openQueryId, OUTCOME_A, Multiverse.QueryExpired.selector);
+
+        // Resolved here, on either path.
+        multiverse.resolve(GENESIS_UID, reportedQueryId);
+        multiverse.resolve(GENESIS_UID, openQueryId);
+        _assertQuoteRevertsLikeReport(GENESIS_UID, reportedQueryId, OUTCOME_B, Multiverse.QueryAlreadyResolved.selector);
+        _assertQuoteRevertsLikeReport(GENESIS_UID, openQueryId, OUTCOME_A, Multiverse.QueryAlreadyResolved.selector);
+    }
+
+    function test_GetNextRequiredStake_RevertsLikeReportInAForkedUniverse() public {
+        // A query still open when the genesis forks: the forked universe takes no reports, and quotes none.
+        uint256 openQueryId = _createDefaultQuery();
+        _forkGenesis();
+        _assertQuoteRevertsLikeReport(GENESIS_UID, openQueryId, OUTCOME_A, Multiverse.InvalidUniverseState.selector);
+    }
+
     function test_GetOutcomeStakes_EmptyForFreshQuery() public {
         // An existing query with no stakes yet reads as an empty side.
         uint256 queryId = _createDefaultQuery();
