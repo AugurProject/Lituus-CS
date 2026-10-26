@@ -3,6 +3,7 @@ pragma solidity ^0.8.35;
 
 import { IERC20Errors } from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 
+import { LituusRep } from "src/LituusRep.sol";
 import { Multiverse } from "src/Multiverse.sol";
 import { QueryTokenizer } from "src/QueryTokenizer.sol";
 import { ILituusRep } from "src/interfaces/ILituusRep.sol";
@@ -39,6 +40,22 @@ contract QueryTokenizerMigrateTest is QueryTokenizerFixtures {
         childRep.approve(address(tokenizer), type(uint256).max);
     }
 
+    /// @dev Forks child A on a query of its own (`user` migrates genesis wREP into it to pay and escalate) and
+    ///      spawns its child for OUTCOME_A, all at the current timestamp.
+    function _forkChildA() internal returns (uint248 grandchild) {
+        ILituusRep childRep = multiverse.repTokenOf(childA);
+        vm.prank(user);
+        multiverse.migrate(GENESIS_UID, OUTCOME_A, 200 ether);
+        vm.prank(user);
+        childRep.approve(address(multiverse), type(uint256).max);
+        uint256 queryId = multiverse.queryCount();
+        vm.prank(user);
+        multiverse.createQuery(childA, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
+        _escalateToFork(childA, queryId, user, user);
+        multiverse.spawnChildUniverse(childA, OUTCOME_A);
+        grandchild = _childId(childA, OUTCOME_A);
+    }
+
     /* ============================================== HAPPY PATHS =============================================== */
 
     function test_Migrate_HappyPath() public {
@@ -57,12 +74,34 @@ contract QueryTokenizerMigrateTest is QueryTokenizerFixtures {
     function test_Migrate_DeploysChildTokenOnFirstArrival() public {
         _mintAndFork();
         address predictedToken = vm.computeCreateAddress(address(tokenizer), vm.getNonce(address(tokenizer)));
+        uint256 migratedRep = tokenizer.pooledRep(GENESIS_UID) / MINTED;
 
+        // Emission order: the Multiverse's wallet migration, then the child token's deployment, then the
+        // tokenizer's migration (rate 1: shares and assets equal).
+        vm.expectEmit(true, true, true, true, address(multiverse));
+        emit Multiverse.Migrated(address(tokenizer), GENESIS_UID, childA, migratedRep);
         vm.expectEmit(true, true, true, true, address(tokenizer));
         emit QueryTokenizer.QueryTokenDeployed(childA, predictedToken);
-        _migrateTokens(user, OUTCOME_A, 1);
+        vm.expectEmit(true, true, true, true, address(tokenizer));
+        emit QueryTokenizer.QueryTokensMigrated(user, GENESIS_UID, childA, 1, migratedRep);
+        vm.prank(user);
+        tokenizer.migrate(GENESIS_UID, OUTCOME_A, 1);
 
-        assertEq(address(tokenizer.token(childA)), predictedToken);
+        IQueryToken childToken = tokenizer.token(childA);
+        assertEq(address(childToken), predictedToken);
+        // The state _migrateTokens would assert: the parent token burned and its pool share gone, the child
+        // token minted and the share pooled there (rate 1: the same amount), the vote counted.
+        uint256 oneQuery = tokenizer.ONE_QUERY();
+        assertEq(tokenizer.token(GENESIS_UID).balanceOf(user), (MINTED - 1) * oneQuery);
+        assertEq(tokenizer.token(GENESIS_UID).totalSupply(), (MINTED - 1) * oneQuery);
+        assertEq(tokenizer.pooledRep(GENESIS_UID), (MINTED - 1) * migratedRep);
+        assertEq(genesisRep.balanceOf(address(tokenizer)), (MINTED - 1) * migratedRep);
+        assertEq(childToken.balanceOf(user), oneQuery);
+        assertEq(childToken.totalSupply(), oneQuery);
+        assertEq(tokenizer.pooledRep(childA), migratedRep);
+        assertEq(multiverse.repTokenOf(childA).balanceOf(address(tokenizer)), migratedRep);
+        assertEq(_totalMigratedIn(childA), migratedRep);
+        assertEq(_totalMigratedOut(GENESIS_UID), migratedRep);
 
         // A second arrival reuses it.
         _migrateTokens(user, OUTCOME_A, 1);
@@ -210,7 +249,101 @@ contract QueryTokenizerMigrateTest is QueryTokenizerFixtures {
         assertEq(genesisRep.balanceOf(address(tokenizer)), 2.2 ether);
     }
 
+    function test_Migrate_IntoChildTokenDeployedByAMint() public {
+        // A mint in child A deploys its token before anything arrives; the arrival reuses it and blends in.
+        _mintAndFork();
+        _fundInChild(bystander, childA, OUTCOME_A, 100 ether);
+        uint256 childPrice = tokenizer.mintPrice(childA);
+        vm.prank(bystander);
+        tokenizer.mint(childA, 1);
+        IQueryToken childToken = tokenizer.token(childA);
+
+        (uint256 migratedRep,) = _migrateTokens(user, OUTCOME_A, 2);
+
+        assertEq(address(tokenizer.token(childA)), address(childToken));
+        assertEq(childToken.totalSupply(), 3 * tokenizer.ONE_QUERY());
+        assertEq(tokenizer.pooledRep(childA), childPrice + migratedRep);
+        (uint256 price,) = _redeemTokenIn(childA, user);
+        assertEq(price, (childPrice + migratedRep) / 3);
+    }
+
+    function test_Migrate_ThroughNestedForks() public {
+        _mintAndFork();
+        _migrateTokens(user, OUTCOME_A, 1);
+        uint248 grandchild = _forkChildA();
+
+        // Child A forked: its tokens are frozen there like the genesis ones.
+        vm.prank(user);
+        vm.expectRevert(Multiverse.InvalidUniverseState.selector);
+        tokenizer.redeem(childA, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
+
+        // A genesis token still arrives in the already-forked child A...
+        _migrateTokens(user, OUTCOME_A, 1);
+        assertEq(tokenizer.token(childA).totalSupply(), 2 * tokenizer.ONE_QUERY());
+
+        // ...and both move on into the grandchild, where they redeem at the grandchild's average.
+        (uint256 migratedRep, uint256 grandchildShares) = _migrateTokensIn(childA, user, OUTCOME_A, 2);
+        assertEq(migratedRep, 2.2 ether);
+        assertEq(tokenizer.pooledRep(childA), 0);
+        assertEq(tokenizer.pooledRep(grandchild), grandchildShares);
+        (uint256 price,) = _redeemTokenIn(grandchild, user);
+        assertEq(price, grandchildShares / 2);
+    }
+
+    function test_Migrate_NestedWindowStaysOpenUntilParentResolves() public {
+        _mintAndFork();
+        _migrateTokens(user, OUTCOME_A, 2);
+        _forkChildA();
+
+        // Both windows are past their clock: the genesis one is closed, child A's stays open while the
+        // genesis fork is unresolved.
+        vm.warp(vm.getBlockTimestamp() + MIGRATION_DURATION);
+        vm.prank(user);
+        vm.expectRevert(Multiverse.MigrationWindowClosed.selector);
+        tokenizer.migrate(GENESIS_UID, OUTCOME_A, 1);
+        _migrateTokensIn(childA, user, OUTCOME_A, 1);
+
+        // Once the genesis fork resolves, child A's window closes too.
+        multiverse.advanceForkState(GENESIS_UID);
+        vm.prank(user);
+        vm.expectRevert(Multiverse.MigrationWindowClosed.selector);
+        tokenizer.migrate(childA, OUTCOME_A, 1);
+    }
+
     /* ================================================ REVERTS ================================================= */
+
+    function test_RevertWhen_Migrate_ForkResolved() public {
+        _mintAndFork();
+        vm.warp(vm.getBlockTimestamp() + MIGRATION_DURATION);
+        multiverse.advanceForkState(GENESIS_UID);
+
+        vm.prank(user);
+        vm.expectRevert(Multiverse.InvalidUniverseState.selector);
+        tokenizer.migrate(GENESIS_UID, OUTCOME_A, 1);
+        assertEq(tokenizer.token(GENESIS_UID).balanceOf(user), MINTED * tokenizer.ONE_QUERY());
+        assertEq(tokenizer.pooledRep(GENESIS_UID), 3.3 ether);
+    }
+
+    function test_RevertWhen_Migrate_ShareRoundsToZeroChildShares() public {
+        // Pins a known edge: a 1 wei pool share, at a parent rate above 1, is worth less than one child share,
+        // so the child vault's wrap rejects it and the token cannot leave the forked universe.
+        feeCtl.setFee(1);
+        _mintTokens(user, 1);
+        assertEq(tokenizer.pooledRep(GENESIS_UID), 1);
+        feeCtl.setFee(DEFAULT_FEE);
+        vm.prank(user);
+        genesisRep.transfer(address(multiverse), 50 ether);
+        vm.prank(address(multiverse));
+        genesisRep.burnShares(50 ether);
+        _forkGenesis();
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
+
+        vm.prank(user);
+        vm.expectRevert(LituusRep.ZeroShares.selector);
+        tokenizer.migrate(GENESIS_UID, OUTCOME_A, 1);
+        assertEq(tokenizer.token(GENESIS_UID).balanceOf(user), tokenizer.ONE_QUERY());
+        assertEq(tokenizer.pooledRep(GENESIS_UID), 1);
+    }
 
     function test_RevertWhen_Migrate_ZeroAmount() public {
         _mintAndFork();

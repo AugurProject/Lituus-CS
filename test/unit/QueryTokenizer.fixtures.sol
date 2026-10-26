@@ -134,46 +134,59 @@ abstract contract QueryTokenizerFixtures is MultiverseFixtures {
     }
 
     /// @dev Migration fixture: `account` migrates `amount` whole genesis Query Tokens into the child of
-    ///      `outcome`, asserting what leaves the parent pool (floor(pooledRep / wholeSupply) × amount) and the
-    ///      tokenizer's parent wREP, the parent burn, the child wREP arriving at the parent's rate and being
-    ///      pooled, the child token balance/supply, the parent's and the child's migration counters, and the
-    ///      Migrated event.
-    /// @return migratedRep The parent wREP the migration took out of the pool.
-    /// @return childShares The child wREP it put into the child's pool.
+    ///      `outcome`. See `_migrateTokensIn`.
     function _migrateTokens(address account, uint256 outcome, uint256 amount)
         internal
         returns (uint256 migratedRep, uint256 childShares)
     {
-        uint248 childId = _childId(GENESIS_UID, outcome);
+        return _migrateTokensIn(GENESIS_UID, account, outcome, amount);
+    }
+
+    /// @dev Migration fixture: `account` migrates `amount` whole Query Tokens of `parentId` into the child of
+    ///      `outcome`, asserting what leaves the parent pool (floor(pooledRep / wholeSupply) × amount) and the
+    ///      tokenizer's parent wREP, the parent burn, the child wREP arriving at the parent's rate and being
+    ///      pooled, the child token balance/supply, the parent's and the child's migration counters, and the
+    ///      Multiverse's Migrated and the tokenizer's QueryTokensMigrated events.
+    /// @return migratedRep The parent wREP the migration took out of the pool.
+    /// @return childShares The child wREP it put into the child's pool.
+    function _migrateTokensIn(uint248 parentId, address account, uint256 outcome, uint256 amount)
+        internal
+        returns (uint256 migratedRep, uint256 childShares)
+    {
+        uint248 childId = _childId(parentId, outcome);
+        ILituusRep parentRep = multiverse.repTokenOf(parentId);
         ILituusRep childRep = multiverse.repTokenOf(childId);
-        IQueryToken parentToken = tokenizer.token(GENESIS_UID);
+        IQueryToken parentToken = tokenizer.token(parentId);
         uint256 wholeSupply = parentToken.totalSupply() / tokenizer.ONE_QUERY();
-        uint256 pooledBefore = tokenizer.pooledRep(GENESIS_UID);
+        uint256 pooledBefore = tokenizer.pooledRep(parentId);
         migratedRep = pooledBefore / wholeSupply * amount;
-        uint256 assets = genesisRep.convertToAssets(migratedRep);
+        uint256 assets = parentRep.convertToAssets(migratedRep);
         childShares = childRep.convertToShares(assets);
 
         uint256 parentBalanceBefore = parentToken.balanceOf(account);
         uint256 parentSupplyBefore = parentToken.totalSupply();
-        uint256 tokenizerParentRepBefore = genesisRep.balanceOf(address(tokenizer));
+        uint256 tokenizerParentRepBefore = parentRep.balanceOf(address(tokenizer));
         uint256 tokenizerChildRepBefore = childRep.balanceOf(address(tokenizer));
         uint256 childPooledBefore = tokenizer.pooledRep(childId);
         IQueryToken childTokenBefore = tokenizer.token(childId);
         uint256 childBalanceBefore = address(childTokenBefore) == address(0) ? 0 : childTokenBefore.balanceOf(account);
         uint256 childSupplyBefore = address(childTokenBefore) == address(0) ? 0 : childTokenBefore.totalSupply();
         uint128 migratedInBefore = _totalMigratedIn(childId);
-        uint128 migratedOutBefore = _totalMigratedOut(GENESIS_UID);
+        uint128 migratedOutBefore = _totalMigratedOut(parentId);
 
+        // Emission order: the Multiverse's wallet migration (the tokenizer is the holder), then the tokenizer.
+        vm.expectEmit(true, true, true, true, address(multiverse));
+        emit Multiverse.Migrated(address(tokenizer), parentId, childId, assets);
         vm.expectEmit(true, true, true, true, address(tokenizer));
-        emit QueryTokenizer.Migrated(account, GENESIS_UID, childId, amount, migratedRep);
+        emit QueryTokenizer.QueryTokensMigrated(account, parentId, childId, amount, migratedRep);
         vm.prank(account);
-        tokenizer.migrate(GENESIS_UID, outcome, amount);
+        tokenizer.migrate(parentId, outcome, amount);
 
         uint256 migratedWei = amount * tokenizer.ONE_QUERY();
         assertEq(parentToken.balanceOf(account), parentBalanceBefore - migratedWei);
         assertEq(parentToken.totalSupply(), parentSupplyBefore - migratedWei);
-        assertEq(tokenizer.pooledRep(GENESIS_UID), pooledBefore - migratedRep);
-        assertEq(genesisRep.balanceOf(address(tokenizer)), tokenizerParentRepBefore - migratedRep);
+        assertEq(tokenizer.pooledRep(parentId), pooledBefore - migratedRep);
+        assertEq(parentRep.balanceOf(address(tokenizer)), tokenizerParentRepBefore - migratedRep);
 
         IQueryToken childToken = tokenizer.token(childId);
         assertTrue(address(childToken) != address(0));
@@ -183,7 +196,7 @@ abstract contract QueryTokenizerFixtures is MultiverseFixtures {
         assertEq(tokenizer.pooledRep(childId), childPooledBefore + childShares);
 
         assertEq(_totalMigratedIn(childId), migratedInBefore + assets);
-        assertEq(_totalMigratedOut(GENESIS_UID), migratedOutBefore + assets);
+        assertEq(_totalMigratedOut(parentId), migratedOutBefore + assets);
     }
 
     function _totalMigratedIn(uint248 universeId) internal view returns (uint128 migratedIn) {

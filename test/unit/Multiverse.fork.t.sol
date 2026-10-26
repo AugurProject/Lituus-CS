@@ -436,6 +436,44 @@ contract MultiverseForkTest is MultiverseFixtures {
         assertEq(totalMigratedOut, 301 ether);
     }
 
+    function test_Migrate_EmitsMigratedAndReturnsChildShares() public {
+        // A burn before the fork moves the genesis rate above 1, so assets differ from shares.
+        vm.prank(user);
+        genesisRep.transfer(address(multiverse), 50 ether);
+        vm.prank(address(multiverse));
+        genesisRep.burnShares(50 ether);
+        _forkGenesis();
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
+        uint248 child1 = _childId(GENESIS_UID, OUTCOME_A);
+        ILituusRep child1Rep = multiverse.repTokenOf(child1);
+
+        // The child opens at the parent's rate; a burn in the child moves its rate above that, so child shares
+        // differ from both.
+        vm.prank(bystander);
+        multiverse.migrate(GENESIS_UID, OUTCOME_A, 100 ether);
+        vm.prank(bystander);
+        child1Rep.transfer(address(multiverse), 50 ether);
+        vm.prank(address(multiverse));
+        child1Rep.burnShares(50 ether);
+
+        uint256 shares = 100 ether;
+        uint256 assets = genesisRep.convertToAssets(shares);
+        uint256 expectedChildShares = child1Rep.convertToShares(assets);
+        // assets, parent shares and child shares are all different
+        assertGt(assets, shares);
+        assertLt(expectedChildShares, shares);
+
+        vm.expectEmit(true, true, true, true, address(multiverse));
+        emit Multiverse.Migrated(user, GENESIS_UID, child1, assets);
+        vm.prank(user);
+        (uint248 childUniverseId, uint256 childShares) = multiverse.migrate(GENESIS_UID, OUTCOME_A, shares);
+
+        // The return values name the child and what was credited to the caller there.
+        assertEq(childUniverseId, child1);
+        assertEq(childShares, expectedChildShares);
+        assertEq(child1Rep.balanceOf(user), childShares);
+    }
+
     function test_Migrate_Reverts() public {
         // Only forking universes accept migration.
         vm.prank(user);

@@ -247,6 +247,8 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     event ResolverRewardPaid(
         address indexed resolver, uint248 indexed universeId, uint256 indexed queryId, uint256 amount
     );
+    // Wallet wREP migrated out of a forking universe into one of its children, counted as a vote in `assets`.
+    event Migrated(address indexed holder, uint248 indexed universeId, uint248 indexed childUniverseId, uint256 assets);
     // A stake claimed out of a forked universe into one of its children, paid in the child's wREP.
     event StakeMigrated(
         address indexed staker,
@@ -2012,6 +2014,8 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
 
         // Count the vote in underlying assets (what actually flowed through Lituus).
         _countMigration(universe, childUniverse, childUniverseId, assets);
+
+        emit Migrated(msg.sender, universeId, childUniverseId, assets);
     }
 
     /**

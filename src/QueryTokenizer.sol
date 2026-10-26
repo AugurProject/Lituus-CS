@@ -68,7 +68,7 @@ contract QueryTokenizer is ReentrancyGuard, IQueryTokenizer {
     event QueryTokenDeployed(uint248 indexed universeId, address token);
     event Minted(address indexed minter, uint248 indexed universeId, uint256 amount, uint256 cost);
     event Redeemed(address indexed redeemer, uint248 indexed universeId, uint256 price);
-    event Migrated(
+    event QueryTokensMigrated(
         address indexed holder,
         uint248 indexed parentUniverseId,
         uint248 indexed childUniverseId,
@@ -182,7 +182,7 @@ contract QueryTokenizer is ReentrancyGuard, IQueryTokenizer {
 
         IQueryToken childToken = _getOrDeployToken(childUniverseId);
         childToken.mint(msg.sender, amount * ONE_QUERY);
-        emit Migrated(msg.sender, parentUniverseId, childUniverseId, amount, migratedRep);
+        emit QueryTokensMigrated(msg.sender, parentUniverseId, childUniverseId, amount, migratedRep);
     }
 
     /* ================================================ INTERNALS ================================================ */
