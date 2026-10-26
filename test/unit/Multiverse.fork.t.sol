@@ -614,22 +614,6 @@ contract MultiverseForkTest is MultiverseFixtures {
 
     /* ======================================= QUERY FLOW ACROSS FORKS ======================================== */
 
-    /// @dev The scalar resolution record of a query in an arbitrary universe (the fixtures'
-    ///      _resolution is genesis-keyed).
-    function _resolutionIn(uint248 universeId, uint256 queryId) internal view returns (ResolutionView memory r) {
-        (
-            r.queryCreateTime,
-            r.lastStakeTime,
-            r.stakeCount,
-            r.totalStaked,
-            r.noOfOutcomesAtCap,
-            r.cap,
-            r.forkBurn,
-            r.outcome,
-            r.lastReportedOutcome
-        ) = multiverse.queryResolutions(universeId, queryId);
-    }
-
     function test_QueryFlow_ExpiredBeforeForkRestartsInChildren() public {
         // A query expires unreported (window lapses at t0 + 3d, nobody resolves it) before the genesis
         // forks: the fork reopens it. Each child gets a FULL window clocked from the fork, and a second

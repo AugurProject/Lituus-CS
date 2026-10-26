@@ -27,4 +27,13 @@ interface IMultiverse {
 
     /// @notice The Lituus REP token for a universe (what the QueryTokenizer pools and pays fees in).
     function repTokenOf(uint248 universeId) external view returns (ILituusRep);
+
+    /// @notice Migrates `shares` of the caller's wREP from a forking universe into the child of `outcome`,
+    ///         counted as a migration vote for that child. Only while the universe's migration window is
+    ///         open and the child is spawned.
+    /// @return childUniverseId The child the wREP landed in.
+    /// @return childShares The child wREP credited to the caller.
+    function migrate(uint248 universeId, uint256 outcome, uint256 shares)
+        external
+        returns (uint248 childUniverseId, uint256 childShares);
 }

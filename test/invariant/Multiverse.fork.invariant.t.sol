@@ -2,33 +2,56 @@
 pragma solidity ^0.8.35;
 
 import { Multiverse } from "src/Multiverse.sol";
+import { QueryTokenizer } from "src/QueryTokenizer.sol";
+import { IMultiverse } from "src/interfaces/IMultiverse.sol";
+import { IQueryFeeController } from "src/interfaces/IQueryFeeController.sol";
+import { IQueryToken } from "src/interfaces/IQueryToken.sol";
 import { MultiverseDeployFixture } from "../unit/Multiverse.fixtures.sol";
 import { MultiverseForkHandler } from "./handlers/MultiverseForkHandler.sol";
 
-/// @notice Stateful fuzzing of a forked genesis: random sequences of spawn, migrate, stake settlements, time
-///         moves and the fork's resolution must keep the migration accounting consistent.
+/// @notice Stateful fuzzing of a forked genesis: random sequences of spawn, migrate, stake settlements, query
+///         token migrations and redemptions, time moves and the fork's resolution must keep the migration
+///         accounting consistent.
 /// @dev The genesis is forked in setUp on a query the three actors staked on (one of them on a third
 ///      outcome that never reaches the cap), next to a query resolved before the fork and one left open, so
 ///      every handler action has something to work with from the first call. The resolution burns before
 ///      the fork, so the parent's rate is above 1 throughout. The pot at the fork is pinned here, at face
 ///      value and as parked (net of Zoltar's burn on the fork bond), and the invariants hold the counters
-///      against them.
+///      against them. The real QueryTokenizer is wired in and every actor holds genesis query tokens minted
+///      before the fork; their pool is the tokenizer's, outside the pot.
 contract MultiverseForkInvariantTest is MultiverseDeployFixture {
     uint256 internal constant ACTOR_REP_BALANCE = 1000 ether;
     uint256 internal constant ACTOR_COUNT = 3;
+    uint256 internal constant TOKENS_PER_ACTOR = 2;
 
     MultiverseForkHandler internal handler;
+    QueryTokenizer internal tokenizer;
     address[] internal actors;
     uint256 internal forkQueryId;
     uint256 internal resolvedQueryId;
     uint256 internal openQueryId;
     uint256 internal potAtFork;
     uint256 internal parkedAtFork;
+    uint256 internal tokensAtFork;
+    uint256 internal poolAtFork;
+    uint256 internal averageAtFork;
 
     /// @dev 3200 ether (the actors' balances plus a 200 ether pool remainder) so the per-outcome cap is
     ///      32 ether and the default fee sits on the cap grid, like the functional suites.
     function _genesisSupply() internal pure override returns (uint256) {
         return ACTOR_COUNT * ACTOR_REP_BALANCE + 200 ether;
+    }
+
+    /// @dev Deploys the real tokenizer first, then the Multiverse pointing at it (Deploy.s.sol order).
+    function _deployMultiverse(IQueryFeeController controller) internal override returns (Multiverse) {
+        tokenizer = new QueryTokenizer();
+        return new Multiverse(
+            zoltar, GENESIS_UID, controller, address(tokenizer), MIGRATION_DURATION, REPORTING_PERIOD, APPEAL_PERIOD
+        );
+    }
+
+    function _afterProtocolDeploy() internal override {
+        tokenizer.setMultiverse(IMultiverse(address(multiverse)));
     }
 
     function setUp() public override {
@@ -37,8 +60,15 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
         for (uint256 i = 0; i < ACTOR_COUNT; ++i) {
             actors.push(makeAddr(string.concat("actor", vm.toString(i))));
             _fundWithRep(actors[i], ACTOR_REP_BALANCE);
+            vm.prank(actors[i]);
+            genesisRep.approve(address(tokenizer), type(uint256).max);
+            vm.prank(actors[i]);
+            tokenizer.mint(GENESIS_UID, TOKENS_PER_ACTOR);
         }
         assertEq(_capWrep(), 32 * DEFAULT_FEE);
+        tokensAtFork = ACTOR_COUNT * TOKENS_PER_ACTOR;
+        poolAtFork = tokenizer.pooledRep(GENESIS_UID);
+        averageAtFork = poolAtFork / tokensAtFork;
 
         // Two queries actor0 (A) and actor1 (B) ladder to 1 + 2. The first is resolved before the fork, B
         // winning, so actor1 is owed 2 plus 80% of actor0's 1 and actor0 nothing; the second stays open.
@@ -66,7 +96,7 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
         assertEq(potAtFork, parkedAtFork + forkThreshold / zoltar.FORK_BURN_DIVISOR());
 
         handler = new MultiverseForkHandler(
-            multiverse, zoltar, genesisRep, GENESIS_UID, forkQueryId, resolvedQueryId, openQueryId, actors
+            multiverse, tokenizer, zoltar, genesisRep, GENESIS_UID, forkQueryId, resolvedQueryId, openQueryId, actors
         );
         targetContract(address(handler));
     }
@@ -167,5 +197,69 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
         assertEq(
             multiverse.getUserStake(GENESIS_UID, resolvedQueryId, actors[0], OUTCOME_A), resolvedStaked - winnerStaked
         );
+    }
+
+    /// @dev The tokenizer holds no wREP outside its pools: in the parent and in every child the pool is its
+    ///      balance, and a child nothing arrived in has neither.
+    function invariant_TokenPoolsAreTheTokenizersBalances() public view {
+        assertEq(genesisRep.balanceOf(address(tokenizer)), tokenizer.pooledRep(GENESIS_UID));
+        for (uint256 i = 0; i < handler.outcomesLength(); ++i) {
+            uint256 outcome = handler.outcomeAt(i);
+            uint248 childId = handler.childOf(outcome);
+            if (!handler.ghostSpawned(outcome)) {
+                assertEq(tokenizer.pooledRep(childId), 0);
+                assertEq(address(tokenizer.token(childId)), address(0));
+                continue;
+            }
+            assertEq(multiverse.repTokenOf(childId).balanceOf(address(tokenizer)), tokenizer.pooledRep(childId));
+        }
+    }
+
+    /// @dev Migration moves query rights, never makes or loses any: the parent keeps what did not leave, each
+    ///      child holds what arrived less what was redeemed there, and all of it adds up to what was minted.
+    function invariant_QueryRightsAreConserved() public view {
+        uint256 oneQuery = tokenizer.ONE_QUERY();
+        uint256 parentSupply = tokenizer.token(GENESIS_UID).totalSupply();
+        assertEq(parentSupply, (tokensAtFork - handler.ghostTokensMigrated()) * oneQuery);
+        uint256 childSupplies;
+        for (uint256 i = 0; i < handler.outcomesLength(); ++i) {
+            uint256 outcome = handler.outcomeAt(i);
+            IQueryToken childToken = tokenizer.token(handler.childOf(outcome));
+            if (address(childToken) == address(0)) continue;
+            childSupplies += childToken.totalSupply();
+        }
+        assertEq(parentSupply + childSupplies, (tokensAtFork - handler.ghostTokensRedeemed()) * oneQuery);
+    }
+
+    /// @dev Nothing enters the parent pool after the fork and every token leaves with the floored average, so
+    ///      the pool is what it was less what left, and the average the stayers see never drops below the one
+    ///      at the fork (the dust concentrating on them is under one wei per token minted).
+    function invariant_ParentPoolOnlyDrainsAtTheAverage() public view {
+        uint256 pool = tokenizer.pooledRep(GENESIS_UID);
+        assertEq(pool, poolAtFork - handler.ghostParentPoolMigrated());
+        uint256 remaining = tokensAtFork - handler.ghostTokensMigrated();
+        if (remaining == 0) {
+            assertLt(pool, tokensAtFork);
+            return;
+        }
+        assertGe(pool / remaining, averageAtFork);
+        assertLt(pool / remaining, averageAtFork + tokensAtFork);
+    }
+
+    /// @dev Each child's pool is what the migrations brought in less what the redemptions paid out of it, and
+    ///      it backs only tokens that arrived by migration; the last token redeemed takes the whole pool.
+    function invariant_ChildPoolsMatchArrivalsAndRedemptions() public view {
+        uint256 oneQuery = tokenizer.ONE_QUERY();
+        for (uint256 i = 0; i < handler.outcomesLength(); ++i) {
+            uint256 outcome = handler.outcomeAt(i);
+            uint248 childId = handler.childOf(outcome);
+            assertEq(
+                tokenizer.pooledRep(childId), handler.ghostChildPoolIn(outcome) - handler.ghostChildPoolOut(outcome)
+            );
+            IQueryToken childToken = tokenizer.token(childId);
+            uint256 supply = address(childToken) == address(0) ? 0 : childToken.totalSupply();
+            assertLe(supply, handler.ghostTokensMigratedInto(outcome) * oneQuery);
+            if (supply == 0) assertEq(tokenizer.pooledRep(childId), 0);
+        }
     }
 }

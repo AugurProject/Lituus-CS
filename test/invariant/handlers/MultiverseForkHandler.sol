@@ -6,12 +6,14 @@ import { StdUtils } from "forge-std/StdUtils.sol";
 import { StdCheats } from "forge-std/StdCheats.sol";
 
 import { Multiverse } from "src/Multiverse.sol";
+import { QueryTokenizer } from "src/QueryTokenizer.sol";
 import { ILituusRep } from "src/interfaces/ILituusRep.sol";
+import { IQueryToken } from "src/interfaces/IQueryToken.sol";
 import { MockZoltar } from "src/mock/MockZoltar.sol";
 
-/// @notice Handler for stateful fuzzing of a forked universe: spawning children, migrating wallet wREP,
-///         settling the forking query's stakes and the other queries' stakes into the children, moving
-///         time, and resolving the fork.
+/// @notice Handler for stateful fuzzing of a forked universe: spawning children, migrating wallet wREP and
+///         query tokens, settling the forking query's stakes and the other queries' stakes into the children,
+///         redeeming query tokens where they landed, moving time, and resolving the fork.
 /// @dev    The invariant test forks the genesis on a query the actors staked on, next to a query resolved
 ///         before the fork and one left open, before handing over to the runner. Every action guards its
 ///         own preconditions (window, state, child spawned, balance, stake left) and no-ops instead of
@@ -25,8 +27,12 @@ contract MultiverseForkHandler is CommonBase, StdCheats, StdUtils {
     uint256 internal constant MAX_TIME_ADVANCE = 10 days;
     // Smallest wallet migration: with the rate above 1, dust rounds to zero child shares and the wrap reverts.
     uint256 internal constant MIN_MIGRATION = 1 gwei;
+    // What a redeemed child query token is spent on.
+    string internal constant QUESTION = "John Doe's pet?[CAT,DOG,SHARK]";
+    uint8 internal constant NUMBER_OF_OUTCOMES = 3;
 
     Multiverse public immutable MULTIVERSE;
+    QueryTokenizer public immutable TOKENIZER;
     MockZoltar public immutable ZOLTAR;
     ILituusRep public immutable REP;
     uint248 public immutable GENESIS_UID;
@@ -52,9 +58,18 @@ contract MultiverseForkHandler is CommonBase, StdCheats, StdUtils {
     uint248 public ghostWinner;
     mapping(uint256 outcome => bool) public ghostSpawned;
     mapping(uint256 outcome => uint256) public ghostMigratedInto;
+    // Query tokens: whole tokens that left the parent and what they took out of its pool (parent shares), per
+    // child what arrived in its pool and what redemptions paid out of it (child shares), tokens redeemed.
+    uint256 public ghostTokensMigrated;
+    uint256 public ghostParentPoolMigrated;
+    uint256 public ghostTokensRedeemed;
+    mapping(uint256 outcome => uint256) public ghostTokensMigratedInto;
+    mapping(uint256 outcome => uint256) public ghostChildPoolIn;
+    mapping(uint256 outcome => uint256) public ghostChildPoolOut;
 
     constructor(
         Multiverse multiverse_,
+        QueryTokenizer tokenizer_,
         MockZoltar zoltar_,
         ILituusRep rep_,
         uint248 genesisUid_,
@@ -64,6 +79,7 @@ contract MultiverseForkHandler is CommonBase, StdCheats, StdUtils {
         address[] memory actors_
     ) {
         MULTIVERSE = multiverse_;
+        TOKENIZER = tokenizer_;
         ZOLTAR = zoltar_;
         REP = rep_;
         GENESIS_UID = genesisUid_;
@@ -261,6 +277,68 @@ contract MultiverseForkHandler is CommonBase, StdCheats, StdUtils {
         ghostStakeVotes += vote;
         ghostOpenStakesRefunded += amount;
         ghostMigratedInto[childOutcome] += vote;
+    }
+
+    /// @notice Migrate some of a random actor's genesis query tokens into a random spawned child. The pool
+    ///         share they take along is a wallet migration out of the tokenizer, counted like one. Rejected
+    ///         like every counted lane once the window closed or the fork resolved.
+    function migrateQueryTokens(uint256 actorSeed, uint256 outcomeSeed, uint256 amountSeed) external {
+        uint256 outcome = outcomes[bound(outcomeSeed, 0, outcomes.length - 1)];
+        if (!ghostSpawned[outcome]) return;
+        address actor = actors[bound(actorSeed, 0, actors.length - 1)];
+        IQueryToken parentToken = TOKENIZER.token(GENESIS_UID);
+        uint256 oneQuery = TOKENIZER.ONE_QUERY();
+        uint256 held = parentToken.balanceOf(actor) / oneQuery;
+        if (held == 0) return;
+        uint256 amount = bound(amountSeed, 1, held);
+        if (ghostResolved || !_windowOpen()) {
+            vm.prank(actor);
+            try TOKENIZER.migrate(GENESIS_UID, outcome, amount) {
+                revert("migrateQueryTokens: landed after the migration window");
+            } catch { }
+            return;
+        }
+
+        uint248 childId = childOf(outcome);
+        uint256 migratedRep = TOKENIZER.pooledRep(GENESIS_UID) / (parentToken.totalSupply() / oneQuery) * amount;
+        uint256 childPoolBefore = TOKENIZER.pooledRep(childId);
+        vm.prank(actor);
+        TOKENIZER.migrate(GENESIS_UID, outcome, amount);
+
+        // The child pool grows by the share converted through the two vaults, and the child tokens are minted.
+        uint256 arrived = TOKENIZER.pooledRep(childId) - childPoolBefore;
+        require(
+            arrived == _childSharesFor(MULTIVERSE.repTokenOf(childId), migratedRep),
+            "migrateQueryTokens: child pool differs from the share"
+        );
+
+        uint256 assets = REP.convertToAssets(migratedRep);
+        ghostWalletMigrated += assets;
+        ghostMigratedInto[outcome] += assets;
+        ghostTokensMigrated += amount;
+        ghostParentPoolMigrated += migratedRep;
+        ghostTokensMigratedInto[outcome] += amount;
+        ghostChildPoolIn[outcome] += arrived;
+    }
+
+    /// @notice Redeem one of a random actor's child query tokens into a query in that child, at that pool's
+    ///         average. The children stay Active throughout, so this lane never closes.
+    function redeemChildToken(uint256 actorSeed, uint256 outcomeSeed) external {
+        uint256 outcome = outcomes[bound(outcomeSeed, 0, outcomes.length - 1)];
+        if (!ghostSpawned[outcome]) return;
+        uint248 childId = childOf(outcome);
+        IQueryToken childToken = TOKENIZER.token(childId);
+        if (address(childToken) == address(0)) return;
+        address actor = actors[bound(actorSeed, 0, actors.length - 1)];
+        uint256 oneQuery = TOKENIZER.ONE_QUERY();
+        if (childToken.balanceOf(actor) < oneQuery) return;
+
+        uint256 price = TOKENIZER.pooledRep(childId) / (childToken.totalSupply() / oneQuery);
+        vm.prank(actor);
+        TOKENIZER.redeem(childId, QUESTION, NUMBER_OF_OUTCOMES);
+
+        ghostTokensRedeemed += 1;
+        ghostChildPoolOut[outcome] += price;
     }
 
     /// @notice Resolve the fork once the window closed. No-ops before that or if already resolved.
