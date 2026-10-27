@@ -247,6 +247,8 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     event ResolverRewardPaid(
         address indexed resolver, uint248 indexed universeId, uint256 indexed queryId, uint256 amount
     );
+    // Wallet wREP migrated out of a forking universe into one of its children, counted as a vote in `assets`.
+    event Migrated(address indexed holder, uint248 indexed universeId, uint248 indexed childUniverseId, uint256 assets);
     // A stake claimed out of a forked universe into one of its children, paid in the child's wREP.
     event StakeMigrated(
         address indexed staker,
@@ -1988,10 +1990,17 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * @param universeId The forking universe to migrate out of.
      * @param outcome The forking query's outcome whose child to migrate into, as passed to spawnChildUniverse.
      * @param shares The amount of the caller's parent wREP shares to migrate.
+     * @return childUniverseId The child the wREP landed in.
+     * @return childShares The child wREP credited to the caller.
      */
-    function migrate(uint248 universeId, uint256 outcome, uint256 shares) external nonReentrant {
-        (Universe storage universe, Universe storage childUniverse, uint248 childUniverseId) =
-            _migrationTarget(universeId, outcome);
+    function migrate(uint248 universeId, uint256 outcome, uint256 shares)
+        external
+        nonReentrant
+        returns (uint248 childUniverseId, uint256 childShares)
+    {
+        Universe storage universe;
+        Universe storage childUniverse;
+        (universe, childUniverse, childUniverseId) = _migrationTarget(universeId, outcome);
 
         // Burn the caller's parent wREP and take the underlying (pause-exempt, rate-preserving
         // owner lane — the forked vault is permanently unwrap-paused).
@@ -2000,11 +2009,13 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         ZOLTAR.addRepToMigrationBalance(universeId, assets);
         ZOLTAR.splitMigrationRep(universeId, assets, outcome);
         // Wrap it into the child vault (pulls via the spawn-time approval) and credit the caller.
-        uint256 childShares = childUniverse.repToken.wrap(address(this), assets);
+        childShares = childUniverse.repToken.wrap(address(this), assets);
         childUniverse.repToken.safeTransfer(msg.sender, childShares);
 
         // Count the vote in underlying assets (what actually flowed through Lituus).
         _countMigration(universe, childUniverse, childUniverseId, assets);
+
+        emit Migrated(msg.sender, universeId, childUniverseId, assets);
     }
 
     /**

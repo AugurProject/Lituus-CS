@@ -436,6 +436,44 @@ contract MultiverseForkTest is MultiverseFixtures {
         assertEq(totalMigratedOut, 301 ether);
     }
 
+    function test_Migrate_EmitsMigratedAndReturnsChildShares() public {
+        // A burn before the fork moves the genesis rate above 1, so assets differ from shares.
+        vm.prank(user);
+        genesisRep.transfer(address(multiverse), 50 ether);
+        vm.prank(address(multiverse));
+        genesisRep.burnShares(50 ether);
+        _forkGenesis();
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
+        uint248 child1 = _childId(GENESIS_UID, OUTCOME_A);
+        ILituusRep child1Rep = multiverse.repTokenOf(child1);
+
+        // The child opens at the parent's rate; a burn in the child moves its rate above that, so child shares
+        // differ from both.
+        vm.prank(bystander);
+        multiverse.migrate(GENESIS_UID, OUTCOME_A, 100 ether);
+        vm.prank(bystander);
+        child1Rep.transfer(address(multiverse), 50 ether);
+        vm.prank(address(multiverse));
+        child1Rep.burnShares(50 ether);
+
+        uint256 shares = 100 ether;
+        uint256 assets = genesisRep.convertToAssets(shares);
+        uint256 expectedChildShares = child1Rep.convertToShares(assets);
+        // assets, parent shares and child shares are all different
+        assertGt(assets, shares);
+        assertLt(expectedChildShares, shares);
+
+        vm.expectEmit(true, true, true, true, address(multiverse));
+        emit Multiverse.Migrated(user, GENESIS_UID, child1, assets);
+        vm.prank(user);
+        (uint248 childUniverseId, uint256 childShares) = multiverse.migrate(GENESIS_UID, OUTCOME_A, shares);
+
+        // The return values name the child and what was credited to the caller there.
+        assertEq(childUniverseId, child1);
+        assertEq(childShares, expectedChildShares);
+        assertEq(child1Rep.balanceOf(user), childShares);
+    }
+
     function test_Migrate_Reverts() public {
         // Only forking universes accept migration.
         vm.prank(user);
@@ -613,22 +651,6 @@ contract MultiverseForkTest is MultiverseFixtures {
     }
 
     /* ======================================= QUERY FLOW ACROSS FORKS ======================================== */
-
-    /// @dev The scalar resolution record of a query in an arbitrary universe (the fixtures'
-    ///      _resolution is genesis-keyed).
-    function _resolutionIn(uint248 universeId, uint256 queryId) internal view returns (ResolutionView memory r) {
-        (
-            r.queryCreateTime,
-            r.lastStakeTime,
-            r.stakeCount,
-            r.totalStaked,
-            r.noOfOutcomesAtCap,
-            r.cap,
-            r.forkBurn,
-            r.outcome,
-            r.lastReportedOutcome
-        ) = multiverse.queryResolutions(universeId, queryId);
-    }
 
     function test_QueryFlow_ExpiredBeforeForkRestartsInChildren() public {
         // A query expires unreported (window lapses at t0 + 3d, nobody resolves it) before the genesis

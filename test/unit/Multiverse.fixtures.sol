@@ -97,6 +97,11 @@ abstract contract MultiverseDeployFixture is Test {
     }
 
     function _resolution(uint256 queryId) internal view returns (ResolutionView memory r) {
+        return _resolutionIn(GENESIS_UID, queryId);
+    }
+
+    /// @dev The scalar resolution record of a query in an arbitrary universe.
+    function _resolutionIn(uint248 universeId, uint256 queryId) internal view returns (ResolutionView memory r) {
         (
             r.queryCreateTime,
             r.lastStakeTime,
@@ -107,7 +112,7 @@ abstract contract MultiverseDeployFixture is Test {
             r.forkBurn,
             r.outcome,
             r.lastReportedOutcome
-        ) = multiverse.queryResolutions(GENESIS_UID, queryId);
+        ) = multiverse.queryResolutions(universeId, queryId);
     }
 
     /// @dev The genesis universe's uncapped demand-inclusive query fee, read off the production

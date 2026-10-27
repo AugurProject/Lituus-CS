@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.35;
 
+import { ILituusRep } from "src/interfaces/ILituusRep.sol";
 import { QueryTokenizerFixtures } from "../unit/QueryTokenizer.fixtures.sol";
 
 /// @notice Fuzzed pool-accounting properties of the QueryTokenizer: deposits and redemptions
@@ -113,5 +114,115 @@ contract QueryTokenizerFuzzTest is QueryTokenizerFixtures {
         (uint256 price, uint256 queryId) = _redeemToken(user);
         (,, uint256 recordedFee,,) = multiverse.queries(queryId);
         assertEq(recordedFee, price);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                            FORK MIGRATION
+    //////////////////////////////////////////////////////////////*/
+    /// @dev Tokens minted at two fees (crossing the cap), the parent's rate possibly moved by a burn, then a
+    ///      fork with some tokens migrated into each child, a mint in one child at its own price and a
+    ///      redemption there. Across the fork: the parent pool gives up the migrated tokens' share rounded down,
+    ///      so its floored average can only rise, by at most a wei per migration, and the last tokens out empty
+    ///      it; what the children hold, in underlying, is what the parent gave up less the child
+    ///      vault's rounding (under 2 wei per migration: once into shares, once back); a child's average is the
+    ///      blend of what arrived and what was minted there; and every pool is exactly the tokenizer's wREP
+    ///      balance in that universe.
+    function testFuzz_Migrate_PoolsReconcileAcrossTheFork(
+        uint8 mintCount1,
+        uint8 mintCount2,
+        uint256 fee1,
+        uint256 fee2,
+        uint8 toA,
+        uint8 toB,
+        uint256 burnSeed,
+        uint8 childMints
+    ) public {
+        uint256 m1 = bound(mintCount1, 1, 3);
+        uint256 m2 = bound(mintCount2, 0, 3);
+        fee1 = bound(fee1, 0.01 ether, 60 ether);
+        fee2 = bound(fee2, 0.01 ether, 60 ether);
+        feeCtl.setFee(fee1);
+        uint256 deposited = _mintTokens(user, m1);
+        if (m2 > 0) {
+            feeCtl.setFee(fee2);
+            deposited += _mintTokens(user, m2);
+        }
+        uint256 minted = m1 + m2;
+        feeCtl.setFee(DEFAULT_FEE);
+
+        // A burn before the fork moves the parent's rate (the children open at it); zero keeps it at 1.
+        uint256 sharesToBurn = bound(burnSeed, 0, 100 ether);
+        if (sharesToBurn > 0) {
+            vm.prank(user);
+            genesisRep.transfer(address(multiverse), sharesToBurn);
+            vm.prank(address(multiverse));
+            genesisRep.burnShares(sharesToBurn);
+        }
+
+        _forkGenesis();
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_B);
+        uint248 childA = _childId(GENESIS_UID, OUTCOME_A);
+        uint248 childB = _childId(GENESIS_UID, OUTCOME_B);
+
+        uint256 a = bound(toA, 0, minted);
+        uint256 b = bound(toB, 0, minted - a);
+        uint256 averageBefore = _poolAverage(GENESIS_UID);
+        uint256 migrated;
+        uint256 givenUp;
+        uint256 received;
+        uint256 migrations;
+        if (a > 0) {
+            (uint256 migratedRep, uint256 childShares) = _migrateTokens(user, OUTCOME_A, a);
+            assertEq(migratedRep, deposited * a / minted);
+            migrated += migratedRep;
+            givenUp += genesisRep.convertToAssets(migratedRep);
+            received += multiverse.repTokenOf(childA).convertToAssets(childShares);
+            migrations++;
+        }
+        if (b > 0) {
+            // _migrateTokens asserts the share against the average read right before it.
+            (uint256 migratedRep, uint256 childShares) = _migrateTokens(user, OUTCOME_B, b);
+            migrated += migratedRep;
+            givenUp += genesisRep.convertToAssets(migratedRep);
+            received += multiverse.repTokenOf(childB).convertToAssets(childShares);
+            migrations++;
+        }
+        assertEq(tokenizer.pooledRep(GENESIS_UID), deposited - migrated);
+        // Rounding down what leaves favors the tokens that stay: their floored average cannot drop, and it
+        // rises by at most a wei per migration. Once every token left, nothing is left behind.
+        if (minted - a - b > 0) {
+            assertGe(_poolAverage(GENESIS_UID), averageBefore);
+            assertLe(_poolAverage(GENESIS_UID), averageBefore + migrations);
+        } else {
+            assertEq(tokenizer.pooledRep(GENESIS_UID), 0);
+        }
+        assertLe(received, givenUp);
+        assertApproxEqAbs(received, givenUp, 2 * migrations);
+
+        // A mint in child A at the child's own price blends into what arrived there.
+        uint256 childMintCount = bound(childMints, 0, 2);
+        uint256 childDeposited;
+        if (childMintCount > 0) {
+            ILituusRep childRepA = multiverse.repTokenOf(childA);
+            vm.prank(bystander);
+            multiverse.migrate(GENESIS_UID, OUTCOME_A, 100 ether);
+            vm.prank(bystander);
+            childRepA.approve(address(tokenizer), type(uint256).max);
+            childDeposited = tokenizer.mintPrice(childA) * childMintCount;
+            vm.prank(bystander);
+            tokenizer.mint(childA, childMintCount);
+        }
+        uint256 arrivedInA = tokenizer.pooledRep(childA) - childDeposited;
+        if (a + childMintCount > 0) {
+            assertEq(_poolAverage(childA), (arrivedInA + childDeposited) / (a + childMintCount));
+            (uint256 price,) = _redeemTokenIn(childA, a > 0 ? user : bystander);
+            assertEq(price, (arrivedInA + childDeposited) / (a + childMintCount));
+        }
+
+        // Solvency in every universe: the tokenizer's wREP balance IS the pool.
+        assertEq(genesisRep.balanceOf(address(tokenizer)), tokenizer.pooledRep(GENESIS_UID));
+        assertEq(multiverse.repTokenOf(childA).balanceOf(address(tokenizer)), tokenizer.pooledRep(childA));
+        assertEq(multiverse.repTokenOf(childB).balanceOf(address(tokenizer)), tokenizer.pooledRep(childB));
     }
 }
