@@ -149,6 +149,24 @@ contract QueryTokenizerMigrateTest is QueryTokenizerFixtures {
         assertEq(tokenizer.token(GENESIS_UID).totalSupply(), 0);
     }
 
+    function test_Migrate_AllTokensInOneBatchTakeTheWholePool() public {
+        _mintTokens(user, 1);
+        feeCtl.setFee(2 ether);
+        _mintTokens(user, 2);
+        feeCtl.setFee(DEFAULT_FEE);
+        _forkGenesis();
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
+
+        // 5.5 / 3 does not divide evenly, yet one batch of all three takes all the pool: 5.5 × 3 / 3.
+        // (Pricing the batch at the floored average, 3 × floor(5.5 / 3), would strand 1 wei.)
+        (uint256 migratedRep, uint256 childShares) = _migrateTokens(user, OUTCOME_A, 3);
+        assertEq(migratedRep, 5.5 ether);
+        assertEq(tokenizer.pooledRep(GENESIS_UID), 0);
+        assertEq(genesisRep.balanceOf(address(tokenizer)), 0);
+        assertEq(tokenizer.token(GENESIS_UID).totalSupply(), 0);
+        assertEq(tokenizer.pooledRep(_childId(GENESIS_UID, OUTCOME_A)), childShares);
+    }
+
     function test_Migrate_SplitAcrossChildren() public {
         uint256 mintCost = _mintAndFork();
 
