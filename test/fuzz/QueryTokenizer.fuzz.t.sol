@@ -121,8 +121,9 @@ contract QueryTokenizerFuzzTest is QueryTokenizerFixtures {
     //////////////////////////////////////////////////////////////*/
     /// @dev Tokens minted at two fees (crossing the cap), the parent's rate possibly moved by a burn, then a
     ///      fork with some tokens migrated into each child, a mint in one child at its own price and a
-    ///      redemption there. Across the fork: the parent pool gives up exactly the average per token and its
-    ///      average never moves; what the children hold, in underlying, is what the parent gave up less the child
+    ///      redemption there. Across the fork: the parent pool gives up the migrated tokens' share rounded down,
+    ///      so its floored average can only rise, by at most a wei per migration, and the last tokens out empty
+    ///      it; what the children hold, in underlying, is what the parent gave up less the child
     ///      vault's rounding (under 2 wei per migration: once into shares, once back); a child's average is the
     ///      blend of what arrived and what was minted there; and every pool is exactly the tokenizer's wREP
     ///      balance in that universe.
@@ -173,7 +174,7 @@ contract QueryTokenizerFuzzTest is QueryTokenizerFixtures {
         uint256 migrations;
         if (a > 0) {
             (uint256 migratedRep, uint256 childShares) = _migrateTokens(user, OUTCOME_A, a);
-            assertEq(migratedRep, averageBefore * a);
+            assertEq(migratedRep, deposited * a / minted);
             migrated += migratedRep;
             givenUp += genesisRep.convertToAssets(migratedRep);
             received += multiverse.repTokenOf(childA).convertToAssets(childShares);
@@ -188,11 +189,13 @@ contract QueryTokenizerFuzzTest is QueryTokenizerFixtures {
             migrations++;
         }
         assertEq(tokenizer.pooledRep(GENESIS_UID), deposited - migrated);
-        // Like a redemption run, a migration concentrates the floor dust on the tokens that stay: the floored
-        // average cannot drop, and the dust is under one wei per token minted.
+        // Rounding down what leaves favors the tokens that stay: their floored average cannot drop, and it
+        // rises by at most a wei per migration. Once every token left, nothing is left behind.
         if (minted - a - b > 0) {
             assertGe(_poolAverage(GENESIS_UID), averageBefore);
-            assertLt(_poolAverage(GENESIS_UID), averageBefore + minted);
+            assertLe(_poolAverage(GENESIS_UID), averageBefore + migrations);
+        } else {
+            assertEq(tokenizer.pooledRep(GENESIS_UID), 0);
         }
         assertLe(received, givenUp);
         assertApproxEqAbs(received, givenUp, 2 * migrations);

@@ -300,7 +300,7 @@ contract MultiverseForkHandler is CommonBase, StdCheats, StdUtils {
         }
 
         uint248 childId = childOf(outcome);
-        uint256 migratedRep = TOKENIZER.pooledRep(GENESIS_UID) / (parentToken.totalSupply() / oneQuery) * amount;
+        uint256 migratedRep = TOKENIZER.pooledRep(GENESIS_UID) * amount / (parentToken.totalSupply() / oneQuery);
         uint256 childPoolBefore = TOKENIZER.pooledRep(childId);
         vm.prank(actor);
         TOKENIZER.migrate(GENESIS_UID, outcome, amount);

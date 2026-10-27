@@ -35,12 +35,12 @@ interface IQueryTokenizer {
     /* ============================================= FORK MIGRATION ============================================== */
 
     /// @notice Migrates `amount` whole Query Tokens from a forked parent universe into the child of
-    ///         `childOutcome`: the parent tokens burn, their share of the pool (the pool average per
-    ///         token) leaves the parent through the Multiverse as a counted migration vote for the child,
-    ///         and the same number of the child's Query Tokens is minted to the caller.
+    ///         `childOutcome`: the parent tokens burn, their share of the pool (pooledRep × amount /
+    ///         wholeSupply) leaves the parent through the Multiverse as a counted migration vote for the
+    ///         child, and the same number of the child's Query Tokens is minted to the caller.
     /// @dev Query tokens are never forwarded to the heir: once a universe forks, minting and redeeming
-    ///      freeze there and migration is the only path to a child. Removing exactly the average per
-    ///      token leaves the parent's average unchanged for the holders who stay; what arrives joins the
+    ///      freeze there and migration is the only path to a child. The share is rounded down, so the
+    ///      holders who stay never lose and the last tokens out take the whole pool; what arrives joins the
     ///      child's pool in child wREP and blends with the child's own mints. Tokens not migrated inside
     ///      the window stay in the parent with their share of the pool, worthless. The parent's state,
     ///      the window and the child's existence are checked by the Multiverse (see Multiverse.migrate).
@@ -61,7 +61,7 @@ interface IQueryTokenizer {
 
     /// @notice The Lituus REP pooled in the universe, backing its outstanding query tokens.
     /// @dev Grows by the full mint cost on each mint and by what a migration brings in from the parent;
-    ///      shrinks by the per-token average on each redemption or migration out, so only mints (at new
-    ///      fees) and arrivals from a parent move the average.
+    ///      shrinks by the per-token average on each redemption and by the migrated tokens' share on each
+    ///      migration out, so only mints (at new fees) and arrivals from a parent move the average.
     function pooledRep(uint248 universeId) external view returns (uint256);
 }

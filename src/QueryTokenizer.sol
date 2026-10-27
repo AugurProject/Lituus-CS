@@ -30,9 +30,9 @@ import { QueryToken } from "./QueryToken.sol";
  *      Query tokens are universe-specific and are NEVER forwarded to the heir: once a universe forks,
  *      minting and redeeming freeze there (the oracle rejects non-current universes) and migration is the
  *      only path to a child. Inside the migration window a holder picks a child: the parent tokens burn,
- *      their share of the pool (the average per token) migrates through the Multiverse as a counted vote
- *      for that child, and the same number of the child's tokens is minted to the holder. Tokens not
- *      migrated stay in the parent with their share of the pool, worthless.
+ *      their share of the pool migrates through the Multiverse as a counted vote for that child, and the
+ *      same number of the child's tokens is minted to the holder. Tokens not migrated stay in the parent
+ *      with their share of the pool, worthless.
  */
 contract QueryTokenizer is ReentrancyGuard, IQueryTokenizer {
     using SafeERC20 for ILituusRep;
@@ -165,10 +165,10 @@ contract QueryTokenizer is ReentrancyGuard, IQueryTokenizer {
         uint256 wholeTokensTotalSupply = parentToken.totalSupply() / ONE_QUERY;
         if (wholeTokensTotalSupply == 0) revert NoWholeTokens();
 
-        // Each token takes the pool average with it, so the average left behind does not move (the
-        // floor dust stays pooled, as in redeem).
+        // The tokens take their share of the pool, rounded down: the holders who stay never lose, and the
+        // last tokens out take the whole pool with them (nothing sweeps a forked universe's pool later).
         uint256 pooledRepTokens = pooledRep[parentUniverseId];
-        uint256 migratedRep = pooledRepTokens / wholeTokensTotalSupply * amount;
+        uint256 migratedRep = pooledRepTokens * amount / wholeTokensTotalSupply;
 
         // Reverts with ERC20InsufficientBalance if the caller holds fewer whole tokens than `amount`.
         parentToken.burn(msg.sender, amount * ONE_QUERY);

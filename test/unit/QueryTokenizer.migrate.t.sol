@@ -128,7 +128,7 @@ contract QueryTokenizerMigrateTest is QueryTokenizerFixtures {
         assertEq(_poolAverage(GENESIS_UID), averageBefore);
     }
 
-    function test_Migrate_FloorDustStaysInParentPool() public {
+    function test_Migrate_LastTokensOutTakeTheWholePool() public {
         _mintTokens(user, 1);
         feeCtl.setFee(2 ether);
         _mintTokens(user, 2);
@@ -136,10 +136,16 @@ contract QueryTokenizerMigrateTest is QueryTokenizerFixtures {
         _forkGenesis();
         multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
 
-        // 5.5 / 3 floors to 1.833..3, so all three tokens leave 1 wei behind with nothing to claim it.
-        (uint256 migratedRep,) = _migrateTokens(user, OUTCOME_A, 3);
-        assertEq(migratedRep, 5.5 ether - 1);
-        assertEq(tokenizer.pooledRep(GENESIS_UID), 1);
+        // 5.5 / 3 floors, so the first token leaves a fraction of a wei behind for the two that stay...
+        uint256 pool = 5.5 ether;
+        (uint256 first,) = _migrateTokens(user, OUTCOME_A, 1);
+        assertEq(first, pool / 3);
+        assertEq(tokenizer.pooledRep(GENESIS_UID), pool - first);
+
+        // ...and the last two take everything that is left: nothing stays in a pool nobody can sweep.
+        (uint256 rest,) = _migrateTokens(user, OUTCOME_A, 2);
+        assertEq(rest, pool - first);
+        assertEq(tokenizer.pooledRep(GENESIS_UID), 0);
         assertEq(tokenizer.token(GENESIS_UID).totalSupply(), 0);
     }
 

@@ -231,19 +231,19 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
         assertEq(parentSupply + childSupplies, (tokensAtFork - handler.ghostTokensRedeemed()) * oneQuery);
     }
 
-    /// @dev Nothing enters the parent pool after the fork and every token leaves with the floored average, so
-    ///      the pool is what it was less what left, and the average the stayers see never drops below the one
-    ///      at the fork (the dust concentrating on them is under one wei per token minted).
-    function invariant_ParentPoolOnlyDrainsAtTheAverage() public view {
+    /// @dev Nothing enters the parent pool after the fork and every migration takes its share rounded down, so
+    ///      the pool is what it was less what left, the average the stayers see never drops below the one at the
+    ///      fork and rises by at most a wei per migration, and the last tokens out leave nothing behind.
+    function invariant_ParentPoolOnlyDrainsAtTheShare() public view {
         uint256 pool = tokenizer.pooledRep(GENESIS_UID);
         assertEq(pool, poolAtFork - handler.ghostParentPoolMigrated());
         uint256 remaining = tokensAtFork - handler.ghostTokensMigrated();
         if (remaining == 0) {
-            assertLt(pool, tokensAtFork);
+            assertEq(pool, 0);
             return;
         }
         assertGe(pool / remaining, averageAtFork);
-        assertLt(pool / remaining, averageAtFork + tokensAtFork);
+        assertLe(pool / remaining, averageAtFork + handler.ghostTokensMigrated());
     }
 
     /// @dev Each child's pool is what the migrations brought in less what the redemptions paid out of it, and

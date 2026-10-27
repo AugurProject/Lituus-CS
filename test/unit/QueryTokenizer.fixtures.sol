@@ -143,7 +143,7 @@ abstract contract QueryTokenizerFixtures is MultiverseFixtures {
     }
 
     /// @dev Migration fixture: `account` migrates `amount` whole Query Tokens of `parentId` into the child of
-    ///      `outcome`, asserting what leaves the parent pool (floor(pooledRep / wholeSupply) × amount) and the
+    ///      `outcome`, asserting what leaves the parent pool (pooledRep × amount / wholeSupply, floored) and the
     ///      tokenizer's parent wREP, the parent burn, the child wREP arriving at the parent's rate and being
     ///      pooled, the child token balance/supply, the parent's and the child's migration counters, and the
     ///      Multiverse's Migrated and the tokenizer's QueryTokensMigrated events.
@@ -159,7 +159,7 @@ abstract contract QueryTokenizerFixtures is MultiverseFixtures {
         IQueryToken parentToken = tokenizer.token(parentId);
         uint256 wholeSupply = parentToken.totalSupply() / tokenizer.ONE_QUERY();
         uint256 pooledBefore = tokenizer.pooledRep(parentId);
-        migratedRep = pooledBefore / wholeSupply * amount;
+        migratedRep = pooledBefore * amount / wholeSupply;
         uint256 assets = parentRep.convertToAssets(migratedRep);
         childShares = childRep.convertToShares(assets);
 
