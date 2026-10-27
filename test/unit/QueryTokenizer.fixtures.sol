@@ -4,6 +4,7 @@ pragma solidity ^0.8.35;
 import { Multiverse } from "src/Multiverse.sol";
 import { QueryToken } from "src/QueryToken.sol";
 import { QueryTokenizer } from "src/QueryTokenizer.sol";
+import { ILituusRep } from "src/interfaces/ILituusRep.sol";
 import { IMultiverse } from "src/interfaces/IMultiverse.sol";
 import { IQueryFeeController } from "src/interfaces/IQueryFeeController.sol";
 import { IQueryToken } from "src/interfaces/IQueryToken.sol";
@@ -21,7 +22,7 @@ abstract contract QueryTokenizerFixtures is MultiverseFixtures {
     // that aligns the fee with the cap grid), so MockZoltar's fork threshold is 3200 / 20 = 160 REP.
     // Half of it — the cap on both the tokenizer's mint price and the direct-path query fee — is
     // the single derivation every cap assertion builds on.
-    uint256 internal constant HALF_FORK_THRESHOLD = 80 ether;
+    uint256 internal constant HALF_FORK_THRESHOLD = 32 ether;
 
     QueryTokenizer internal tokenizer;
 
@@ -36,7 +37,9 @@ abstract contract QueryTokenizerFixtures is MultiverseFixtures {
     /// @dev Deploys the real tokenizer first, then the Multiverse pointing at it (Deploy.s.sol order).
     function _deployMultiverse(IQueryFeeController controller) internal override returns (Multiverse) {
         tokenizer = new QueryTokenizer();
-        return new Multiverse(zoltar, GENESIS_UID, controller, address(tokenizer));
+        return new Multiverse(
+            zoltar, GENESIS_UID, controller, address(tokenizer), MIGRATION_DURATION, REPORTING_PERIOD, APPEAL_PERIOD
+        );
     }
 
     /// @dev Completes the deploy wiring: the tokenizer learns the Multiverse address (once).
@@ -85,43 +88,132 @@ abstract contract QueryTokenizerFixtures is MultiverseFixtures {
     /// @return price The pool-average fee the redemption paid.
     /// @return queryId The id of the query the redemption created.
     function _redeemToken(address account) internal returns (uint256 price, uint256 queryId) {
-        IQueryToken queryToken = tokenizer.token(GENESIS_UID);
+        return _redeemTokenIn(GENESIS_UID, account);
+    }
+
+    /// @dev `_redeemToken` in any universe, in that universe's wREP.
+    function _redeemTokenIn(uint248 universeId, address account) internal returns (uint256 price, uint256 queryId) {
+        ILituusRep repToken = multiverse.repTokenOf(universeId);
+        IQueryToken queryToken = tokenizer.token(universeId);
         uint256 wholeSupply = queryToken.totalSupply() / tokenizer.ONE_QUERY();
-        uint256 pooledBefore = tokenizer.pooledRep(GENESIS_UID);
+        uint256 pooledBefore = tokenizer.pooledRep(universeId);
         price = pooledBefore / wholeSupply;
         queryId = multiverse.queryCount();
 
         uint256 balanceBefore = queryToken.balanceOf(account);
-        uint256 tokenizerRepBefore = genesisRep.balanceOf(address(tokenizer));
-        uint256 multiverseRepBefore = genesisRep.balanceOf(address(multiverse));
+        uint256 tokenizerRepBefore = repToken.balanceOf(address(tokenizer));
+        uint256 multiverseRepBefore = repToken.balanceOf(address(multiverse));
 
         // Emission order inside redeem(): the Multiverse emits QueryCreated, then the tokenizer
         // emits Redeemed.
         vm.expectEmit(true, true, true, true, address(multiverse));
-        emit Multiverse.QueryCreated(account, queryId, GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
+        emit Multiverse.QueryCreated(account, queryId, universeId, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
         vm.expectEmit(true, true, true, true, address(tokenizer));
-        emit QueryTokenizer.Redeemed(account, GENESIS_UID, price);
+        emit QueryTokenizer.Redeemed(account, universeId, price);
         vm.prank(account);
-        tokenizer.redeem(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
+        tokenizer.redeem(universeId, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
 
         assertEq(queryToken.balanceOf(account), balanceBefore - tokenizer.ONE_QUERY());
-        assertEq(tokenizer.pooledRep(GENESIS_UID), pooledBefore - price);
-        assertEq(genesisRep.balanceOf(address(tokenizer)), tokenizerRepBefore - price);
-        assertEq(genesisRep.balanceOf(address(multiverse)), multiverseRepBefore + price);
+        assertEq(tokenizer.pooledRep(universeId), pooledBefore - price);
+        assertEq(repToken.balanceOf(address(tokenizer)), tokenizerRepBefore - price);
+        assertEq(repToken.balanceOf(address(multiverse)), multiverseRepBefore + price);
 
         assertEq(multiverse.queryCount(), queryId + 1);
-        (uint8 numberOfOutcomes, uint248 originUniverse, uint256 fee, string memory question) =
+        (uint8 numberOfOutcomes, uint248 originUniverse, uint256 fee, string memory question,) =
             multiverse.queries(queryId);
         assertEq(numberOfOutcomes, DEFAULT_NUMBER_OF_OUTCOMES);
-        assertEq(originUniverse, GENESIS_UID);
+        assertEq(originUniverse, universeId);
         assertEq(fee, price);
         assertEq(question, DEFAULT_QUESTION);
 
-        ResolutionView memory r = _resolution(queryId);
+        ResolutionView memory r = _resolutionIn(universeId, queryId);
         uint48 queryCreateTime = r.queryCreateTime;
-        uint8 outcome = r.outcome;
+        uint256 outcome = r.outcome;
         assertEq(queryCreateTime, uint48(vm.getBlockTimestamp()));
         assertEq(outcome, multiverse.UNRESOLVED());
+    }
+
+    /// @dev Migration fixture: `account` migrates `amount` whole genesis Query Tokens into the child of
+    ///      `outcome`. See `_migrateTokensIn`.
+    function _migrateTokens(address account, uint256 outcome, uint256 amount)
+        internal
+        returns (uint256 migratedRep, uint256 childShares)
+    {
+        return _migrateTokensIn(GENESIS_UID, account, outcome, amount);
+    }
+
+    /// @dev Migration fixture: `account` migrates `amount` whole Query Tokens of `parentId` into the child of
+    ///      `outcome`, asserting what leaves the parent pool (pooledRep × amount / wholeSupply, floored) and the
+    ///      tokenizer's parent wREP, the parent burn, the child wREP arriving at the parent's rate and being
+    ///      pooled, the child token balance/supply, the parent's and the child's migration counters, and the
+    ///      Multiverse's Migrated and the tokenizer's QueryTokensMigrated events.
+    /// @return migratedRep The parent wREP the migration took out of the pool.
+    /// @return childShares The child wREP it put into the child's pool.
+    function _migrateTokensIn(uint248 parentId, address account, uint256 outcome, uint256 amount)
+        internal
+        returns (uint256 migratedRep, uint256 childShares)
+    {
+        uint248 childId = _childId(parentId, outcome);
+        ILituusRep parentRep = multiverse.repTokenOf(parentId);
+        ILituusRep childRep = multiverse.repTokenOf(childId);
+        IQueryToken parentToken = tokenizer.token(parentId);
+        uint256 wholeSupply = parentToken.totalSupply() / tokenizer.ONE_QUERY();
+        uint256 pooledBefore = tokenizer.pooledRep(parentId);
+        migratedRep = pooledBefore * amount / wholeSupply;
+        uint256 assets = parentRep.convertToAssets(migratedRep);
+        childShares = childRep.convertToShares(assets);
+
+        uint256 parentBalanceBefore = parentToken.balanceOf(account);
+        uint256 parentSupplyBefore = parentToken.totalSupply();
+        uint256 tokenizerParentRepBefore = parentRep.balanceOf(address(tokenizer));
+        uint256 tokenizerChildRepBefore = childRep.balanceOf(address(tokenizer));
+        uint256 childPooledBefore = tokenizer.pooledRep(childId);
+        IQueryToken childTokenBefore = tokenizer.token(childId);
+        uint256 childBalanceBefore = address(childTokenBefore) == address(0) ? 0 : childTokenBefore.balanceOf(account);
+        uint256 childSupplyBefore = address(childTokenBefore) == address(0) ? 0 : childTokenBefore.totalSupply();
+        uint128 migratedInBefore = _totalMigratedIn(childId);
+        uint128 migratedOutBefore = _totalMigratedOut(parentId);
+
+        // Emission order: the Multiverse's wallet migration (the tokenizer is the holder), then the tokenizer.
+        vm.expectEmit(true, true, true, true, address(multiverse));
+        emit Multiverse.Migrated(address(tokenizer), parentId, childId, assets);
+        vm.expectEmit(true, true, true, true, address(tokenizer));
+        emit QueryTokenizer.QueryTokensMigrated(account, parentId, childId, amount, migratedRep);
+        vm.prank(account);
+        tokenizer.migrate(parentId, outcome, amount);
+
+        uint256 migratedWei = amount * tokenizer.ONE_QUERY();
+        assertEq(parentToken.balanceOf(account), parentBalanceBefore - migratedWei);
+        assertEq(parentToken.totalSupply(), parentSupplyBefore - migratedWei);
+        assertEq(tokenizer.pooledRep(parentId), pooledBefore - migratedRep);
+        assertEq(parentRep.balanceOf(address(tokenizer)), tokenizerParentRepBefore - migratedRep);
+
+        IQueryToken childToken = tokenizer.token(childId);
+        assertTrue(address(childToken) != address(0));
+        assertEq(childToken.balanceOf(account), childBalanceBefore + migratedWei);
+        assertEq(childToken.totalSupply(), childSupplyBefore + migratedWei);
+        assertEq(childRep.balanceOf(address(tokenizer)), tokenizerChildRepBefore + childShares);
+        assertEq(tokenizer.pooledRep(childId), childPooledBefore + childShares);
+
+        assertEq(_totalMigratedIn(childId), migratedInBefore + assets);
+        assertEq(_totalMigratedOut(parentId), migratedOutBefore + assets);
+    }
+
+    function _totalMigratedIn(uint248 universeId) internal view returns (uint128 migratedIn) {
+        (,,,,,,, migratedIn,,,,,) = multiverse.universes(universeId);
+    }
+
+    function _totalMigratedOut(uint248 universeId) internal view returns (uint128 migratedOut) {
+        (,,,,,,,,,, migratedOut,,) = multiverse.universes(universeId);
+    }
+
+    function _favoriteChild(uint248 universeId) internal view returns (uint248 favoriteChild) {
+        (,,,,, favoriteChild,,,,,,,) = multiverse.universes(universeId);
+    }
+
+    /// @dev The average per whole token the universe's pool pays out, floored like redeem prices it.
+    function _poolAverage(uint248 universeId) internal view returns (uint256) {
+        return tokenizer.pooledRep(universeId) / (tokenizer.token(universeId).totalSupply() / tokenizer.ONE_QUERY());
     }
 
     /// @dev The QueryToken of the genesis universe, typed as the concrete contract.

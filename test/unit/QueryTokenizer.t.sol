@@ -328,15 +328,6 @@ contract QueryTokenizerTest is QueryTokenizerFixtures {
     }
 
     /*//////////////////////////////////////////////////////////////
-                                MIGRATE
-    //////////////////////////////////////////////////////////////*/
-    function test_RevertWhen_Migrate_NotImplemented() public {
-        vm.prank(user);
-        vm.expectRevert(QueryTokenizer.MigrationNotImplemented.selector);
-        tokenizer.migrate(GENESIS_UID, GENESIS_UID + 1, 1);
-    }
-
-    /*//////////////////////////////////////////////////////////////
                                QUERY TOKEN
     //////////////////////////////////////////////////////////////*/
     function test_QueryToken_Metadata() public {

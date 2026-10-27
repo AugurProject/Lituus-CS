@@ -23,9 +23,18 @@ interface IZoltar {
 
     function universes(uint248 universeId) external view returns (Universe memory);
 
+    /// @notice The universe's fork start time; zero means the universe has not forked.
+    function getForkTime(uint248 universeId) external view returns (uint256);
+
     function forkUniverse(uint248 universeId, uint256 questionId) external;
 
     function deployChild(uint248 universeId, uint256 outcomeIndex) external;
+
+    function addRepToMigrationBalance(uint248 universeId, uint256 amount) external;
+
+    function splitMigrationRep(uint248 universeId, uint256 amount, uint256 outcomeIndex) external;
+
+    function getMigrationRepBalance(address holder, uint248 universeId) external view returns (uint256);
 
     function zoltarQuestionData() external view returns (IZoltarQuestionData);
 }
@@ -47,4 +56,8 @@ interface IZoltarQuestionData {
         returns (uint256);
 
     function questions(uint256 questionId) external view returns (QuestionData memory);
+
+    function questionCreatedTimestamp(uint256 questionId) external view returns (uint256);
+
+    function isMalformedAnswerOption(uint256 questionId, uint256 answer) external view returns (bool);
 }

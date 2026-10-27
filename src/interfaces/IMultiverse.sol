@@ -6,7 +6,7 @@ import { ILituusRep } from "./ILituusRep.sol";
 /// @notice The subset of the Multiverse the QueryTokenizer (and deploy script) depend on.
 interface IMultiverse {
     /// @notice Creates a query paying a tokenizer-supplied price (the redeemed token's pooled average).
-    ///         Never forwards to the heir: reverts unless the universe itself is Active/Forming.
+    ///         Never forwards to the heir: reverts unless the universe itself is Active.
     ///         `creator` (the redeemer) is emitted as QueryCreated's creator.
     function createQueryFromTokenizer(
         uint248 universeId,
@@ -19,7 +19,7 @@ interface IMultiverse {
     /// @notice One-call mint pricing for the QueryTokenizer: the uncapped query fee (base × demand
     ///         modifier, read-only) and the fee cap (half the fork threshold), both in wREP, plus the
     ///         universe's wREP token. Never forwards to the heir: reverts unless the universe itself
-    ///         is Active/Forming.
+    ///         is Active.
     function getMintPricing(uint248 universeId)
         external
         view
@@ -27,4 +27,13 @@ interface IMultiverse {
 
     /// @notice The Lituus REP token for a universe (what the QueryTokenizer pools and pays fees in).
     function repTokenOf(uint248 universeId) external view returns (ILituusRep);
+
+    /// @notice Migrates `shares` of the caller's wREP from a forking universe into the child of `outcome`,
+    ///         counted as a migration vote for that child. Only while the universe's migration window is
+    ///         open and the child is spawned.
+    /// @return childUniverseId The child the wREP landed in.
+    /// @return childShares The child wREP credited to the caller.
+    function migrate(uint248 universeId, uint256 outcome, uint256 shares)
+        external
+        returns (uint248 childUniverseId, uint256 childShares);
 }
