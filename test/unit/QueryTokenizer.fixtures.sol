@@ -200,15 +200,15 @@ abstract contract QueryTokenizerFixtures is MultiverseFixtures {
     }
 
     function _totalMigratedIn(uint248 universeId) internal view returns (uint128 migratedIn) {
-        (,,,,,,, migratedIn,,,,,) = multiverse.universes(universeId);
+        (,,,,,,, migratedIn,,,,,,) = multiverse.universes(universeId);
     }
 
     function _totalMigratedOut(uint248 universeId) internal view returns (uint128 migratedOut) {
-        (,,,,,,,,,, migratedOut,,) = multiverse.universes(universeId);
+        (,,,,,,,,,, migratedOut,,,) = multiverse.universes(universeId);
     }
 
     function _favoriteChild(uint248 universeId) internal view returns (uint248 favoriteChild) {
-        (,,,,, favoriteChild,,,,,,,) = multiverse.universes(universeId);
+        (,,,,, favoriteChild,,,,,,,,) = multiverse.universes(universeId);
     }
 
     /// @dev The average per whole token the universe's pool pays out, floored like redeem prices it.

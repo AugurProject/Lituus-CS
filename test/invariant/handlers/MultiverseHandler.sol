@@ -36,6 +36,9 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
     // Per-call time-advance ceiling: two appeal windows, so runs explore both live and
     // expired reporting/appeal windows without instantly killing every query.
     uint256 internal constant MAX_TIME_ADVANCE = 2 days;
+    // Tip bounds: the same span as the fee, so tips range from dust to well above the fee.
+    uint256 internal constant MIN_TIP = 1;
+    uint256 internal constant MAX_TIP = 1e21;
 
     Multiverse public immutable MULTIVERSE;
     MockQueryFeeController public immutable FEE_CTL;
@@ -51,12 +54,15 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
     uint256 public ghostTotalStaked;
     uint256 public ghostTotalPaidOut;
     uint256 public ghostTotalBurned;
+    uint256 public ghostTotalTips;
+    uint256 public ghostTipsPlaced;
     uint256 public ghostReportsPlaced;
     uint256 public ghostResolvesPerformed;
     uint256 public ghostClaimsPerformed;
     uint256 public ghostNow;
     mapping(uint256 queryId => uint256) public ghostQueryCreateTime;
     mapping(uint256 queryId => uint256) public ghostQueryFee;
+    mapping(uint256 queryId => uint256) public ghostQueryTips;
     mapping(uint256 queryId => uint256) public ghostStakeCount;
     mapping(uint256 queryId => uint256) public ghostQueryStaked;
     mapping(uint256 queryId => uint256) public ghostLastOutcome;
@@ -70,6 +76,7 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
     mapping(uint256 queryId => uint256) public ghostResolvedOutcome;
     mapping(uint256 queryId => mapping(uint256 stakeIndex => bool)) public ghostClaimed;
     mapping(address actor => uint256) public ghostActorStaked;
+    mapping(address actor => uint256) public ghostActorTipped;
     mapping(address actor => uint256) public ghostActorReceived;
 
     constructor(
@@ -111,9 +118,30 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
         ghostTotalFees += chargedFee;
     }
 
+    /// @notice Tip an existing query as a random actor. No-ops when no tip can land (nothing created yet, the
+    ///         query already resolved or reported, its reporting window expired, or the actor cannot afford it).
+    function tip(uint256 querySeed, uint256 amountSeed, uint256 actorSeed) external {
+        if (ghostQueriesCreated == 0) return;
+        uint256 queryId = bound(querySeed, 0, ghostQueriesCreated - 1);
+        if (ghostResolved[queryId] || ghostStakeCount[queryId] != 0) return;
+        if (ghostNow > ghostQueryCreateTime[queryId] + MULTIVERSE.REPORTING_PERIOD()) return;
+
+        uint256 amount = bound(amountSeed, MIN_TIP, MAX_TIP);
+        address actor = actors[bound(actorSeed, 0, actors.length - 1)];
+        if (REP.balanceOf(actor) < amount) return;
+
+        vm.prank(actor);
+        MULTIVERSE.tip(GENESIS_UID, queryId, amount);
+
+        ++ghostTipsPlaced;
+        ghostQueryTips[queryId] += amount;
+        ghostActorTipped[actor] += amount;
+        ghostTotalTips += amount;
+    }
+
     /// @dev The time of the latest stake on a query, read off the resolution record.
     function _lastStakeTime(uint256 queryId) internal view returns (uint256 lastStakeTime) {
-        (, lastStakeTime,,,,,,,) = MULTIVERSE.queryResolutions(GENESIS_UID, queryId);
+        (, lastStakeTime,,,,,,,,) = MULTIVERSE.queryResolutions(GENESIS_UID, queryId);
     }
 
     /// @notice Report on an existing query as a random actor, with a valid outcome that differs
@@ -156,7 +184,7 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
         // A stake that lands the second outcome on the cap forks the universe inside report(), and every
         // later call on the genesis would revert. The fork flow has its own suite; this ladder stops one
         // step short of it.
-        (,,,, uint8 outcomesAtCap, uint96 cap,,,) = MULTIVERSE.queryResolutions(GENESIS_UID, queryId);
+        (,,,, uint8 outcomesAtCap, uint96 cap,,,,) = MULTIVERSE.queryResolutions(GENESIS_UID, queryId);
         uint256 outcomeStaked = MULTIVERSE.getOutcomeStakes(GENESIS_UID, queryId, outcome).totalOutcomeStaked;
         if (outcomesAtCap == 1 && outcomeStaked + requiredStake == cap) return;
 
@@ -227,7 +255,8 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
         // resolve() burns the whole profit from the multiverse balance, so the balance drop
         // splits into destroyed shares (the supply drop) and transfers to recipients. The reward
         // ramp only moves value between the two streams: whatever the fee did not pay out was
-        // burned, so their sum is pinned exactly, independently of the ramp.
+        // burned, so their sum is pinned exactly, independently of the ramp. The tips are paid out
+        // in full on top, never burned.
         uint256 burned = supplyBefore - REP.totalSupply();
         uint256 expectedLosers;
         for (uint256 i = 0; i < stakeCount; ++i) {
@@ -240,9 +269,14 @@ contract MultiverseHandler is CommonBase, StdCheats, StdUtils {
         uint256 paidOut = multiverseBalanceBefore - REP.balanceOf(address(MULTIVERSE)) - burned;
         uint256 autoSettledBond = stakeCount == 1 ? ghostStakeAmount[queryId][0] : 0;
         require(
-            burned + paidOut == ghostQueryFee[queryId] + expectedLosers / MULTIVERSE.BURN_DIVIDER() + autoSettledBond,
+            burned + paidOut
+                == ghostQueryFee[queryId] + expectedLosers / MULTIVERSE.BURN_DIVIDER() + autoSettledBond
+                    + ghostQueryTips[queryId],
             "resolveQuery: burn + outflow mismatch"
         );
+        // The tips are paid out, never burned: the recipient's inflow is its fee share plus the auto-settled bond
+        // plus every tip, and the fee share is its only part that can be zero.
+        require(paidOut >= ghostQueryTips[queryId] + autoSettledBond, "resolveQuery: tips not paid in full");
 
         // Only the expected recipient may gain REP; everyone else's balance must be untouched.
         for (uint256 i = 0; i < actors.length; ++i) {

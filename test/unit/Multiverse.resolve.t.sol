@@ -55,7 +55,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
 
         // resolverPay = 1e18 / 2 = 0.5e18 (see happy path); INVALID = max-uint.
         vm.expectEmit(true, true, true, true, address(multiverse));
-        emit Multiverse.ResolverRewardPaid(user, GENESIS_UID, queryId, 0.5 ether);
+        emit Multiverse.ResolverRewardPaid(user, GENESIS_UID, queryId, 0.5 ether, 0);
         vm.expectEmit(true, true, true, true, address(multiverse));
         emit Multiverse.QueryResolved(user, GENESIS_UID, queryId, multiverse.INVALID());
 
@@ -212,7 +212,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
         // reporterPay = 1e18 / 2 = 0.5e18; StakeClaimed carries only the stake refund
         // (1 ether), so the fee reward is not added to the claim payouts.
         vm.expectEmit(true, true, true, true, address(multiverse));
-        emit Multiverse.ReporterRewardPaid(user, GENESIS_UID, queryId, 0.5 ether);
+        emit Multiverse.ReporterRewardPaid(user, GENESIS_UID, queryId, 0.5 ether, 0);
         vm.expectEmit(true, true, true, true, address(multiverse));
         emit Multiverse.StakeClaimed(user, GENESIS_UID, queryId, 1 ether);
         vm.expectEmit(true, true, true, true, address(multiverse));
@@ -258,7 +258,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
         uint256 userBalanceBefore = genesisRep.balanceOf(user);
 
         vm.expectEmit(true, true, true, true, address(multiverse));
-        emit Multiverse.ReporterRewardPaid(user, GENESIS_UID, queryId, 0);
+        emit Multiverse.ReporterRewardPaid(user, GENESIS_UID, queryId, 0, 0);
 
         _resolve(bystander, queryId);
 
@@ -275,7 +275,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
 
         // reporterPay = fee * elapsed / REPORTING_PERIOD = 1e18 / 2 = 0.5e18
         vm.expectEmit(true, true, true, true, address(multiverse));
-        emit Multiverse.ReporterRewardPaid(user, GENESIS_UID, queryId, 0.5 ether);
+        emit Multiverse.ReporterRewardPaid(user, GENESIS_UID, queryId, 0.5 ether, 0);
 
         uint256 userBalanceBefore = genesisRep.balanceOf(user);
         uint256 bystanderBalanceBefore = genesisRep.balanceOf(bystander);
@@ -296,7 +296,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
         _warpPastAppealWindow(queryId);
 
         vm.expectEmit(true, true, true, true, address(multiverse));
-        emit Multiverse.ReporterRewardPaid(user, GENESIS_UID, queryId, 1 ether);
+        emit Multiverse.ReporterRewardPaid(user, GENESIS_UID, queryId, 1 ether, 0);
 
         uint256 userBalanceBefore = genesisRep.balanceOf(user);
         uint256 bystanderBalanceBefore = genesisRep.balanceOf(bystander);
@@ -323,7 +323,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
         // The winning outcome's first stake landed 18 hours after creation: 1/4 of the ramp elapsed
         // reporterPay = fee * elapsed / REPORTING_PERIOD = 1e18 / 4 = 1e18 * 64800 / 259200 = 0.25e18
         vm.expectEmit(true, true, true, true, address(multiverse));
-        emit Multiverse.ReporterRewardPaid(bystander, GENESIS_UID, queryId, 0.25 ether);
+        emit Multiverse.ReporterRewardPaid(bystander, GENESIS_UID, queryId, 0.25 ether, 0);
 
         uint256 outcome = _resolve(challenger, queryId);
         assertEq(outcome, OUTCOME_B);
@@ -365,7 +365,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
         // The fee reward goes to the FIRST reporter of the winning outcome (user, not challenger),
         // ramped from user's stake time: reporterPay = 1e18 * 1/4 = 0.25e18
         vm.expectEmit(true, true, true, true, address(multiverse));
-        emit Multiverse.ReporterRewardPaid(user, GENESIS_UID, queryId, 0.25 ether);
+        emit Multiverse.ReporterRewardPaid(user, GENESIS_UID, queryId, 0.25 ether, 0);
 
         uint256 userBalanceBeforeResolve = genesisRep.balanceOf(user);
         uint256 multiverseBalanceBeforeResolve = genesisRep.balanceOf(address(multiverse));
@@ -428,7 +428,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
         // which would pay 11/12 of the fee instead):
         // reporterPay = fee * elapsed / REPORTING_PERIOD = 1e18 * 1/4 = 0.25e18
         vm.expectEmit(true, true, true, true, address(multiverse));
-        emit Multiverse.ReporterRewardPaid(user, GENESIS_UID, queryId, 0.25 ether);
+        emit Multiverse.ReporterRewardPaid(user, GENESIS_UID, queryId, 0.25 ether, 0);
 
         uint256 outcome = _resolve(bystander, queryId);
         assertEq(outcome, OUTCOME_A);
@@ -455,7 +455,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
 
         // reporterPay = fee * elapsed / REPORTING_PERIOD = 4e18 * 64800 / 259200 = 1e18
         vm.expectEmit(true, true, true, true, address(multiverse));
-        emit Multiverse.ReporterRewardPaid(bystander, GENESIS_UID, queryId, 1 ether);
+        emit Multiverse.ReporterRewardPaid(bystander, GENESIS_UID, queryId, 1 ether, 0);
 
         uint256 outcome = _resolve(challenger, queryId);
         assertEq(outcome, OUTCOME_B);
@@ -479,7 +479,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
         // The winning stake landed 3 days + 19 hours after creation — past the ramp end, so the
         // reward is capped at the whole 1 ether fee instead of fee * elapsed / REPORTING_PERIOD.
         vm.expectEmit(true, true, true, true, address(multiverse));
-        emit Multiverse.ReporterRewardPaid(bystander, GENESIS_UID, queryId, 1 ether);
+        emit Multiverse.ReporterRewardPaid(bystander, GENESIS_UID, queryId, 1 ether, 0);
 
         _resolve(user, queryId);
     }
@@ -595,7 +595,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
         uint256 challengerBalanceBefore = genesisRep.balanceOf(challenger);
 
         vm.expectEmit(true, true, true, true, address(multiverse));
-        emit Multiverse.ReporterRewardPaid(challenger, GENESIS_UID, queryId, 0.5 ether);
+        emit Multiverse.ReporterRewardPaid(challenger, GENESIS_UID, queryId, 0.5 ether, 0);
         assertEq(_resolve(bystander, queryId), OUTCOME_B);
 
         // The reward is pushed at resolve; user reported first but on the losing side and gets nothing.
@@ -628,7 +628,7 @@ contract MultiverseResolveTest is MultiverseFixtures {
         uint256 bystanderBalanceBefore = genesisRep.balanceOf(bystander);
 
         vm.expectEmit(true, true, true, true, address(multiverse));
-        emit Multiverse.ReporterRewardPaid(bystander, GENESIS_UID, queryId, DEFAULT_FEE);
+        emit Multiverse.ReporterRewardPaid(bystander, GENESIS_UID, queryId, DEFAULT_FEE, 0);
         assertEq(_resolve(challenger, queryId), OUTCOME_C);
         assertEq(genesisRep.balanceOf(bystander), bystanderBalanceBefore + DEFAULT_FEE);
 

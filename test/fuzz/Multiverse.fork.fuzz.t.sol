@@ -101,7 +101,7 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
     ///      plus the return the capped outcomes get, everything above the cap less what Zoltar burned of the
     ///      fork bond, over the cap. The same in every child.
     function _expectedChildPayout(uint256 queryId, uint256 amount) internal view returns (uint256) {
-        (,,, uint96 totalStaked,, uint96 cap, uint96 forkBurn,,) = multiverse.queryResolutions(GENESIS_UID, queryId);
+        (,,, uint96 totalStaked,, uint96 cap, uint96 forkBurn,,,) = multiverse.queryResolutions(GENESIS_UID, queryId);
         uint256 distributable = uint256(totalStaked) - cap - forkBurn;
         return amount + amount * distributable / cap;
     }
@@ -151,9 +151,9 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
         uint256 forkThreshold = zoltar.getForkThreshold(GENESIS_UID);
 
         (uint256 queryId, uint256[4][3] memory staked) = _buildRandomForkingLadder(seed);
-        (,,, uint96 totalStaked,,,,,) = multiverse.queryResolutions(GENESIS_UID, queryId);
+        (,,, uint96 totalStaked,,,,,,) = multiverse.queryResolutions(GENESIS_UID, queryId);
         uint256 parked = zoltar.getMigrationRepBalance(address(multiverse), GENESIS_UID);
-        (,,,,,,,,,,,, uint128 unmigratedBefore) = multiverse.universes(GENESIS_UID);
+        (,,,,,,,,,,,, uint128 unmigratedBefore,) = multiverse.universes(GENESIS_UID);
         // The pot is carried at face value; what is parked is the pot less Zoltar's burn on the bond.
         assertEq(unmigratedBefore, parked + _forkBurn(forkThreshold));
 
@@ -170,7 +170,7 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
 
         // The stakes left the supply as counted migration at face value; what stays is the forking query's
         // fee. The burn is accounted on the record, not here.
-        (,,,,,,,,,, uint128 totalOut,, uint128 unmigratedAfter) = multiverse.universes(GENESIS_UID);
+        (,,,,,,,,,, uint128 totalOut,, uint128 unmigratedAfter,) = multiverse.universes(GENESIS_UID);
         assertEq(totalOut, totalStaked);
         assertEq(unmigratedAfter, unmigratedBefore - totalStaked);
         assertEq(unmigratedAfter, fee);
@@ -196,7 +196,7 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
         uint256 bondShares = genesisRep.convertToSharesUp(forkThreshold);
 
         (uint256 queryId, uint256[4][3] memory staked) = _buildRandomForkingLadder(seed);
-        (,,, uint96 totalStaked,, uint96 cap, uint96 forkBurn,,) = multiverse.queryResolutions(GENESIS_UID, queryId);
+        (,,, uint96 totalStaked,, uint96 cap, uint96 forkBurn,,,) = multiverse.queryResolutions(GENESIS_UID, queryId);
         assertEq(cap, genesisRep.convertToSharesUp(supply / multiverse.CAP_DIVISOR()));
         assertGe(totalStaked, 2 * uint256(cap));
         assertGe(totalStaked, bondShares);
@@ -206,7 +206,7 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
         assertEq(underlying.balanceOf(address(multiverse)), 0);
         assertEq(genesisRep.balanceOf(address(multiverse)), 0);
         uint256 parked = zoltar.getMigrationRepBalance(address(multiverse), GENESIS_UID);
-        (,,,,,,,,,,,, uint128 unmigratedBefore) = multiverse.universes(GENESIS_UID);
+        (,,,,,,,,,,,, uint128 unmigratedBefore,) = multiverse.universes(GENESIS_UID);
         assertEq(unmigratedBefore, parked + _forkBurn(forkThreshold));
         assertEq(forkBurn, genesisRep.convertToSharesUp(_forkBurn(forkThreshold)));
 
@@ -214,7 +214,7 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
         for (uint256 o = 0; o < outcomes.length; o++) {
             assertLe(zoltar.splitPerChild(address(multiverse), GENESIS_UID, outcomes[o]), parked);
         }
-        (,,,,,,,,,, uint128 totalOut,, uint128 unmigratedAfter) = multiverse.universes(GENESIS_UID);
+        (,,,,,,,,,, uint128 totalOut,, uint128 unmigratedAfter,) = multiverse.universes(GENESIS_UID);
         assertEq(totalOut, principalAssets);
         assertEq(unmigratedAfter, unmigratedBefore - principalAssets);
     }
@@ -276,7 +276,7 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
 
         vm.warp(vm.getBlockTimestamp() + multiverse.APPEAL_PERIOD() + 1);
         for (uint256 q = 0; q < SIDE_QUERIES; q++) {
-            (,, uint16 stakeCount,,,,,,) = multiverse.queryResolutions(GENESIS_UID, side[q].id);
+            (,, uint16 stakeCount,,,,,,,) = multiverse.queryResolutions(GENESIS_UID, side[q].id);
             if (stakeCount == 0 || uint256(keccak256(abi.encode(seed, "resolve", q))) % 2 == 0) continue;
             vm.prank(resolver);
             multiverse.resolve(GENESIS_UID, side[q].id);
@@ -297,7 +297,7 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
     ///      other stake comes back as it was. Returns the votes added to each child, indexed like `outcomes`.
     function _settleSideStakes(SideQuery[] memory side, uint256 seed) internal returns (uint256[4] memory votes) {
         for (uint256 q = 0; q < side.length; q++) {
-            (,,, uint96 totalStaked,,,, uint256 winner,) = multiverse.queryResolutions(GENESIS_UID, side[q].id);
+            (,,, uint96 totalStaked,,,, uint256 winner,,) = multiverse.queryResolutions(GENESIS_UID, side[q].id);
             for (uint256 r = 0; r < reporters.length; r++) {
                 for (uint256 o = 0; o < outcomes.length; o++) {
                     uint256 amount = side[q].staked[r][o];
@@ -346,7 +346,7 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
 
         (uint256 forkQueryId, uint256[4][3] memory forkStaked) = _buildRandomForkingLadder(seed);
         uint256 parked = zoltar.getMigrationRepBalance(address(multiverse), GENESIS_UID);
-        (,,,,,,,,,,,, uint128 unmigratedBefore) = multiverse.universes(GENESIS_UID);
+        (,,,,,,,,,,,, uint128 unmigratedBefore,) = multiverse.universes(GENESIS_UID);
         assertEq(unmigratedBefore, parked + _forkBurn(forkThreshold));
 
         uint256 totalVotes = _claimEveryStakeInEveryChild(forkQueryId, forkStaked);
@@ -358,12 +358,12 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
             for (uint256 r = 0; r < reporters.length; r++) {
                 forkVotes += genesisRep.convertToAssets(forkStaked[r][o]);
             }
-            (,,,,,,, uint128 totalIn,,,,,) = multiverse.universes(_childId(GENESIS_UID, outcomes[o]));
+            (,,,,,,, uint128 totalIn,,,,,,) = multiverse.universes(_childId(GENESIS_UID, outcomes[o]));
             assertEq(totalIn, forkVotes + sideVotes[o]);
             totalVotes += sideVotes[o];
             assertLe(zoltar.splitPerChild(address(multiverse), GENESIS_UID, outcomes[o]), parked);
         }
-        (,,,,,,,,,, uint128 totalOut,, uint128 unmigratedAfter) = multiverse.universes(GENESIS_UID);
+        (,,,,,,,,,, uint128 totalOut,, uint128 unmigratedAfter,) = multiverse.universes(GENESIS_UID);
         assertEq(totalOut, totalVotes);
         assertEq(unmigratedAfter, unmigratedBefore - totalVotes);
 

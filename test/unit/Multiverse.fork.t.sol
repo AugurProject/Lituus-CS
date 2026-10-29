@@ -54,7 +54,7 @@ contract MultiverseForkTest is MultiverseFixtures {
     }
 
     function _unmigratedSupply(uint248 universeId) internal view returns (uint128 supply) {
-        (,,,,,,,,,,,, supply) = multiverse.universes(universeId);
+        (,,,,,,,,,,,, supply,) = multiverse.universes(universeId);
     }
 
     /* ============================================= FORK TRIGGER ============================================= */
@@ -76,7 +76,7 @@ contract MultiverseForkTest is MultiverseFixtures {
             uint128 forkQuery,
             uint128 totalMigratedOut,
             uint128 totalQueryFees,
-            uint128 unmigratedSupply
+            uint128 unmigratedSupply,
         ) = multiverse.universes(GENESIS_UID);
         assertEq(uint8(universeState), uint8(Multiverse.UniverseState.Migration));
         assertEq(forkTime, uint48(vm.getBlockTimestamp()));
@@ -229,7 +229,7 @@ contract MultiverseForkTest is MultiverseFixtures {
             bool isCanonical,
             uint248 parent,,,,,
             uint128 forkQuery,,
-            uint128 childQueryFees,
+            uint128 childQueryFees,,
         ) = multiverse.universes(child1);
         // Children spawn Active: fully functional immediately, no activation step.
         assertEq(uint8(universeState), uint8(Multiverse.UniverseState.Active));
@@ -261,7 +261,7 @@ contract MultiverseForkTest is MultiverseFixtures {
 
     /// @dev A helper for the query-fee read (field 12 of the Universe struct).
     function _totalQueryFees(uint248 universeId) internal view returns (uint128 fees) {
-        (,,,,,,,,,,, fees,) = multiverse.universes(universeId);
+        (,,,,,,,,,,, fees,,) = multiverse.universes(universeId);
     }
 
     function test_PotMigration_FeeFundsInheritedQueryResolutionInChildren() public {
@@ -279,7 +279,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         assertEq(_totalQueryFees(child1), DEFAULT_FEE);
         assertEq(_totalQueryFees(child2), DEFAULT_FEE);
         assertEq(multiverse.repTokenOf(child1).totalAssets(), DEFAULT_FEE);
-        (,,,,,,, uint128 totalIn,,, uint128 totalOut,,) = multiverse.universes(GENESIS_UID);
+        (,,,,,,, uint128 totalIn,,, uint128 totalOut,,,) = multiverse.universes(GENESIS_UID);
         assertEq(totalIn, 0);
         assertEq(totalOut, 0);
 
@@ -403,36 +403,36 @@ contract MultiverseForkTest is MultiverseFixtures {
         ILituusRep child1Rep = multiverse.repTokenOf(child1);
         assertEq(child1Rep.balanceOf(user), 100 ether); // rate parity: same share count
 
-        (,,,,, uint248 favoriteChild,, uint128 totalIn1, uint128 maxOut,,,,) = multiverse.universes(child1);
+        (,,,,, uint248 favoriteChild,, uint128 totalIn1, uint128 maxOut,,,,,) = multiverse.universes(child1);
         assertEq(totalIn1, 100 ether);
-        (,,,,, favoriteChild,,, maxOut,,,,) = multiverse.universes(GENESIS_UID);
+        (,,,,, favoriteChild,,, maxOut,,,,,) = multiverse.universes(GENESIS_UID);
         assertEq(maxOut, 100 ether);
         assertEq(favoriteChild, child1);
 
         // challenger outvotes into child2: the running max flips (strict >).
         vm.prank(challenger);
         multiverse.migrate(GENESIS_UID, OUTCOME_B, 150 ether);
-        (,,,,, favoriteChild,,, maxOut,,,,) = multiverse.universes(GENESIS_UID);
+        (,,,,, favoriteChild,,, maxOut,,,,,) = multiverse.universes(GENESIS_UID);
         assertEq(maxOut, 150 ether);
         assertEq(favoriteChild, child2);
 
         // An equal amount does NOT flip the winner: first-to-reach holds it.
         vm.prank(user);
         multiverse.migrate(GENESIS_UID, OUTCOME_A, 50 ether);
-        (,,,,, favoriteChild,,, maxOut,,,,) = multiverse.universes(GENESIS_UID);
+        (,,,,, favoriteChild,,, maxOut,,,,,) = multiverse.universes(GENESIS_UID);
         assertEq(maxOut, 150 ether);
         assertEq(favoriteChild, child2);
 
         // Adding to previously leading child does flip the winner: the running max is strict >.
         vm.prank(user);
         multiverse.migrate(GENESIS_UID, OUTCOME_A, 1 ether);
-        (,,,,, favoriteChild,,, maxOut,,,,) = multiverse.universes(GENESIS_UID);
+        (,,,,, favoriteChild,,, maxOut,,,,,) = multiverse.universes(GENESIS_UID);
         assertEq(maxOut, 151 ether);
         assertEq(favoriteChild, child1);
 
         // The parent's outflow counter accumulates every migration: the live electorate measure
         // (the 2/3 denominator and the SR max supply, read at the end of migration).
-        (,,,,,,,,,, uint128 totalMigratedOut,,) = multiverse.universes(GENESIS_UID);
+        (,,,,,,,,,, uint128 totalMigratedOut,,,) = multiverse.universes(GENESIS_UID);
         assertEq(totalMigratedOut, 301 ether);
     }
 
@@ -527,7 +527,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         assertEq(uint8(_universeState(GENESIS_UID)), uint8(Multiverse.UniverseState.PostFork));
         assertTrue(genesisRep.unwrapPaused());
         assertEq(multiverse.canonicalHeir(), child2);
-        (,,, bool isCanonical,,,,,,,,,) = multiverse.universes(child2);
+        (,,, bool isCanonical,,,,,,,,,,) = multiverse.universes(child2);
         assertTrue(isCanonical);
 
         // Children need no per-child resolution: they have been Active since spawn (whether the
@@ -551,7 +551,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         // Each child answers the forking query its own way.
         assertEq(multiverse.getOutcome(child1, forkQueryId), OUTCOME_A);
         assertEq(multiverse.getOutcome(child2, forkQueryId), OUTCOME_B);
-        (,,,,, uint248 favoriteChild,,,,,,,) = multiverse.universes(GENESIS_UID);
+        (,,,,, uint248 favoriteChild,,,,,,,,) = multiverse.universes(GENESIS_UID);
         assertEq(favoriteChild, child2);
 
         // A freshly spawned child is query-functional while its parent is still mid-Migration.
@@ -634,7 +634,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         vm.warp(vm.getBlockTimestamp() + multiverse.MIGRATION_DURATION());
         multiverse.advanceForkState(GENESIS_UID);
         multiverse.advanceForkState(child1);
-        (,,,,, uint248 favoriteChild,,,,,,,) = multiverse.universes(child1);
+        (,,,,, uint248 favoriteChild,,,,,,,,) = multiverse.universes(child1);
         assertEq(favoriteChild, grandchild);
 
         // The forking query never resolves in child1 itself; a lookup keyed to the stale
@@ -1118,8 +1118,8 @@ contract MultiverseForkTest is MultiverseFixtures {
         multiverse.migrateStake(GENESIS_UID, forkQueryId, OUTCOME_A, OUTCOME_A);
 
         // The 32 ether principal moved from parked to counted; the 19.2 ether of winnings did not vote.
-        (,,,,, uint248 favoriteChild,,, uint128 maxOut,, uint128 totalOut,,) = multiverse.universes(GENESIS_UID);
-        (,,,,,,, uint128 totalIn,,,,,) = multiverse.universes(child1);
+        (,,,,, uint248 favoriteChild,,, uint128 maxOut,, uint128 totalOut,,,) = multiverse.universes(GENESIS_UID);
+        (,,,,,,, uint128 totalIn,,,,,,) = multiverse.universes(child1);
         assertEq(totalOut, 32 ether);
         assertEq(totalIn, 32 ether);
         assertEq(maxOut, 32 ether);
@@ -1216,7 +1216,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         uint248 child2 = _childId(GENESIS_UID, OUTCOME_B);
 
         vm.expectEmit(true, true, true, true);
-        emit Multiverse.ReporterRewardPaid(user, child1, queryId, DEFAULT_FEE / 2);
+        emit Multiverse.ReporterRewardPaid(user, child1, queryId, DEFAULT_FEE / 2, 0);
         multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
         assertEq(multiverse.repTokenOf(child1).balanceOf(user), DEFAULT_FEE / 2);
         assertEq(multiverse.repTokenOf(child1).balanceOf(challenger), 0);
@@ -1289,8 +1289,8 @@ contract MultiverseForkTest is MultiverseFixtures {
         assertEq(multiverse.getUserStake(GENESIS_UID, resolvedQueryId, challenger, OUTCOME_B), 0);
 
         // The whole payout votes: it is real value moving once, into one child.
-        (,,,,, uint248 favoriteChild,,, uint128 maxOut,, uint128 totalOut,,) = multiverse.universes(GENESIS_UID);
-        (,,,,,,, uint128 totalIn,,,,,) = multiverse.universes(child1);
+        (,,,,, uint248 favoriteChild,,, uint128 maxOut,, uint128 totalOut,,,) = multiverse.universes(GENESIS_UID);
+        (,,,,,,, uint128 totalIn,,,,,,) = multiverse.universes(child1);
         assertEq(totalOut, payoutAssets);
         assertEq(totalIn, payoutAssets);
         assertEq(maxOut, payoutAssets);
@@ -1324,9 +1324,9 @@ contract MultiverseForkTest is MultiverseFixtures {
         assertEq(multiverse.getUserStake(GENESIS_UID, openQueryId, challenger, OUTCOME_B), 0);
 
         // A refund votes with its amount, in the child it went to.
-        (,,,,, uint248 favoriteChild,,, uint128 maxOut,, uint128 totalOut,,) = multiverse.universes(GENESIS_UID);
-        (,,,,,,, uint128 totalIn1,,,,,) = multiverse.universes(child1);
-        (,,,,,,, uint128 totalIn2,,,,,) = multiverse.universes(child2);
+        (,,,,, uint248 favoriteChild,,, uint128 maxOut,, uint128 totalOut,,,) = multiverse.universes(GENESIS_UID);
+        (,,,,,,, uint128 totalIn1,,,,,,) = multiverse.universes(child1);
+        (,,,,,,, uint128 totalIn2,,,,,,) = multiverse.universes(child2);
         assertEq(totalOut, 3 ether);
         assertEq(totalIn1, 2 ether);
         assertEq(totalIn2, 1 ether);
@@ -1469,8 +1469,8 @@ contract MultiverseForkTest is MultiverseFixtures {
         assertEq(multiverse.getUserStake(GENESIS_UID, resolvedQueryId, challenger, OUTCOME_B), 0);
         assertEq(multiverse.getUserStake(GENESIS_UID, openQueryId, challenger, OUTCOME_B), 0);
 
-        (,,,,, uint248 favoriteChild,,, uint128 maxOut,, uint128 totalOut,,) = multiverse.universes(GENESIS_UID);
-        (,,,,,,, uint128 totalIn,,,,,) = multiverse.universes(child2);
+        (,,,,, uint248 favoriteChild,,, uint128 maxOut,, uint128 totalOut,,,) = multiverse.universes(GENESIS_UID);
+        (,,,,,,, uint128 totalIn,,,,,,) = multiverse.universes(child2);
         assertEq(totalOut, vote);
         assertEq(totalIn, vote);
         assertEq(maxOut, vote);
@@ -1507,7 +1507,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         assertEq(multiverse.getUserStake(GENESIS_UID, queryId, challenger, INVALID_OUTCOME), 0);
 
         // The principal votes for the INVALID child, like any other outcome's.
-        (,,,,,,, uint128 totalIn,,,,,) = multiverse.universes(childInvalid);
+        (,,,,,,, uint128 totalIn,,,,,,) = multiverse.universes(childInvalid);
         assertEq(totalIn, 32 ether);
 
         // The A side is paid the same return in its own child.
@@ -1584,7 +1584,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         }
         vm.stopPrank();
         uint256 singlesShares = child2Rep.balanceOf(challenger);
-        (,,,,,,,,,, uint128 singlesOut,,) = multiverse.universes(GENESIS_UID);
+        (,,,,,,,,,, uint128 singlesOut,,,) = multiverse.universes(GENESIS_UID);
         uint128 singlesUnmigrated = _unmigratedSupply(GENESIS_UID);
         uint256 singlesDrawn = _drawnIntoChild(GENESIS_UID, OUTCOME_B);
 
@@ -1593,7 +1593,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         multiverse.migrateStakes(GENESIS_UID, queryIds, outcomes, OUTCOME_B);
 
         // Each stake converts to assets on its own either way: the same votes and the same draw.
-        (,,,,,,,,,, uint128 batchOut,,) = multiverse.universes(GENESIS_UID);
+        (,,,,,,,,,, uint128 batchOut,,,) = multiverse.universes(GENESIS_UID);
         assertEq(batchOut, singlesOut);
         assertEq(_unmigratedSupply(GENESIS_UID), singlesUnmigrated);
         assertEq(_drawnIntoChild(GENESIS_UID, OUTCOME_B), singlesDrawn);
@@ -1664,7 +1664,7 @@ contract MultiverseForkTest is MultiverseFixtures {
             Multiverse.UniverseState universeState,
             uint48 forkTime,
             bool isCanonical,
-            uint248 parent,,,,,,,,
+            uint248 parent,,,,,,,,,
         ) = multiverse.universes(child3);
         assertEq(uint8(universeState), uint8(Multiverse.UniverseState.Active));
         assertEq(parent, GENESIS_UID);
@@ -1676,7 +1676,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         // The settled fork is untouched: the winner and the canonical timeline stay where they were, and the
         // late child is neither.
         assertFalse(isCanonical);
-        (,,,,, uint248 favoriteChild,,,,,,,) = multiverse.universes(GENESIS_UID);
+        (,,,,, uint248 favoriteChild,,,,,,,,) = multiverse.universes(GENESIS_UID);
         assertEq(favoriteChild, child2);
         assertEq(multiverse.canonicalHeir(), child2);
         assertEq(multiverse.getOutcome(GENESIS_UID, forkQueryId), OUTCOME_B);
@@ -1698,7 +1698,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         multiverse.createQuery(child3, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
         assertEq(multiverse.queryCount(), queryId + 1);
         assertLt(child3Rep.balanceOf(bystander), 10 ether);
-        (,,,,,,, uint128 totalIn,,,,,) = multiverse.universes(child3);
+        (,,,,,,, uint128 totalIn,,,,,,) = multiverse.universes(child3);
         assertEq(totalIn, 0);
     }
 
@@ -1723,7 +1723,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         uint248 grandchildB = _childId(child1, OUTCOME_B);
         vm.prank(user);
         multiverse.migrate(child1, OUTCOME_B, 100 ether);
-        (,,,,, uint248 favoriteChild,,, uint128 maxOut,,,,) = multiverse.universes(child1);
+        (,,,,, uint248 favoriteChild,,, uint128 maxOut,,,,,) = multiverse.universes(child1);
         assertEq(favoriteChild, grandchildB);
         assertEq(maxOut, 100 ether);
 
@@ -1734,7 +1734,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         vm.expectRevert(Multiverse.MigrationWindowClosed.selector);
         multiverse.migrate(child1, OUTCOME_B, 1 ether);
         multiverse.advanceForkState(child1);
-        (,,,,, favoriteChild,,,,,,,) = multiverse.universes(child1);
+        (,,,,, favoriteChild,,,,,,,,) = multiverse.universes(child1);
         assertEq(favoriteChild, grandchildB);
         assertEq(multiverse.getOutcome(child1, nestedQueryId), OUTCOME_B);
     }
@@ -1771,12 +1771,12 @@ contract MultiverseForkTest is MultiverseFixtures {
         vm.warp(vm.getBlockTimestamp() + multiverse.MIGRATION_DURATION());
         multiverse.advanceForkState(child3);
         assertEq(uint8(_universeState(child3)), uint8(Multiverse.UniverseState.PostFork));
-        (,,,,, uint248 favoriteChild,,,,,,,) = multiverse.universes(child3);
+        (,,,,, uint248 favoriteChild,,,,,,,,) = multiverse.universes(child3);
         assertEq(favoriteChild, grandchild);
         assertEq(multiverse.getOutcome(child3, nestedQueryId), OUTCOME_A);
 
         // A non-canonical line: the canonical timeline never moved.
-        (,,, bool isCanonical,,,,,,,,,) = multiverse.universes(grandchild);
+        (,,, bool isCanonical,,,,,,,,,,) = multiverse.universes(grandchild);
         assertFalse(isCanonical);
         assertEq(multiverse.canonicalHeir(), child2);
     }
@@ -1800,7 +1800,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         multiverse.advanceForkState(GENESIS_UID);
         uint248 child2 = _childId(GENESIS_UID, OUTCOME_B);
         vm.expectEmit(true, true, true, true, address(multiverse));
-        emit Multiverse.ReporterRewardPaid(challenger, child2, forkQueryId, forkFee / 2);
+        emit Multiverse.ReporterRewardPaid(challenger, child2, forkQueryId, forkFee / 2, 0);
         multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_B);
 
         // The late child is funded exactly like an on-time one — the fee pot copy and its first reporter's

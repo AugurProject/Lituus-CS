@@ -94,6 +94,7 @@ abstract contract MultiverseDeployFixture is Test {
         uint96 forkBurn;
         uint256 outcome;
         uint256 lastReportedOutcome;
+        uint128 tips;
     }
 
     function _resolution(uint256 queryId) internal view returns (ResolutionView memory r) {
@@ -111,7 +112,8 @@ abstract contract MultiverseDeployFixture is Test {
             r.cap,
             r.forkBurn,
             r.outcome,
-            r.lastReportedOutcome
+            r.lastReportedOutcome,
+            r.tips
         ) = multiverse.queryResolutions(universeId, queryId);
     }
 
@@ -135,7 +137,7 @@ abstract contract MultiverseDeployFixture is Test {
         IQueryFeeController controller = _deployFeeController();
         multiverse = _deployMultiverse(controller);
 
-        (ILituusRep repToken,,,,,,,,,,,,) = multiverse.universes(GENESIS_UID);
+        (ILituusRep repToken,,,,,,,,,,,,,) = multiverse.universes(GENESIS_UID);
         genesisRep = repToken;
 
         _afterProtocolDeploy();
@@ -234,7 +236,7 @@ abstract contract MultiverseDeployFixture is Test {
     /* ============================================ FORK HELPERS ============================================ */
 
     function _universeState(uint248 universeId) internal view returns (Multiverse.UniverseState state) {
-        (, state,,,,,,,,,,,) = multiverse.universes(universeId);
+        (, state,,,,,,,,,,,,) = multiverse.universes(universeId);
     }
 
     function _childId(uint248 parentId, uint256 outcome) internal view returns (uint248) {

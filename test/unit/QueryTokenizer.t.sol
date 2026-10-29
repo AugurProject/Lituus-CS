@@ -240,7 +240,7 @@ contract QueryTokenizerTest is QueryTokenizerFixtures {
 
         // Resolution pays the first correct reporter from the POOL-AVERAGE fee: 1.1 / 4 = 0.275.
         vm.expectEmit(true, true, true, true, address(multiverse));
-        emit Multiverse.ReporterRewardPaid(user, GENESIS_UID, queryId, 0.275 ether);
+        emit Multiverse.ReporterRewardPaid(user, GENESIS_UID, queryId, 0.275 ether, 0);
         assertEq(_resolve(user, queryId), OUTCOME_A);
 
         // Claims: stake plus the pro-rata share of the losing 2 after the 20% burn

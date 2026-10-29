@@ -66,8 +66,8 @@ contract MultiverseInvariantTest is MultiverseDeployFixture {
     function invariant_RepBalanceMatchesFeesAndStakes() public view {
         assertEq(
             genesisRep.balanceOf(address(multiverse)),
-            handler.ghostTotalFees() + handler.ghostTotalStaked() - handler.ghostTotalPaidOut()
-                - handler.ghostTotalBurned()
+            handler.ghostTotalFees() + handler.ghostTotalStaked() + handler.ghostTotalTips()
+                - handler.ghostTotalPaidOut() - handler.ghostTotalBurned()
         );
     }
 
@@ -75,7 +75,7 @@ contract MultiverseInvariantTest is MultiverseDeployFixture {
     function invariant_PayoutsNeverExceedDeposits() public view {
         assertLe(
             handler.ghostTotalPaidOut() + handler.ghostTotalBurned(),
-            handler.ghostTotalFees() + handler.ghostTotalStaked()
+            handler.ghostTotalFees() + handler.ghostTotalStaked() + handler.ghostTotalTips()
         );
     }
 
@@ -225,14 +225,33 @@ contract MultiverseInvariantTest is MultiverseDeployFixture {
         }
     }
 
-    /// @dev Per-actor conservation: an actor's REP only moves into stakes it placed itself and
-    ///      back out through settlement payouts it received (claims, rewards, auto-settlement).
+    /// @dev Every unresolved query holds exactly the tips placed on it, a resolved one holds none, and the
+    ///      universe's tip aggregate is their sum (no fork here, so no spawn dust).
+    function invariant_TipsMatchGhosts() public view {
+        uint256 count = multiverse.queryCount();
+        uint256 unpaidTips;
+        for (uint256 i = 0; i < count; ++i) {
+            if (handler.ghostResolved(i)) {
+                assertEq(multiverse.getTips(GENESIS_UID, i), 0);
+                assertEq(_resolution(i).tips, 0);
+            } else {
+                assertEq(_resolution(i).tips, handler.ghostQueryTips(i));
+                unpaidTips += handler.ghostQueryTips(i);
+            }
+        }
+        (,,,,,,,,,,,,, uint128 totalTips) = multiverse.universes(GENESIS_UID);
+        assertEq(totalTips, unpaidTips);
+    }
+
+    /// @dev Per-actor conservation: an actor's REP only moves into stakes and tips it placed itself and
+    ///      back out through settlement payouts it received (claims, rewards, tips, auto-settlement).
     function invariant_ActorBalancesConserved() public view {
         for (uint256 i = 0; i < handler.actorsLength(); ++i) {
             address actor = handler.actorAt(i);
             assertEq(
                 genesisRep.balanceOf(actor),
-                HANDLER_REP_BALANCE - handler.ghostActorStaked(actor) + handler.ghostActorReceived(actor)
+                HANDLER_REP_BALANCE - handler.ghostActorStaked(actor) - handler.ghostActorTipped(actor)
+                    + handler.ghostActorReceived(actor)
             );
         }
     }
@@ -246,6 +265,7 @@ contract MultiverseInvariantTest is MultiverseDeployFixture {
         console.log("queriesCreated :", handler.ghostQueriesCreated());
         console.log("reportsPlaced  :", handler.ghostReportsPlaced());
         console.log("resolves       :", handler.ghostResolvesPerformed());
+        console.log("tipsPlaced     :", handler.ghostTipsPlaced());
         console.log("claims         :", handler.ghostClaimsPerformed());
         console.log("totalFees      :", handler.ghostTotalFees());
         console.log("totalStaked    :", handler.ghostTotalStaked());

@@ -36,12 +36,12 @@ contract MultiverseZoltarForkTest is MultiverseFixtures {
             u.isLituusFork,,,
             u.forkQuery,,
             u.totalQueryFees,
-            u.unmigratedSupply
+            u.unmigratedSupply,
         ) = multiverse.universes(universeId);
     }
 
     function _repOf(uint248 universeId) internal view returns (ILituusRep repToken) {
-        (repToken,,,,,,,,,,,,) = multiverse.universes(universeId);
+        (repToken,,,,,,,,,,,,,) = multiverse.universes(universeId);
     }
 
     function _childId(uint256 outcome) internal view returns (uint248) {
@@ -345,7 +345,7 @@ contract MultiverseZoltarForkTest is MultiverseFixtures {
         multiverse.resolve(child1, settledId);
         vm.prank(bystander);
         multiverse.report(child1, settledId, OUTCOME_A);
-        (uint48 childCreateTime,, uint16 childStakeCount,,,,,,) = multiverse.queryResolutions(child1, settledId);
+        (uint48 childCreateTime,, uint16 childStakeCount,,,,,,,) = multiverse.queryResolutions(child1, settledId);
         assertEq(childCreateTime, mirrorTime);
         assertEq(childStakeCount, 1);
 
@@ -362,7 +362,7 @@ contract MultiverseZoltarForkTest is MultiverseFixtures {
     /* =========================================== RETURN OF STAKES ========================================== */
 
     function _totalMigratedOut(uint248 universeId) internal view returns (uint128 totalOut) {
-        (,,,,,,,,,, totalOut,,) = multiverse.universes(universeId);
+        (,,,,,,,,,, totalOut,,,) = multiverse.universes(universeId);
     }
 
     /// @dev Asserts `staker` got its `parentShares` payout as child wREP: assets at the parent's frozen rate,
@@ -507,7 +507,7 @@ contract MultiverseZoltarForkTest is MultiverseFixtures {
         multiverse.report(grandchild, openQueryId, OUTCOME_A);
         vm.stopPrank();
         assertEq(multiverse.queryCount(), queryId + 1);
-        (uint48 inheritedCreateTime,, uint16 inheritedStakeCount,,,,,,) =
+        (uint48 inheritedCreateTime,, uint16 inheritedStakeCount,,,,,,,) =
             multiverse.queryResolutions(grandchild, openQueryId);
         assertEq(inheritedCreateTime, _universe(child1).forkTime);
         assertEq(inheritedStakeCount, 1);

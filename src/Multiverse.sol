@@ -110,9 +110,11 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     ///      each; a report writes `lastReportedOutcome` and the shared slot. wREP amounts are bounded by the REP
     ///      max supply (100M * 1e18), comfortably within uint96.
     struct QueryResolution {
-        // The time the query first became reportable in this universe.
-        // Set on createQuery in the origin universe and lazily on the first report() in heir universes
-        // (to the parent's forkTime — the fork moment that created the universe).
+        // The time the query first became reportable in this universe. Set on createQuery in the origin
+        // universe, and in an heir universe on the query's first touch there — report(), tip() or resolve() — to
+        // the parent's forkTime (the fork moment that created the universe). Nonzero marks the record as existing:
+        // the lineage walk (_inheritedQueryProperties) stops at the nearest record by it, so a record must keep
+        // it once set, resolved records included.
         uint48 queryCreateTime;
         // When the latest stake was placed. Each stake reopens the appeal window from this time.
         uint48 lastStakeTime;
@@ -133,6 +135,11 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         uint256 outcome;
         // The outcome of the latest stake. Wins the query if the appeal window lapses unchallenged.
         uint256 lastReportedOutcome;
+        // Tips this universe pays out for the query, in wREP: the tips it inherited, copied in at the first touch
+        // of the local record, plus the tips placed here. Paid in full to the first correct reporter, or to the
+        // resolver of an unreported query, and cleared once paid. A forking query's record keeps them: every child
+        // pays them out of the parked balance at its spawn.
+        uint128 tips;
         // Stake totals and first reporter per outcome.
         mapping(uint256 outcome => OutcomeStakes) outcomes;
         // Each staker's total per outcome; zeroed when claimed or settled.
@@ -183,6 +190,10 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         // burned part stays in here; fee splits move neither (per-world duplicated copies). Kept locally:
         // Zoltar's balance would include foreign flows.
         uint128 unmigratedSupply;
+        // Unpaid tips held for this universe's queries, in nominal wREP shares: += at tip, -= when a resolution
+        // pays them out. At a fork the aggregate (minus the forking query's own tips) is copied into EVERY child
+        // at its spawn, like totalQueryFees.
+        uint128 totalTips;
     }
 
     struct UniverseStatistics {
@@ -239,13 +250,15 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     /// @notice A child universe was spawned for one outcome of a forking universe.
     event ChildUniverseSpawned(uint248 indexed parentUniverseId, uint248 indexed childUniverseId, uint256 outcome);
     event StakeClaimed(address indexed reporter, uint248 indexed universeId, uint256 indexed queryId, uint256 payout);
-    // The first correct reporter's share of the query fee, paid when the escalation game resolves.
+    // The first correct reporter's share of the query fee (`amount`) and the query's tips (`tips`), paid when the
+    // escalation game resolves.
     event ReporterRewardPaid(
-        address indexed reporter, uint248 indexed universeId, uint256 indexed queryId, uint256 amount
+        address indexed reporter, uint248 indexed universeId, uint256 indexed queryId, uint256 amount, uint256 tips
     );
-    // The resolver's share of the query fee for resolving an unreported query INVALID after expiry.
+    // The resolver's share of the query fee (`amount`) and the query's tips (`tips`), for resolving an unreported
+    // query INVALID after expiry.
     event ResolverRewardPaid(
-        address indexed resolver, uint248 indexed universeId, uint256 indexed queryId, uint256 amount
+        address indexed resolver, uint248 indexed universeId, uint256 indexed queryId, uint256 amount, uint256 tips
     );
     // Wallet wREP migrated out of a forking universe into one of its children, counted as a vote in `assets`.
     event Migrated(address indexed holder, uint248 indexed universeId, uint248 indexed childUniverseId, uint256 assets);
@@ -257,6 +270,8 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         uint256 queryId,
         uint256 assets
     );
+    // A tip placed on an unreported query, paid to its first correct reporter (or its resolver if none reports).
+    event QueryTipped(address indexed tipper, uint248 indexed universeId, uint256 indexed queryId, uint256 amount);
 
     /* ================================================= ERRORS ================================================== */
     error ZeroAddress();
@@ -285,6 +300,8 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     error NotAWinningOutcome();
     error InvalidClaimBatch();
     error OnlyQueryTokenizer();
+    error ZeroTip();
+    error QueryAlreadyReported();
 
     /* =============================================== CONSTRUCTOR =============================================== */
     /**
@@ -621,15 +638,18 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * @param outcome The reported outcome (1..numberOfOutcomes, or INVALID).
      */
     function report(uint248 universeId, uint256 queryId, uint256 outcome) external nonReentrant {
-        (Universe storage universe, QueryResolution storage resolution, uint48 queryCreateTime) =
+        (Universe storage universe, QueryResolution storage resolution, uint48 queryCreateTime, uint128 inheritedTips) =
             _checkReportable(universeId, queryId, outcome);
         uint16 stakeCount = resolution.stakeCount;
 
         uint256 cap = resolution.cap;
         if (stakeCount == 0) {
-            // Only a query without a stake can lack a local record: the first touch of an inherited query stores
-            // the clock it inherited (for any other query this rewrites the same value).
-            resolution.queryCreateTime = queryCreateTime;
+            // First touch of an inherited query: anchor the record's clock and store the tips it inherited. A
+            // record that already exists (the origin's, or one a tip anchored) holds its own clock and tips.
+            if (resolution.queryCreateTime == 0) {
+                resolution.queryCreateTime = queryCreateTime;
+                if (inheritedTips != 0) resolution.tips = inheritedTips;
+            }
             // Freeze the per-outcome cap: the whole ladder is measured against this one value.
             // a fraction of the REP supply, bounded by max supply (100M * 1e18), within uint96
             cap = _capShares(universe.repToken, universeId);
@@ -695,13 +715,11 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         QueryResolution storage resolution = queryResolutions[universeId][queryId];
         if (resolution.outcome != UNRESOLVED) revert QueryAlreadyResolved();
 
-        // A query resolved in an ancestor is inherited by this lineage (via getOutcome) and must not be
-        // resolved again. Only the first touch of an inherited query (no local record yet) needs the walk.
-        if (resolution.queryCreateTime == 0 && _findResolution(universeId, queryId) != UNRESOLVED) {
-            revert QueryAlreadyResolved();
-        }
-
-        uint48 queryCreateTime = _getAndUpdateQueryCreateTime(universeId, queryId);
+        (uint48 queryCreateTime, uint128 inheritedTips) = _inheritedQueryProperties(universeId, queryId);
+        // A first touch anchors the record's clock, which a resolved record keeps: descendants find their nearest
+        // record by it. The inherited tips are not stored: a first touch here resolves INVALID, paying them, or
+        // reverts.
+        if (resolution.queryCreateTime == 0) resolution.queryCreateTime = queryCreateTime;
 
         if (resolution.stakeCount == 0 && queryCreateTime + REPORTING_PERIOD < block.timestamp) {
             // if the report period has passed and the query was not reported on then resolve the query as INVALID
@@ -715,9 +733,15 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
             uint256 queryFee = queries[queryId].fee;
             uint256 resolverPay = _timeBasedFeeShare(queryFee, block.timestamp - (queryCreateTime + REPORTING_PERIOD));
             uint256 profit = queryFee - resolverPay;
-            _consumeQueryFee(universe, queryFee);
-            emit ResolverRewardPaid(msg.sender, universeId, queryId, resolverPay);
-            universe.repToken.safeTransfer(msg.sender, resolverPay);
+            // The tips are the resolver's in full, with no ramp: nobody reported, so nobody else earned them. They
+            // are the stored tips, or on a first touch the inherited ones (one of the two is always zero).
+            uint128 storedTips = resolution.tips;
+            uint128 tips = storedTips + inheritedTips;
+            _consumeQueryFeeAndTips(universe, queryFee, tips);
+            // Paid out: clearing the record earns the storage refund (nothing reads a resolved query's tips).
+            if (storedTips != 0) resolution.tips = 0;
+            emit ResolverRewardPaid(msg.sender, universeId, queryId, resolverPay, tips);
+            universe.repToken.safeTransfer(msg.sender, resolverPay + tips);
             // The unpaid fee remainder is the query's profit: recorded for the fee controller and
             // burned as wREP, the same as on the stakes path.
             if (profit > 0) {
@@ -744,6 +768,47 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         // The universe is Active here (_checkUniverseState above). If its Zoltar counterpart has forked
         // natively in the meantime, mirror that fork now, in this same tx, right after the resolution.
         if (ZOLTAR.getForkTime(universeId) != 0) _mirrorZoltarFork(universeId);
+    }
+
+    /**
+     * @notice Tips a query's first correct reporter, in the universe's wREP.
+     * @dev The universe must exist and be Active. A tip can be placed while the query has no report in this
+     *      universe and its reporting window is still open — the same window a first report must land in.
+     *      The tips are paid in full, with no ramp, to the first reporter of the winning outcome, or to the
+     *      resolver if the query expires unreported and resolves INVALID. An inherited query carries the
+     *      tips placed in its ancestors (copied into the local record at its first touch) and can be tipped
+     *      again here while it has no report in this universe; those tips stay local to this universe.
+     * @param universeId The universe to tip in.
+     * @param queryId The query being tipped.
+     * @param amount The tip, in the universe's wREP.
+     */
+    function tip(uint248 universeId, uint256 queryId, uint256 amount) external nonReentrant {
+        // Tips can only be placed in an existing and active universe.
+        Universe storage universe = _checkUniverseState(universeId);
+        if (queryId >= queryCount) revert InvalidQuery();
+        if (amount == 0) revert ZeroTip();
+
+        QueryResolution storage resolution = queryResolutions[universeId][queryId];
+        if (resolution.outcome != UNRESOLVED) revert QueryAlreadyResolved();
+        // Tips are for the first report, so they close with the first stake (checked before the lineage walk,
+        // which it doesn't need) or with the reporting window.
+        if (resolution.stakeCount != 0) revert QueryAlreadyReported();
+
+        (uint48 queryCreateTime, uint128 inheritedTips) = _inheritedQueryProperties(universeId, queryId);
+        if (queryCreateTime + REPORTING_PERIOD < block.timestamp) revert QueryExpired();
+
+        // A first touch anchors the record: its clock now, its inherited tips with the new tip below.
+        if (resolution.queryCreateTime == 0) resolution.queryCreateTime = queryCreateTime;
+
+        universe.repToken.safeTransferFrom(msg.sender, address(this), amount);
+        // On a first touch the record held no tips, otherwise nothing is inherited: one write covers both.
+        // Tips are REP amounts within uint128.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        resolution.tips += inheritedTips + uint128(amount);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        universe.totalTips += uint128(amount);
+
+        emit QueryTipped(msg.sender, universeId, queryId, amount);
     }
 
     /**
@@ -1168,7 +1233,8 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      *
      *      `profit` is the wREP removed from circulation: 20% of the losing stakes
      *      (`totalLoserStakes / BURN_DIVIDER`) plus the unpaid fee remainder (`fee - reporterPay`).
-     *      The reporter reward is pushed here via `safeTransfer`.
+     *      The reporter reward is pushed here via `safeTransfer`, together with the query's tips, which are
+     *      paid in full and are not profit.
      *
      *      Winner stake refunds and their proportional share of the remaining 80% of losing stakes
      *      are NOT settled here — those are claimed separately through claim() (except the case of
@@ -1187,8 +1253,8 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         uint48 reportingTimestamp = winnerStakes.firstReportTime;
 
         uint256 queryFee = queries[queryId].fee;
-        // Per-universe queryCreateTime: createQuery sets it for the origin universe and report()
-        // lazily sets it to the parent's forkTime for heir universes on first report.
+        // Per-universe queryCreateTime: createQuery sets it for the origin universe, and the query's first touch
+        // in an heir universe (report(), tip() or resolve()) sets it to the parent's forkTime.
         uint48 queryCreateTime = resolution.queryCreateTime;
 
         uint256 totalLoserStakes = totalStaked - winnerOutcomeStaked;
@@ -1198,23 +1264,27 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         uint256 loserBurn = totalLoserStakes / BURN_DIVIDER;
         uint256 profit = loserBurn + (queryFee - reporterPay);
 
-        _consumeQueryFee(universes[universeId], queryFee);
+        // The tips go to the first correct reporter in full, with no ramp. They are not profit: never burned.
+        uint256 tips = resolution.tips;
+        _consumeQueryFeeAndTips(universes[universeId], queryFee, tips);
+        // Paid out: clearing the record earns the storage refund (nothing reads a resolved query's tips).
+        if (tips != 0) resolution.tips = 0;
 
         ILituusRep repToken = universes[universeId].repToken;
 
-        emit ReporterRewardPaid(reporter, universeId, queryId, reporterPay);
+        emit ReporterRewardPaid(reporter, universeId, queryId, reporterPay, tips);
         // Consecutive reports must differ, so no-losers <=> exactly one stake: settle the sole winner
-        // here in one transfer (bond refund + reporter reward) instead of requiring a claim() call.
+        // here in one transfer (bond refund + reporter reward + tips) instead of requiring a claim() call.
         // The two events stay separate so StakeClaimed payouts don't include a fee reward.
         // TODO: maybe claim the first reporter reward instead of pushing it
         if (resolution.stakeCount == 1) {
             resolution.userStakes[reporter][winnerOutcome] = 0; // zeroed marks the stake settled
             emit StakeClaimed(reporter, universeId, queryId, totalStaked);
-            repToken.safeTransfer(reporter, reporterPay + totalStaked);
+            repToken.safeTransfer(reporter, reporterPay + totalStaked + tips);
         }
         // with more than one stake, even the rewarded reporter must claim their bond separately
         else {
-            repToken.safeTransfer(reporter, reporterPay);
+            repToken.safeTransfer(reporter, reporterPay + tips);
         }
         // Burn the recorded profit as wREP: the burned fifth of the losing stakes plus the unpaid
         // fee remainder. Destroying shares while the asset ledger is untouched raises the
@@ -1287,6 +1357,27 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     }
 
     /**
+     * @notice Returns the tips a query pays out in a given universe: the tips inherited from its lineage plus
+     *         the tips placed there.
+     * @dev Only an Active universe pays tips: a forked one pays them in its children, so it reads zero. Zero
+     *      too once the query is resolved along the universe's lineage. Reverts if the universe does not exist,
+     *      the query does not exist, or the (Active) universe did not inherit the query.
+     * @param universeId The universe to read the tips in.
+     * @param queryId The query to read.
+     * @return The tips the first correct reporter (or the resolver of an unreported query) would receive.
+     */
+    function getTips(uint248 universeId, uint256 queryId) external view returns (uint256) {
+        UniverseState universeState = universes[universeId].universeState;
+        if (universeState == UniverseState.NotExisting) revert InvalidUniverse();
+        if (queryId >= queryCount) revert InvalidQuery();
+        if (universeState != UniverseState.Active) return 0;
+        if (_findResolution(universeId, queryId) != UNRESOLVED) return 0;
+        // The stored tips, or before the first touch the inherited ones (one of the two is always zero).
+        (, uint128 inheritedTips) = _inheritedQueryProperties(universeId, queryId);
+        return queryResolutions[universeId][queryId].tips + inheritedTips;
+    }
+
+    /**
      * @notice Returns one outcome's side of a query's escalation in a given universe: its stake total and
      *         first reporter.
      * @dev Reads the record of the given universe as-is, without forwarding to the universe's heir. Pass
@@ -1342,7 +1433,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         view
         returns (uint256 requiredStake)
     {
-        (Universe storage universe, QueryResolution storage resolution,) =
+        (Universe storage universe, QueryResolution storage resolution,,) =
             _checkReportable(universeId, queryId, outcome);
 
         // Before the first report the cap is not frozen yet: quote against the one report() would freeze now.
@@ -1417,25 +1508,6 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         }
     }
 
-    /**
-     * @notice Returns whether `ancestorId` is `universeId` itself or one of its ancestors in the fork tree.
-     * @dev Walks the parent chain from `universeId` up to the root — the genesis, which is checked
-     *      against `ancestorId` in its own right before ending the walk.
-     */
-    function _isSelfOrAncestor(uint248 ancestorId, uint248 universeId) internal view returns (bool isAncestor) {
-        uint248 currentId = universeId;
-        while (true) {
-            if (currentId == ancestorId) {
-                return true;
-            }
-            // Every parent chain terminates at the genesis.
-            if (currentId == GENESIS_UNIVERSE_ID) {
-                return false;
-            }
-            currentId = universes[currentId].parent;
-        }
-    }
-
     /// @dev Rounds `amount` to the nearest step of the halving sequence cap, cap/2, cap/4, ... in log space:
     ///      the chosen step is never more than a factor of sqrt(2) away from `amount`. A first stake on a step keeps
     ///      every later stake on a step, so the leading outcomes land exactly on the cap. Requires `amount <= cap`.
@@ -1451,12 +1523,17 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     ///      along the lineage, the outcome is valid, this universe inherited the query, and the report lands in
     ///      the reporting window (first report) or the appeal window (later ones). The stake-specific gate
     ///      (CannotStakeOnOutcome) lives in _requiredStake, which both also share. Returns the query's clock in
-    ///      this universe, inherited from the lineage when there is no local record yet; storing it is the
-    ///      caller's.
+    ///      this universe, inherited from the lineage when there is no local record yet, and the tips inherited
+    ///      with it (zero when the local record exists); storing them is the caller's.
     function _checkReportable(uint248 universeId, uint256 queryId, uint256 outcome)
         internal
         view
-        returns (Universe storage universe, QueryResolution storage resolution, uint48 queryCreateTime)
+        returns (
+            Universe storage universe,
+            QueryResolution storage resolution,
+            uint48 queryCreateTime,
+            uint128 inheritedTips
+        )
     {
         // Reports can only be placed in an existing and active universe.
         universe = _checkUniverseState(universeId);
@@ -1469,14 +1546,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         if (outcome == UNRESOLVED) revert InvalidOutcome();
         if ((outcome > queries[queryId].numberOfOutcomes) && (outcome != INVALID)) revert InvalidOutcome();
 
-        // A query resolved in an ancestor universe is inherited by this lineage (via getOutcome), so it
-        // cannot be reported on again here. The ancestor set is fixed per lineage, so this only needs to
-        // be checked on the first touch of an inherited query (no local record yet).
-        if (resolution.queryCreateTime == 0 && _findResolution(universeId, queryId) != UNRESOLVED) {
-            revert QueryAlreadyResolved();
-        }
-
-        queryCreateTime = _inheritedQueryCreateTime(universeId, queryId);
+        (queryCreateTime, inheritedTips) = _inheritedQueryProperties(universeId, queryId);
 
         if (resolution.stakeCount == 0) {
             // check that the reporting window for the query is not over yet
@@ -1578,9 +1648,10 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         // forge-lint: disable-next-line(unsafe-typecast)
         universe.forkQuery = uint128(queryId);
         universe.isLituusFork = true;
-        // The forking query's fee leaves the fee aggregate so the children don't inherit it as a resolution
-        // fee. It is paid as the fork's reporter reward when each child spawns (see _payForkReporter).
-        _consumeQueryFee(universe, query.fee);
+        // The forking query's fee and tips leave the aggregates so the children don't inherit them as pools. Each
+        // child pays them to the first reporter of its own outcome when it spawns (see _payForkReporter). The query
+        // has stakes here, so its local record holds the tips in full.
+        _consumeQueryFeeAndTips(universe, query.fee, queryResolutions[universeId][queryId].tips);
         _enterMigration(universeId, universe, queryId, zoltarQueryId, potAssets - forkThreshold, zoltarBurn);
     }
 
@@ -1616,12 +1687,13 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
 
     /**
      * @notice Parks the contract's entire wREP holding of a forking universe in the Zoltar
-     *         migration balance: query fees, the forking query's pot, and all other stakes and
+     *         migration balance: query fees, tips, the forking query's pot, and all other stakes and
      *         unclaimed winnings. Runs once, in the fork tx.
      * @dev `unwrappedAssets` is REP already unwrapped and still held here (the pot left after the fork
      *      bond for a Lituus fork, zero for a mirrored one) and `zoltarBurn` what Zoltar kept of the
      *      bond. From here every path to this value is a "second part" of a migration — minting into
-     *      a child universe (fee splits at spawn, stakes through migrateStake).
+     *      a child universe (fee and tip splits at spawn, the forking query's reward and tips at spawn, stakes
+     *      through migrateStake).
      *      Nothing is ever withdrawable on the parent side again. unmigratedSupply records the pot as
      *      it stood before the fork, parked plus burned: stake claims take their principal out of it
      *      at face value, so it has to carry the burned part too. SR max supply = totalMigratedOut +
@@ -1642,14 +1714,18 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         universe.unmigratedSupply = uint128(ZOLTAR.getMigrationRepBalance(address(this), universeId) + zoltarBurn);
     }
 
-    /// @dev Marks a query's fee consumed in this universe's fee aggregate. Saturating: the
-    ///      spawn-time fee split rounds down twice, so a child's carried aggregate can run short of
-    ///      the nominal fee sum by dust.
+    /// @dev Marks a query's fee and tips consumed in this universe's fee and tip aggregates. Saturating: the
+    ///      spawn-time splits round down, so a child's carried aggregates can run short of the nominal sums by
+    ///      dust. An untipped query leaves the tip aggregate's slot untouched.
     // TODO: rewrite the fee accounting so that it correctly handles dust and rounding issues.
-    function _consumeQueryFee(Universe storage universe, uint256 fee) internal {
+    function _consumeQueryFeeAndTips(Universe storage universe, uint256 fee, uint256 tips) internal {
         uint128 totalQueryFees = universe.totalQueryFees;
         // forge-lint: disable-next-line(unsafe-typecast)
         universe.totalQueryFees = fee >= totalQueryFees ? 0 : totalQueryFees - uint128(fee);
+        if (tips == 0) return;
+        uint128 totalTips = universe.totalTips;
+        // forge-lint: disable-next-line(unsafe-typecast)
+        universe.totalTips = tips >= totalTips ? 0 : totalTips - uint128(tips);
     }
 
     /// @dev Draws `assets` from the parked migration balance of `universeId` into the child for `outcome` and
@@ -1663,10 +1739,12 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         childShares = childRepToken.wrap(address(this), assets);
     }
 
-    /// @dev Pays the forking query's reporter reward in a newly spawned child. The child resolves the query to
-    ///      `outcome`, so the parent's first reporter of that outcome earned the fee ramp there, paid in child
-    ///      wREP from the parked balance. Nothing is paid if nobody staked on `outcome`. The unpaid part of the
-    ///      fee is never drawn, so it is effectively burned in the child.
+    /// @dev Pays the forking query's reporter reward and tips in a newly spawned child. The child resolves the query
+    ///      to `outcome`, so the parent's first reporter of that outcome earned the fee ramp there, plus the query's
+    ///      tips in full, paid in child wREP from the parked balance. Every child pays its own reporter the full
+    ///      tips: the tips left the parent's aggregate in the fork tx, and Zoltar's per-child escrow backs a copy
+    ///      per child. Nothing is paid if nobody staked on `outcome`. The unpaid part of the fee is never drawn,
+    ///      so it is effectively burned in the child.
     function _payForkReporter(
         uint248 universeId,
         uint248 childUniverseId,
@@ -1682,13 +1760,18 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         // Ramps to the full fee over the reporting window, like the non-fork resolution.
         uint256 reporterPay =
             _timeBasedFeeShare(queries[queryId].fee, winnerStakes.firstReportTime - resolution.queryCreateTime);
-        if (reporterPay == 0) return;
+        uint256 tips = resolution.tips;
+        uint256 totalPay = reporterPay + tips;
+        if (totalPay == 0) return;
 
-        uint256 assets = universes[universeId].repToken.convertToAssets(reporterPay);
-        uint256 childShares = _moveParkedToChild(universeId, childRepToken, outcome, assets);
+        // One draw for both; the event splits the child shares paid between the fee share and the tips pro rata.
+        uint256 childShares = _moveParkedToChild(
+            universeId, childRepToken, outcome, universes[universeId].repToken.convertToAssets(totalPay)
+        );
         childRepToken.safeTransfer(reporter, childShares);
 
-        emit ReporterRewardPaid(reporter, childUniverseId, queryId, childShares);
+        uint256 rewardShares = childShares * reporterPay / totalPay;
+        emit ReporterRewardPaid(reporter, childUniverseId, queryId, rewardShares, childShares - rewardShares);
     }
 
     /// @dev Records `assets` of REP moving out of a forking universe into one of its children through a counted
@@ -1827,6 +1910,17 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
             // Share amounts are REP amounts within uint128.
             // forge-lint: disable-next-line(unsafe-typecast)
             childUniverse.totalQueryFees = uint128(feeShares);
+        }
+
+        // Fund the child with the parent's whole tip aggregate the same way: a full copy per child, not counted
+        // in the migration totals — totalTips is their ledger. The forking query's own tips left the aggregate in
+        // the fork tx; they are paid to its reporter below.
+        uint256 tipAssets = parentUniverse.repToken.convertToAssets(parentUniverse.totalTips);
+        if (tipAssets > 0) {
+            uint256 tipShares = _moveParkedToChild(universeId, childUniverseRepToken, outcome, tipAssets);
+            // Share amounts are REP amounts within uint128.
+            // forge-lint: disable-next-line(unsafe-typecast)
+            childUniverse.totalTips = uint128(tipShares);
         }
 
         // Every child resolves the forking query to its own outcome; descendants inherit it via the
@@ -2268,52 +2362,48 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     }
 
     /**
-     * @notice Returns when a query became reportable in a universe, without storing anything.
-     * @dev If the local record already has a create time, returns it. Otherwise the query can only be
-     *      acted on here if it was inherited through a fork, i.e. its origin universe is an ancestor of
-     *      this one — enforced by walking the parent chain. Its reportable time is then the parent's
-     *      forkTime: the moment of the fork that carried the query in. Every unresolved query restarts
-     *      here with a full window at the fork, whatever state its ancestor record was frozen in — those
-     *      stakes stay in the ancestor record, refundable through migrateStake.
-     * @param universeId The universe the query is being acted on in.
+     * @notice Returns when a query became reportable in a universe and the tips it inherited, without storing
+     *         anything. Reverts if the query is not open to acting on here.
+     * @dev If the local record already has a create time, returns it (and no tips: the record holds its own).
+     *      Otherwise one walk up the parent chain to the nearest ancestor holding a record of the query decides
+     *      everything, because the callers act on an Active universe, which has no descendants and, if
+     *      canonical, is the canonicalHeir — so the lineage to check is exactly its ancestors:
+     *      - The record is resolved: the query is resolved for this lineage (QueryAlreadyResolved). Nothing
+     *        above it needs checking: an ancestor resolves a query only before it forks, so any record below it
+     *        was created later — rejected by this same check, or created resolved (a forking query's spawn).
+     *      - The record is open: the query was inherited, and its tips are complete — every record copies its
+     *        inherited tips at its first touch, and an ancestor is frozen once it forks.
+     *      - No record up to the genesis: the query was not inherited (QueryNotInherited).
+     *      The reportable time is the parent's forkTime: the moment of the fork that carried the query in. Every
+     *      unresolved query restarts here with a full window at the fork, whatever state its ancestor record was
+     *      frozen in — those stakes stay in the ancestor record, refundable through migrateStake.
+     * @param universeId The (Active) universe the query is being acted on in.
      * @param queryId The query in question.
      * @return queryCreateTime The timestamp the query became reportable in this universe.
+     * @return inheritedTips The tips inherited from the lineage; zero when the local record already exists (it
+     *         holds its own, which the caller reads from the record).
      */
-    function _inheritedQueryCreateTime(uint248 universeId, uint256 queryId)
+    function _inheritedQueryProperties(uint248 universeId, uint256 queryId)
         internal
         view
-        returns (uint48 queryCreateTime)
+        returns (uint48 queryCreateTime, uint128 inheritedTips)
     {
         queryCreateTime = queryResolutions[universeId][queryId].queryCreateTime;
-        if (queryCreateTime != 0) return queryCreateTime;
-        // The query was not created in this universe, so it is only available here if this universe
-        // descends from the query's origin universe. New queries cannot be created in a forked (ancestor)
-        // universe, so an origin-is-ancestor match guarantees the query was genuinely inherited.
-        if (!_isSelfOrAncestor(queries[queryId].originUniverse, universeId)) {
-            revert QueryNotInherited();
+        if (queryCreateTime != 0) return (queryCreateTime, 0);
+        // The genesis has no parent: a query it lacks a record for is not inherited.
+        if (universeId == GENESIS_UNIVERSE_ID) revert QueryNotInherited();
+        uint248 parentId = universes[universeId].parent;
+        uint248 currentId = parentId;
+        while (true) {
+            QueryResolution storage ancestorResolution = queryResolutions[currentId][queryId];
+            if (ancestorResolution.queryCreateTime != 0) {
+                if (ancestorResolution.outcome != UNRESOLVED) revert QueryAlreadyResolved();
+                return (universes[parentId].forkTime, ancestorResolution.tips);
+            }
+            // Every parent chain terminates at the genesis.
+            if (currentId == GENESIS_UNIVERSE_ID) revert QueryNotInherited();
+            currentId = universes[currentId].parent;
         }
-        // The query becomes reportable in this universe at the moment of the fork that carried it in:
-        // the parent's forkTime (this universe's own forkTime is 0 until it forks itself). The genesis
-        // has no parent and never reaches here: a query it lacks a record for is not inherited.
-        queryCreateTime = universes[universes[universeId].parent].forkTime;
-    }
-
-    /**
-     * @notice Returns when a query became reportable in a universe, setting it lazily on first access.
-     * @dev See _inheritedQueryCreateTime for the rule; this stores the inherited clock in the local
-     *      record so the query's window is anchored for good in this universe.
-     * @param universeId The universe the query is being acted on in.
-     * @param queryId The query in question.
-     * @return queryCreateTime The timestamp the query became reportable in this universe.
-     */
-    function _getAndUpdateQueryCreateTime(uint248 universeId, uint256 queryId)
-        internal
-        returns (uint48 queryCreateTime)
-    {
-        QueryResolution storage resolution = queryResolutions[universeId][queryId];
-        if (resolution.queryCreateTime != 0) return resolution.queryCreateTime;
-        queryCreateTime = _inheritedQueryCreateTime(universeId, queryId);
-        resolution.queryCreateTime = queryCreateTime;
     }
 
     /**
