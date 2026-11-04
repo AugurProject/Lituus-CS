@@ -4,6 +4,9 @@ pragma solidity ^0.8.35;
 import { Test } from "forge-std/Test.sol";
 
 import { Multiverse } from "src/Multiverse.sol";
+import { LituusRepDeployer } from "src/LituusRepDeployer.sol";
+import { IPermit2 } from "src/interfaces/IPermit2.sol";
+import { Permit2Deployer } from "../utils/Permit2Deployer.sol";
 import { ILituusRep } from "src/interfaces/ILituusRep.sol";
 import { IReputationToken } from "src/interfaces/IReputationToken.sol";
 import { IZoltarQuestionData } from "src/interfaces/IZoltar.sol";
@@ -54,6 +57,10 @@ abstract contract MultiverseDeployFixture is Test {
     MockZoltar internal zoltar;
     // Set by the default _deployFeeController; suites overriding the hook leave it unset.
     MockQueryFeeController internal feeCtl;
+    // Deploys the wREP vaults for the Multiverse; it must exist before the Multiverse's constructor runs.
+    LituusRepDeployer internal vaultDeployer;
+    // The real Permit2, deployed from its creation code.
+    IPermit2 internal permit2;
     Multiverse internal multiverse;
     ILituusRep internal genesisRep;
 
@@ -133,6 +140,8 @@ abstract contract MultiverseDeployFixture is Test {
         zoltarQuestionData = new MockZoltarQuestionData();
         zoltar = new MockZoltar(IReputationToken(address(underlying)), zoltarQuestionData, GENESIS_UID);
         IQueryFeeController controller = _deployFeeController();
+        vaultDeployer = new LituusRepDeployer();
+        permit2 = Permit2Deployer.deploy();
         multiverse = _deployMultiverse(controller);
 
         (ILituusRep repToken,,,,,,,,,,,,) = multiverse.universes(GENESIS_UID);
@@ -156,7 +165,15 @@ abstract contract MultiverseDeployFixture is Test {
     ///      harness (e.g. exposing internal views) override this.
     function _deployMultiverse(IQueryFeeController controller) internal virtual returns (Multiverse) {
         return new Multiverse(
-            zoltar, GENESIS_UID, controller, queryTokenizerStub, MIGRATION_DURATION, REPORTING_PERIOD, APPEAL_PERIOD
+            zoltar,
+            GENESIS_UID,
+            controller,
+            queryTokenizerStub,
+            vaultDeployer,
+            permit2,
+            MIGRATION_DURATION,
+            REPORTING_PERIOD,
+            APPEAL_PERIOD
         );
     }
 

@@ -2,19 +2,23 @@
 pragma solidity ^0.8.35;
 
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import { IZoltar, IZoltarQuestionData } from "./interfaces/IZoltar.sol";
 import { ILituusRep } from "./interfaces/ILituusRep.sol";
-import { LituusRep } from "./LituusRep.sol";
+import { ILituusRepDeployer } from "./interfaces/ILituusRepDeployer.sol";
 import { IReputationToken } from "./interfaces/IReputationToken.sol";
 import { IQueryFeeController } from "./interfaces/IQueryFeeController.sol";
 import { IMultiverse } from "./interfaces/IMultiverse.sol";
+import { IPermit2 } from "./interfaces/IPermit2.sol";
+import { PermitSupport } from "./PermitSupport.sol";
 import { ForkLib } from "./libraries/ForkLib.sol";
 import { MultiverseHelpers } from "./libraries/MultiverseHelpers.sol";
 
-contract Multiverse is ReentrancyGuard, IMultiverse {
+contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
+    using SafeERC20 for IERC20;
     using SafeERC20 for ILituusRep;
 
     /* ========================================== CONSTANTS/IMMUTABLES =========================================== */
@@ -52,6 +56,9 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
     // The QueryTokenizer allowed to create queries at a tokenizer-supplied price.
     // One immutable contract serves every universe.
     address public immutable QUERY_TOKENIZER;
+    // Deploys the wREP vaults (genesis and every child) with this contract as owner. Kept separate so the
+    // vault's creation code stays out of this contract's bytecode.
+    ILituusRepDeployer public immutable VAULT_DEPLOYER;
 
     // Time periods
     uint256 public immutable MIGRATION_DURATION;
@@ -289,21 +296,27 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      * @param _queryFeeController The controller owning each universe's monthly base fee.
      * @param _queryTokenizer The QueryTokenizer allowed to create queries at a tokenizer-supplied price
      * (one immutable contract for all universes).
+     * @param _vaultDeployer The deployer of the wREP vaults.
+     * @param _permit2 Uniswap's Permit2, for approving and paying in one transaction (see PermitSupport).
      */
     constructor(
         IZoltar _zoltar,
         uint248 _initialZoltarUniverseId,
         IQueryFeeController _queryFeeController,
         address _queryTokenizer,
+        ILituusRepDeployer _vaultDeployer,
+        IPermit2 _permit2,
         uint256 _migrationDuration,
         uint256 _reportingPeriod,
         uint256 _appealPeriod
-    ) {
+    ) PermitSupport(_permit2) {
         MIGRATION_DURATION = _migrationDuration;
         REPORTING_PERIOD = _reportingPeriod;
         APPEAL_PERIOD = _appealPeriod;
         QUERY_TOKENIZER = _queryTokenizer;
         if (QUERY_TOKENIZER == address(0)) revert ZeroAddress();
+        VAULT_DEPLOYER = _vaultDeployer;
+        if (address(VAULT_DEPLOYER) == address(0)) revert ZeroAddress();
         ZOLTAR = _zoltar;
         if (address(ZOLTAR) == address(0)) revert ZeroAddress();
         ZOLTAR_QUESTION_DATA = ZOLTAR.zoltarQuestionData();
@@ -317,7 +330,9 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         // token symbol will use a per-universe suffix. Genesis universe will have symbol "REP0"
         // TODO: Discuss the format of the suffix if the forks are for binary queries.
         ILituusRep repToken =
-            new LituusRep(address(this), address(initialZoltarRepToken), "Lituus Reputation Token", "REP0", SCALE);
+            VAULT_DEPLOYER.deploy(address(initialZoltarRepToken), "Lituus Reputation Token", "REP0", SCALE);
+        // wrap() through Permit2 brings the underlying here first and wraps it from this contract.
+        IERC20(address(initialZoltarRepToken)).forceApprove(address(repToken), type(uint256).max);
 
         // Lituus universe ids mirror Zoltar universe ids (children already use Zoltar's child ids via
         // getChildUniverseId), so the genesis must be keyed by its Zoltar id.
@@ -413,6 +428,25 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         return repToken.convertToSharesUp(ZOLTAR.getUniverseTheoreticalSupply(universeId) / CAP_DIVISOR);
     }
 
+    /* ============================================ PERMIT FUNCTIONS ============================================= */
+    /**
+     * @notice Applies the caller's ERC-2612 permit on a universe's wREP in favor of this contract, so a fee or
+     *         a stake can be approved and paid in one multicall: [permitRep, createQuery] or [permitRep, report].
+     * @dev A permit somebody else already submitted goes through as long as the allowance it set is in place;
+     *      anything that leaves the allowance short of `value` reverts with PermitNotEffective.
+     * @param universeId The universe whose wREP the permit is for.
+     * @param value The allowance the permit grants.
+     * @param deadline The permit's deadline.
+     * @param v The signature's v.
+     * @param r The signature's r.
+     * @param s The signature's s.
+     */
+    function permitRep(uint248 universeId, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) external {
+        ILituusRep repToken = universes[universeId].repToken;
+        if (address(repToken) == address(0)) revert InvalidUniverse();
+        _permit(repToken, value, deadline, v, r, s);
+    }
+
     /* ============================================= WRAP FUNCTIONS ============================================== */
     /**
      * @notice Wraps a universe's underlying Zoltar REP into its Lituus REP (wREP) for the caller.
@@ -422,6 +456,9 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      *      underlying spent and the shares received round down, with `sharesToReceive` the caller
      *      fixes the shares received and the underlying pulled rounds up. Both roundings favor
      *      the vault.
+     *      The underlying is pulled on the caller's allowance to the vault when it covers the amount, through
+     *      the caller's Permit2 allowance otherwise (the underlying then passes through this contract, which
+     *      wraps it and hands the shares over).
      * @param universeId The universe whose REP token to wrap into.
      * @param assetsToProvide The exact amount of underlying REP to spend (0 to fix shares instead).
      * @param sharesToReceive The exact amount of wREP shares to receive (0 to fix assets instead).
@@ -439,13 +476,25 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         // TODO: check universe status
         // TODO: maybe check if some fork is upcoming (some escalation game is close to fork threshold)
         ILituusRep repToken = universes[universeId].repToken;
-        if (assetsToProvide > 0) {
-            assets = assetsToProvide;
-            shares = repToken.wrap(msg.sender, assetsToProvide);
+        bool exactAssets = assetsToProvide > 0;
+        assets = exactAssets ? assetsToProvide : repToken.convertToAssetsUp(sharesToReceive);
+
+        address payer = msg.sender;
+        IERC20 underlying = repToken.UNDERLYING_TOKEN();
+        if (underlying.allowance(msg.sender, address(repToken)) < assets) {
+            // REP amounts stay far below uint160.
+            // forge-lint: disable-next-line(unsafe-typecast)
+            PERMIT2.transferFrom(msg.sender, address(this), uint160(assets), address(underlying));
+            payer = address(this);
+        }
+        if (exactAssets) {
+            shares = repToken.wrap(payer, assets);
         } else {
             shares = sharesToReceive;
-            assets = repToken.wrapShares(msg.sender, sharesToReceive);
+            // Pulls exactly `assets`: the same rounded-up conversion at the same rate.
+            repToken.wrapShares(payer, shares);
         }
+        if (payer == address(this)) repToken.safeTransfer(msg.sender, shares);
     }
 
     /**
@@ -518,9 +567,8 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         // by _requiredStake.
         uint256 queryFeeCap = _queryFeeCap(universe.repToken, universeId);
         if (fee >= queryFeeCap) fee = queryFeeCap;
-        // transfer the query fee amount of REP token
-        // TODO: permit? permit2?
-        universe.repToken.safeTransferFrom(msg.sender, address(this), fee);
+        // Take the fee: plain allowance, or the caller's Permit2 allowance (see PermitSupport).
+        _pull(universe.repToken, fee);
 
         _recordQuery(msg.sender, universeId, question, numberOfOutcomes, fee);
     }
@@ -632,7 +680,7 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
         }
 
         uint256 stake = _requiredStake(resolution, queries[queryId].fee, outcome, cap);
-        universe.repToken.safeTransferFrom(msg.sender, address(this), stake);
+        _pull(universe.repToken, stake);
 
         // bounded by the cap, itself a uint96
         // forge-lint: disable-next-line(unsafe-typecast)
@@ -1511,7 +1559,15 @@ contract Multiverse is ReentrancyGuard, IMultiverse {
      */
     function spawnChildUniverse(uint248 universeId, uint256 outcome) external nonReentrant {
         uint248 childUniverseId = ForkLib.spawnChildUniverse(
-            universes, queries, queryResolutions, ZOLTAR, ZOLTAR_QUESTION_DATA, REPORTING_PERIOD, universeId, outcome
+            universes,
+            queries,
+            queryResolutions,
+            ZOLTAR,
+            ZOLTAR_QUESTION_DATA,
+            VAULT_DEPLOYER,
+            REPORTING_PERIOD,
+            universeId,
+            outcome
         );
 
         // Inherit the parent's base fee so the child can charge nonzero query fees from birth

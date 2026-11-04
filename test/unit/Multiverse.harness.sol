@@ -4,6 +4,8 @@ pragma solidity ^0.8.35;
 import { Multiverse } from "src/Multiverse.sol";
 import { IZoltar } from "src/interfaces/IZoltar.sol";
 import { IQueryFeeController } from "src/interfaces/IQueryFeeController.sol";
+import { ILituusRepDeployer } from "src/interfaces/ILituusRepDeployer.sol";
+import { IPermit2 } from "src/interfaces/IPermit2.sol";
 
 /// @notice Test harness exposing the Multiverse's internal statistics views as external functions.
 /// @dev Suites that need it override `_deployMultiverse` to deploy this instead of the production contract.
@@ -13,6 +15,8 @@ contract MultiverseHarness is Multiverse {
         uint248 genesisUniverseId,
         IQueryFeeController queryFeeController,
         address queryTokenizer,
+        ILituusRepDeployer vaultDeployer,
+        IPermit2 permit2,
         uint256 migrationDuration,
         uint256 reportingPeriod,
         uint256 appealPeriod
@@ -22,6 +26,8 @@ contract MultiverseHarness is Multiverse {
             genesisUniverseId,
             queryFeeController,
             queryTokenizer,
+            vaultDeployer,
+            permit2,
             migrationDuration,
             reportingPeriod,
             appealPeriod

@@ -8,6 +8,8 @@ import { IMultiverse } from "./interfaces/IMultiverse.sol";
 import { IQueryToken } from "./interfaces/IQueryToken.sol";
 import { IQueryTokenizer } from "./interfaces/IQueryTokenizer.sol";
 import { ILituusRep } from "./interfaces/ILituusRep.sol";
+import { IPermit2 } from "./interfaces/IPermit2.sol";
+import { PermitSupport } from "./PermitSupport.sol";
 import { QueryToken } from "./QueryToken.sol";
 
 /**
@@ -33,8 +35,11 @@ import { QueryToken } from "./QueryToken.sol";
  *      their share of the pool migrates through the Multiverse as a counted vote for that child, and the
  *      same number of the child's tokens is minted to the holder. Tokens not migrated stay in the parent
  *      with their share of the pool, worthless.
+ *
+ *      Minting takes the wREP on a plain allowance or through Permit2, and `permitRep` applies an ERC-2612
+ *      permit on the wREP, so approving and minting fit in one `multicall` (see PermitSupport).
  */
-contract QueryTokenizer is ReentrancyGuard, IQueryTokenizer {
+contract QueryTokenizer is ReentrancyGuard, PermitSupport, IQueryTokenizer {
     using SafeERC20 for ILituusRep;
 
     /* ========================================== CONSTANTS/IMMUTABLES =========================================== */
@@ -77,7 +82,8 @@ contract QueryTokenizer is ReentrancyGuard, IQueryTokenizer {
     );
 
     /* =========================================== CONSTRUCTOR/SETTER ============================================ */
-    constructor() {
+    /// @param permit2_ Uniswap's Permit2 (see PermitSupport).
+    constructor(IPermit2 permit2_) PermitSupport(permit2_) {
         DEPLOYER = msg.sender;
     }
 
@@ -124,7 +130,7 @@ contract QueryTokenizer is ReentrancyGuard, IQueryTokenizer {
         (uint256 price, ILituusRep repToken) = _mintPrice(multiverse_, universeId);
         uint256 cost = price * amount;
         if (cost == 0) revert ZeroCost();
-        repToken.safeTransferFrom(msg.sender, address(this), cost);
+        _pull(repToken, cost);
         pooledRep[universeId] += cost;
 
         IQueryToken queryToken = _getOrDeployToken(universeId);
@@ -157,6 +163,11 @@ contract QueryTokenizer is ReentrancyGuard, IQueryTokenizer {
     }
 
     /* ============================================ FORK MIGRATION =============================================== */
+    /// @inheritdoc IQueryTokenizer
+    function permitRep(uint248 universeId, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) external {
+        _permit(multiverse.repTokenOf(universeId), value, deadline, v, r, s);
+    }
+
     /// @inheritdoc IQueryTokenizer
     function migrate(uint248 parentUniverseId, uint256 childOutcome, uint256 amount) external nonReentrant {
         if (amount == 0) revert ZeroAmount();

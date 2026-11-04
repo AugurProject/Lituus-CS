@@ -7,7 +7,7 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { IZoltar, IZoltarQuestionData } from "../interfaces/IZoltar.sol";
 import { ILituusRep } from "../interfaces/ILituusRep.sol";
 import { IReputationToken } from "../interfaces/IReputationToken.sol";
-import { LituusRep } from "../LituusRep.sol";
+import { ILituusRepDeployer } from "../interfaces/ILituusRepDeployer.sol";
 import { Multiverse } from "../Multiverse.sol";
 import { MultiverseHelpers } from "./MultiverseHelpers.sol";
 
@@ -239,6 +239,7 @@ library ForkLib {
         mapping(uint248 universeId => mapping(uint256 queryId => Multiverse.QueryResolution)) storage queryResolutions,
         IZoltar zoltar,
         IZoltarQuestionData zoltarQuestionData,
+        ILituusRepDeployer vaultDeployer,
         uint256 reportingPeriod,
         uint248 universeId,
         uint256 outcome
@@ -270,17 +271,25 @@ library ForkLib {
         }
 
         childUniverseId = _spawnChildUniverse(
-            universes, queries, queryResolutions, zoltar, reportingPeriod, universeId, forkQueryId, outcome
+            universes,
+            queries,
+            queryResolutions,
+            zoltar,
+            vaultDeployer,
+            reportingPeriod,
+            universeId,
+            forkQueryId,
+            outcome
         );
     }
 
     /**
      * @notice Creates one child universe for a forking branch and links it into the fork tree.
-     * @dev Deploys the Zoltar-side child if needed, then the child's Lituus REP vault at the parent's
-     *      rate (so accrued appreciation carries over), approves the vault to pull migrated underlying
-     *      from this contract, and resolves the forking query to the CHILD'S OWN outcome — every child
-     *      answers the forking query its own way. Children spawn Active (fully functional immediately) and
-     *      non-canonical.
+     * @dev Deploys the Zoltar-side child if needed, then the child's Lituus REP vault through the vault
+     *      deployer at the parent's rate (so accrued appreciation carries over), approves the vault to pull
+     *      migrated underlying from this contract, and resolves the forking query to the CHILD'S OWN outcome —
+     *      every child answers the forking query its own way. Children spawn Active (fully functional
+     *      immediately) and non-canonical.
      * @param universeId The parent universe forking.
      * @param queryId The forking query.
      * @param outcome The Zoltar outcome index the child is keyed by. For a Lituus fork it is also the forking
@@ -292,6 +301,7 @@ library ForkLib {
         mapping(uint256 queryId => Multiverse.Query) storage queries,
         mapping(uint248 universeId => mapping(uint256 queryId => Multiverse.QueryResolution)) storage queryResolutions,
         IZoltar zoltar,
+        ILituusRepDeployer vaultDeployer,
         uint256 reportingPeriod,
         uint248 universeId,
         uint256 queryId,
@@ -320,14 +330,14 @@ library ForkLib {
         // Deploy a Lituus REP token that wraps the child's Zoltar REP token
         // TODO: have the same REP token symbol format as in Zoltar
         // The child vault starts at the parent's current rate.
-        ILituusRep childUniverseRepToken = new LituusRep(
-            address(this),
+        // The deployer makes its caller the owner: under DELEGATECALL that is the Multiverse.
+        ILituusRep childUniverseRepToken = vaultDeployer.deploy(
             address(childUniverseZoltarRepToken),
             "Lituus Reputation Token",
             "REP0.0", // TODO
             parentUniverse.repToken.rate()
         );
-        // migrate() wraps migrated underlying into the child vault, which pulls from this contract.
+        // migrate() and wrap() through Permit2 bring the underlying here first and wrap it from this contract.
         IERC20(address(childUniverseZoltarRepToken)).forceApprove(address(childUniverseRepToken), type(uint256).max);
         // The child vault spawns with unwrap OPEN: unwrapping child wREP harms nothing — fork
         // accounting is counter-based, and only migrate()/migrateStake() write totalMigratedIn. The
