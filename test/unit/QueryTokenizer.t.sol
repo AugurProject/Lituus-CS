@@ -22,7 +22,7 @@ contract QueryTokenizerTest is QueryTokenizerFixtures {
     }
 
     function test_RevertWhen_SetMultiverse_NotDeployer() public {
-        QueryTokenizer fresh = new QueryTokenizer();
+        QueryTokenizer fresh = new QueryTokenizer(permit2);
 
         vm.prank(user);
         vm.expectRevert(QueryTokenizer.CannotSet.selector);
@@ -37,7 +37,7 @@ contract QueryTokenizerTest is QueryTokenizerFixtures {
     }
 
     function test_SetMultiverse_SetsOnce() public {
-        QueryTokenizer fresh = new QueryTokenizer();
+        QueryTokenizer fresh = new QueryTokenizer(permit2);
         assertEq(address(fresh.multiverse()), address(0));
 
         fresh.setMultiverse(IMultiverse(address(multiverse)));

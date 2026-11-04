@@ -2,6 +2,7 @@
 pragma solidity ^0.8.35;
 
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { IERC20Permit } from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Permit.sol";
 
 /// @notice Lituus REP (wREP): a share token over an underlying Zoltar REP vault.
 /// @dev Share-based accounting with a stored exchange rate. The rate (underlying assets per share,
@@ -20,7 +21,7 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 ///      All state-changing functions are restricted to the owner (the Multiverse); the vault
 ///      exposes no public deposit/redeem surface. The underlying is assumed to be a standard
 ///      ERC20 (no transfer fees, no rebasing, no hooks).
-interface ILituusRep is IERC20 {
+interface ILituusRep is IERC20, IERC20Permit {
     /* ================================================== EVENTS ================================================= */
 
     /// @notice Emitted when underlying is wrapped into shares.
@@ -141,6 +142,9 @@ interface ILituusRep is IERC20 {
     /// @dev Moves only on wraps and unwraps. Direct underlying transfers to the vault are not
     /// reflected here and are unrecoverable.
     function totalAssets() external view returns (uint256);
+
+    /// @notice The underlying Zoltar REP token this vault wraps.
+    function UNDERLYING_TOKEN() external view returns (IERC20);
 
     /// @notice Whether unwrapping is paused.
     function unwrapPaused() external view returns (bool);
