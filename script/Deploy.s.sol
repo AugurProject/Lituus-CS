@@ -20,6 +20,17 @@ import { IPermit2 } from "src/interfaces/IPermit2.sol";
 ///      setter (QueryFeeController.setMultiverse / QueryTokenizer.setMultiverse). Requires an
 ///      already-deployed Zoltar: the Multiverse constructor reads its question-data and REP token
 ///      addresses (the tokenizer reads everything, the mint-price cap included, off the Multiverse).
+///      The Multiverse links the external library ForkLib, which forge script handles before deploying it:
+///      unless an address is given (`--libraries` or `libraries` in foundry.toml), it computes ForkLib's
+///      CREATE2 address from the `create2_deployer` and `create2_library_salt` config (defaults: the standard
+///      deployer 0x4e59b44847b379578588920cA78FbF26c0B4956C and salt 0) and ForkLib's creation code, checks
+///      the chain at that address and deploys ForkLib there only if no code is present, then links that
+///      address. That address is derived from the exact bytecode, so an existing copy is always this same
+///      build, and any change to ForkLib yields a new address and a fresh deploy. On a chain where the
+///      CREATE2 deployer has no code, forge instead deploys ForkLib with a plain CREATE from the broadcasting
+///      account: the address then follows the account's nonce, not the bytecode, so the guarantees above do
+///      not hold. The broadcast file lists the linked address under `libraries`. Deploying or verifying the
+///      Multiverse any other way needs `--libraries src/libraries/ForkLib.sol:ForkLib:<address>`.
 ///      Env vars: PRIVATE_KEY, ZOLTAR_ADDRESS, GENESIS_UNIVERSE_ID (the Zoltar universe id
 ///      treated as the Lituus genesis), and optionally PERMIT2_ADDRESS (defaults to the canonical Permit2).
 contract Deploy is Script {
