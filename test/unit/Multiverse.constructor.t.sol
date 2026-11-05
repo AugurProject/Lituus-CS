@@ -74,12 +74,13 @@ contract MultiverseConstructorTest is MultiverseFixtures {
     function test_Constructor_SetsImmutables() public {
         uint256 deployTime = START_TIME + 5 days;
         vm.warp(deployTime);
+        LituusRepDeployer newVaultDeployer = _newVaultDeployer();
         Multiverse newMultiverse = new Multiverse(
             zoltar,
             GENESIS_UID,
             feeCtl,
             queryTokenizerStub,
-            vaultDeployer,
+            newVaultDeployer,
             permit2,
             MIGRATION_DURATION,
             REPORTING_PERIOD,
@@ -87,7 +88,7 @@ contract MultiverseConstructorTest is MultiverseFixtures {
         );
 
         assertEq(address(newMultiverse.ZOLTAR()), address(zoltar));
-        assertEq(address(newMultiverse.VAULT_DEPLOYER()), address(vaultDeployer));
+        assertEq(address(newMultiverse.VAULT_DEPLOYER()), address(newVaultDeployer));
         assertEq(newMultiverse.GENESIS_UNIVERSE_ID(), GENESIS_UID);
         assertEq(address(newMultiverse.QUERY_FEE_CONTROLLER()), address(feeCtl));
         assertEq(newMultiverse.GENESIS_TIMESTAMP(), deployTime);
@@ -101,7 +102,7 @@ contract MultiverseConstructorTest is MultiverseFixtures {
         // Values distinct from the fixture defaults, so the assertions prove the immutables come from
         // the constructor arguments rather than from any baked-in constant.
         Multiverse newMultiverse = new Multiverse(
-            zoltar, GENESIS_UID, feeCtl, queryTokenizerStub, vaultDeployer, permit2, 30 days, 2 days, 12 hours
+            zoltar, GENESIS_UID, feeCtl, queryTokenizerStub, _newVaultDeployer(), permit2, 30 days, 2 days, 12 hours
         );
 
         assertEq(newMultiverse.MIGRATION_DURATION(), 30 days);
@@ -115,7 +116,7 @@ contract MultiverseConstructorTest is MultiverseFixtures {
             GENESIS_UID,
             feeCtl,
             queryTokenizerStub,
-            vaultDeployer,
+            _newVaultDeployer(),
             permit2,
             MIGRATION_DURATION,
             REPORTING_PERIOD,
@@ -162,42 +163,109 @@ contract MultiverseConstructorTest is MultiverseFixtures {
         LituusRep rep = LituusRep(address(genesisRep));
         assertEq(rep.name(), "Lituus Reputation Token");
         assertEq(rep.symbol(), "REP0");
-        // The deployer hands the vault to whoever asked for it: the Multiverse, not the deployer itself.
+        // The deployer hands the vault to the Multiverse it serves, never to itself.
         assertEq(rep.owner(), address(multiverse));
+        assertEq(vaultDeployer.MULTIVERSE(), address(multiverse));
         assertEq(address(rep.UNDERLYING_TOKEN()), address(underlying));
         assertEq(rep.rate(), multiverse.SCALE());
     }
 
     function test_Constructor_DeploysRepTokenThroughTheDeployer() public {
-        // The deployer's event names the Multiverse as owner, and the vault it announces is the genesis vault.
-        address predictedVault = vm.computeCreateAddress(address(vaultDeployer), vm.getNonce(address(vaultDeployer)));
-        address predictedMultiverse = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
-        vm.expectEmit(true, true, true, true, address(vaultDeployer));
-        emit LituusRepDeployer.LituusRepDeployed(predictedMultiverse, address(underlying), predictedVault);
+        // The vault the deployer announces is the genesis vault, owned by the Multiverse that was predicted.
+        LituusRepDeployer newVaultDeployer = _newVaultDeployer();
+        address predictedMultiverse = newVaultDeployer.MULTIVERSE();
+        address predictedVault =
+            vm.computeCreateAddress(address(newVaultDeployer), vm.getNonce(address(newVaultDeployer)));
+        vm.expectEmit(true, true, true, true, address(newVaultDeployer));
+        emit LituusRepDeployer.LituusRepDeployed(address(underlying), predictedVault);
         Multiverse newMultiverse = new Multiverse(
             zoltar,
             GENESIS_UID,
             feeCtl,
             queryTokenizerStub,
-            vaultDeployer,
+            newVaultDeployer,
             permit2,
             MIGRATION_DURATION,
             REPORTING_PERIOD,
             APPEAL_PERIOD
         );
 
+        assertEq(address(newMultiverse), predictedMultiverse);
         (ILituusRep repToken,,,,,,,,,,,,) = newMultiverse.universes(GENESIS_UID);
         assertEq(address(repToken), predictedVault);
         assertEq(LituusRep(predictedVault).owner(), address(newMultiverse));
     }
 
-    function test_VaultDeployer_VaultBelongsToTheCaller() public {
-        // Anyone can call the deployer; the vault is owned by the caller and no universe points at it.
+    function test_Constructor_DeploysAtThePredictedCreate2Address() public {
+        // The production flow: the vault deployer's address is the account's next CREATE address, the Multiverse's
+        // is the CREATE2 address of its creation code carrying that deployer, and the deployer is bound to it
+        // before either exists. The constructor then finds the deployer expecting exactly this address.
+        bytes32 salt = keccak256("Lituus Multiverse");
+        address vaultDeployerAddress = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
+        bytes memory arguments = abi.encode(
+            zoltar,
+            GENESIS_UID,
+            feeCtl,
+            queryTokenizerStub,
+            ILituusRepDeployer(vaultDeployerAddress),
+            permit2,
+            MIGRATION_DURATION,
+            REPORTING_PERIOD,
+            APPEAL_PERIOD
+        );
+        address predictedMultiverse = vm.computeCreate2Address(
+            salt, keccak256(abi.encodePacked(type(Multiverse).creationCode, arguments)), address(this)
+        );
+
+        LituusRepDeployer newVaultDeployer = new LituusRepDeployer(predictedMultiverse);
+        assertEq(address(newVaultDeployer), vaultDeployerAddress);
+        Multiverse newMultiverse = new Multiverse{ salt: salt }(
+            zoltar,
+            GENESIS_UID,
+            feeCtl,
+            queryTokenizerStub,
+            newVaultDeployer,
+            permit2,
+            MIGRATION_DURATION,
+            REPORTING_PERIOD,
+            APPEAL_PERIOD
+        );
+
+        assertEq(address(newMultiverse), predictedMultiverse);
+        (ILituusRep repToken,,,,,,,,,,,,) = newMultiverse.universes(GENESIS_UID);
+        assertEq(LituusRep(address(repToken)).owner(), predictedMultiverse);
+    }
+
+    function test_RevertWhen_Constructor_DeployerBoundToAnotherAddress() public {
+        // A deployer serving some other address refuses the genesis vault, so the Multiverse never deploys.
+        LituusRepDeployer strayDeployer = new LituusRepDeployer(makeAddr("not this multiverse"));
+        vm.expectRevert(LituusRepDeployer.NotMultiverse.selector);
+        new Multiverse(
+            zoltar,
+            GENESIS_UID,
+            feeCtl,
+            queryTokenizerStub,
+            strayDeployer,
+            permit2,
+            MIGRATION_DURATION,
+            REPORTING_PERIOD,
+            APPEAL_PERIOD
+        );
+    }
+
+    function test_RevertWhen_VaultDeployer_CallerIsNotTheMultiverse() public {
+        // Nobody but the Multiverse gets a vault out of the deployer: a stray token can never carry this
+        // deployer's name.
         vm.prank(user);
-        ILituusRep vault = vaultDeployer.deploy(address(underlying), "Stray", "S", 2 ether);
-        assertEq(LituusRep(address(vault)).owner(), user);
-        assertEq(LituusRep(address(vault)).rate(), 2 ether);
-        assertTrue(address(vault) != address(genesisRep));
+        vm.expectRevert(LituusRepDeployer.NotMultiverse.selector);
+        vaultDeployer.deploy(address(underlying), "Stray", "S", 2 ether);
+        vm.expectRevert(LituusRepDeployer.NotMultiverse.selector);
+        vaultDeployer.deploy(address(underlying), "Stray", "S", 2 ether);
+    }
+
+    function test_RevertWhen_VaultDeployer_MultiverseIsZero() public {
+        vm.expectRevert(LituusRepDeployer.ZeroAddress.selector);
+        new LituusRepDeployer(address(0));
     }
 
     function test_Constructor_Constants() public view {
