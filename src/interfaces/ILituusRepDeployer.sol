@@ -3,12 +3,10 @@ pragma solidity ^0.8.35;
 
 import { ILituusRep } from "./ILituusRep.sol";
 
-/// @notice Deploys Lituus REP vaults on behalf of the caller. Kept outside the Multiverse so the vault's
-///         creation code does not count against the Multiverse's own size.
+/// @notice Deploys Lituus REP vaults for one Multiverse, and for nobody else. Kept outside the Multiverse so the
+///         vault's creation code does not count against the Multiverse's own size.
 interface ILituusRepDeployer {
-    /// @notice Deploys a vault over `underlyingToken` owned by the caller.
-    /// @dev Permissionless on purpose: the vault belongs to whoever calls, so a stranger only ever gets a
-    ///      vault of their own that no universe points at.
+    /// @notice Deploys a vault over `underlyingToken` owned by the Multiverse. Only the Multiverse may call.
     /// @param underlyingToken The Zoltar REP token the vault wraps.
     /// @param name The ERC20 name of the share token.
     /// @param symbol The ERC20 symbol of the share token.
@@ -17,4 +15,7 @@ interface ILituusRepDeployer {
     function deploy(address underlyingToken, string calldata name, string calldata symbol, uint256 initialRate)
         external
         returns (ILituusRep);
+
+    /// @notice The Multiverse this deployer serves, fixed at construction.
+    function MULTIVERSE() external view returns (address);
 }

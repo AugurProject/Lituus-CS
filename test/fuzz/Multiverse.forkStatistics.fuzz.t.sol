@@ -34,6 +34,7 @@ contract MultiverseForkStatisticsFuzzTest is MultiverseFuzzFixtures {
     }
 
     function _deployMultiverse(IQueryFeeController controller) internal override returns (Multiverse) {
+        vaultDeployer = _newVaultDeployer();
         harness = new MultiverseHarness(
             zoltar,
             GENESIS_UID,

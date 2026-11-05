@@ -57,7 +57,8 @@ abstract contract MultiverseDeployFixture is Test {
     MockZoltar internal zoltar;
     // Set by the default _deployFeeController; suites overriding the hook leave it unset.
     MockQueryFeeController internal feeCtl;
-    // Deploys the wREP vaults for the Multiverse; it must exist before the Multiverse's constructor runs.
+    // Deploys the wREP vaults for the Multiverse. Bound to the Multiverse's address before the Multiverse exists,
+    // so it is created right before the Multiverse, by _newVaultDeployer.
     LituusRepDeployer internal vaultDeployer;
     // The real Permit2, deployed from its creation code.
     IPermit2 internal permit2;
@@ -140,7 +141,6 @@ abstract contract MultiverseDeployFixture is Test {
         zoltarQuestionData = new MockZoltarQuestionData();
         zoltar = new MockZoltar(IReputationToken(address(underlying)), zoltarQuestionData, GENESIS_UID);
         IQueryFeeController controller = _deployFeeController();
-        vaultDeployer = new LituusRepDeployer();
         permit2 = Permit2Deployer.deploy();
         multiverse = _deployMultiverse(controller);
 
@@ -161,9 +161,17 @@ abstract contract MultiverseDeployFixture is Test {
     ///      controller suite wires `setMultiverse` here.
     function _afterProtocolDeploy() internal virtual { }
 
+    /// @dev A vault deployer bound to the contract this test creates next, which has to be the Multiverse: the
+    ///      production flow computes the Multiverse's CREATE2 address ahead, here the next CREATE address does.
+    function _newVaultDeployer() internal returns (LituusRepDeployer) {
+        return new LituusRepDeployer(vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1));
+    }
+
     /// @dev Multiverse deploy hook: the production contract by default. Suites that need a test
-    ///      harness (e.g. exposing internal views) override this.
+    ///      harness (e.g. exposing internal views) override this. Every override creates the vault
+    ///      deployer right before the Multiverse (see _newVaultDeployer).
     function _deployMultiverse(IQueryFeeController controller) internal virtual returns (Multiverse) {
+        vaultDeployer = _newVaultDeployer();
         return new Multiverse(
             zoltar,
             GENESIS_UID,

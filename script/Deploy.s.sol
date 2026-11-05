@@ -10,6 +10,7 @@ import { QueryTokenizer } from "src/QueryTokenizer.sol";
 import { IZoltar } from "src/interfaces/IZoltar.sol";
 import { IQueryFeeController } from "src/interfaces/IQueryFeeController.sol";
 import { IMultiverse } from "src/interfaces/IMultiverse.sol";
+import { ILituusRepDeployer } from "src/interfaces/ILituusRepDeployer.sol";
 import { IPermit2 } from "src/interfaces/IPermit2.sol";
 
 /// @notice Deployment script for the Lituus system: QueryFeeController + QueryTokenizer + LituusRepDeployer +
@@ -17,7 +18,14 @@ import { IPermit2 } from "src/interfaces/IPermit2.sol";
 /// @dev The controller, the tokenizer and the vault deployer are deployed before the Multiverse and passed
 ///      into its constructor (the constructor deploys the genesis vault through the deployer); the controller
 ///      and the tokenizer then get their Multiverse back-reference wired via a one-time, deployer-only
-///      setter (QueryFeeController.setMultiverse / QueryTokenizer.setMultiverse). Requires an
+///      setter (QueryFeeController.setMultiverse / QueryTokenizer.setMultiverse).
+///      The vault deployer serves one Multiverse, fixed in its constructor, and the Multiverse's constructor
+///      already uses it, so the Multiverse's address is computed before either exists: the vault deployer
+///      lands at the broadcasting account's next CREATE address, the Multiverse at the CREATE2 address of its
+///      creation code with that deployer address among the constructor arguments, under MULTIVERSE_SALT and
+///      the standard CREATE2 deployer forge routes `new C{salt: ...}` through. The script checks both
+///      addresses; a Multiverse landing anywhere else would fail its own constructor on the genesis vault.
+///      Requires an
 ///      already-deployed Zoltar: the Multiverse constructor reads its question-data and REP token
 ///      addresses (the tokenizer reads everything, the mint-price cap included, off the Multiverse).
 ///      The Multiverse links the external library ForkLib, which forge script handles before deploying it:
@@ -32,7 +40,8 @@ import { IPermit2 } from "src/interfaces/IPermit2.sol";
 ///      not hold. The broadcast file lists the linked address under `libraries`. Deploying or verifying the
 ///      Multiverse any other way needs `--libraries src/libraries/ForkLib.sol:ForkLib:<address>`.
 ///      Env vars: PRIVATE_KEY, ZOLTAR_ADDRESS, GENESIS_UNIVERSE_ID (the Zoltar universe id
-///      treated as the Lituus genesis), and optionally PERMIT2_ADDRESS (defaults to the canonical Permit2).
+///      treated as the Lituus genesis), and optionally PERMIT2_ADDRESS (defaults to the canonical Permit2) and
+///      MULTIVERSE_SALT (the CREATE2 salt, defaults to the hash of "Lituus Multiverse").
 contract Deploy is Script {
     // Time periods baked into the Multiverse as immutables.
     uint256 internal constant MIGRATION_DURATION = 30 days;
@@ -40,6 +49,8 @@ contract Deploy is Script {
     uint256 internal constant APPEAL_PERIOD = 1 days;
     // Uniswap's Permit2, deployed at the same address on every chain it exists on.
     address internal constant CANONICAL_PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
+    // The CREATE2 salt of the Multiverse.
+    bytes32 internal constant DEFAULT_MULTIVERSE_SALT = keccak256("Lituus Multiverse");
 
     function run()
         external
@@ -55,12 +66,33 @@ contract Deploy is Script {
         IZoltar zoltar = IZoltar(vm.envAddress("ZOLTAR_ADDRESS"));
         uint248 genesisUniverseId = uint248(vm.envUint("GENESIS_UNIVERSE_ID"));
         IPermit2 permit2 = IPermit2(vm.envOr("PERMIT2_ADDRESS", CANONICAL_PERMIT2));
+        bytes32 salt = vm.envOr("MULTIVERSE_SALT", DEFAULT_MULTIVERSE_SALT);
 
         vm.startBroadcast(deployerKey);
         queryFeeController = new QueryFeeController(genesisUniverseId);
         queryTokenizer = new QueryTokenizer(permit2);
-        vaultDeployer = new LituusRepDeployer();
-        multiverse = new Multiverse(
+
+        // The vault deployer is the account's next contract; with its address the Multiverse's creation code is
+        // complete and its CREATE2 address follows.
+        address vaultDeployerAddress = vm.computeCreateAddress(deployer, vm.getNonce(deployer));
+        bytes memory multiverseArguments = abi.encode(
+            zoltar,
+            genesisUniverseId,
+            IQueryFeeController(address(queryFeeController)),
+            address(queryTokenizer),
+            ILituusRepDeployer(vaultDeployerAddress),
+            permit2,
+            MIGRATION_DURATION,
+            REPORTING_PERIOD,
+            APPEAL_PERIOD
+        );
+        address predictedMultiverse = vm.computeCreate2Address(
+            salt, keccak256(abi.encodePacked(type(Multiverse).creationCode, multiverseArguments))
+        );
+
+        vaultDeployer = new LituusRepDeployer(predictedMultiverse);
+        require(address(vaultDeployer) == vaultDeployerAddress, "vault deployer landed elsewhere");
+        multiverse = new Multiverse{ salt: salt }(
             zoltar,
             genesisUniverseId,
             IQueryFeeController(address(queryFeeController)),
@@ -71,6 +103,7 @@ contract Deploy is Script {
             REPORTING_PERIOD,
             APPEAL_PERIOD
         );
+        require(address(multiverse) == predictedMultiverse, "Multiverse landed elsewhere");
         queryFeeController.setMultiverse(address(multiverse));
         queryTokenizer.setMultiverse(IMultiverse(address(multiverse)));
         vm.stopBroadcast();
