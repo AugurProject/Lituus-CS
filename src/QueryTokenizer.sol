@@ -8,6 +8,8 @@ import { IMultiverse } from "./interfaces/IMultiverse.sol";
 import { IQueryToken } from "./interfaces/IQueryToken.sol";
 import { IQueryTokenizer } from "./interfaces/IQueryTokenizer.sol";
 import { ILituusRep } from "./interfaces/ILituusRep.sol";
+import { IPermit2 } from "./interfaces/IPermit2.sol";
+import { PermitSupport } from "./PermitSupport.sol";
 import { QueryToken } from "./QueryToken.sol";
 
 /**
@@ -29,14 +31,15 @@ import { QueryToken } from "./QueryToken.sol";
  *
  *      Query tokens are universe-specific and are NEVER forwarded to the heir: once a universe forks,
  *      minting and redeeming freeze there (the oracle rejects non-current universes) and migration is the
- *      only path to a child.
+ *      only path to a child. Inside the migration window a holder picks a child: the parent tokens burn,
+ *      their share of the pool migrates through the Multiverse as a counted vote for that child, and the
+ *      same number of the child's tokens is minted to the holder. Tokens not migrated stay in the parent
+ *      with their share of the pool, worthless.
  *
- *      Fork migration is NOT implemented yet (`migrate` reverts). Intended semantics: during the fork
- *      window a holder picks a child universe; the matching pool share of Lituus REP migrates via the
- *      Multiverse, which custodies the sibling-universe REP, and the migrated amount counts as a vote for
- *      the chosen universe. Unmigrated tokens become useless along with their share of the pool.
+ *      Minting takes the wREP on a plain allowance or through Permit2, and `permitRep` applies an ERC-2612
+ *      permit on the wREP, so approving and minting fit in one `multicall` (see PermitSupport).
  */
-contract QueryTokenizer is ReentrancyGuard, IQueryTokenizer {
+contract QueryTokenizer is ReentrancyGuard, PermitSupport, IQueryTokenizer {
     using SafeERC20 for ILituusRep;
 
     /* ========================================== CONSTANTS/IMMUTABLES =========================================== */
@@ -64,16 +67,23 @@ contract QueryTokenizer is ReentrancyGuard, IQueryTokenizer {
     error ZeroCost();
     error QueryTokenNotExisting();
     error NoWholeTokens();
-    error MigrationNotImplemented();
     error CannotSet();
 
     /* ================================================= EVENTS ================================================== */
     event QueryTokenDeployed(uint248 indexed universeId, address token);
     event Minted(address indexed minter, uint248 indexed universeId, uint256 amount, uint256 cost);
     event Redeemed(address indexed redeemer, uint248 indexed universeId, uint256 price);
+    event QueryTokensMigrated(
+        address indexed holder,
+        uint248 indexed parentUniverseId,
+        uint248 indexed childUniverseId,
+        uint256 amount,
+        uint256 migratedRep
+    );
 
     /* =========================================== CONSTRUCTOR/SETTER ============================================ */
-    constructor() {
+    /// @param permit2_ Uniswap's Permit2 (see PermitSupport).
+    constructor(IPermit2 permit2_) PermitSupport(permit2_) {
         DEPLOYER = msg.sender;
     }
 
@@ -120,7 +130,7 @@ contract QueryTokenizer is ReentrancyGuard, IQueryTokenizer {
         (uint256 price, ILituusRep repToken) = _mintPrice(multiverse_, universeId);
         uint256 cost = price * amount;
         if (cost == 0) revert ZeroCost();
-        repToken.safeTransferFrom(msg.sender, address(this), cost);
+        _pull(repToken, cost);
         pooledRep[universeId] += cost;
 
         IQueryToken queryToken = _getOrDeployToken(universeId);
@@ -154,13 +164,36 @@ contract QueryTokenizer is ReentrancyGuard, IQueryTokenizer {
 
     /* ============================================ FORK MIGRATION =============================================== */
     /// @inheritdoc IQueryTokenizer
-    function migrate(uint248 parentUniverseId, uint248 childUniverseId, uint256 amount) external nonReentrant {
-        // Statement-expressions silence the unused-parameter warnings; the named parameters document
-        // the intended future interface.
-        parentUniverseId;
-        childUniverseId;
-        amount;
-        revert MigrationNotImplemented();
+    function permitRep(uint248 universeId, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) external {
+        _permit(multiverse.repTokenOf(universeId), value, deadline, v, r, s);
+    }
+
+    /// @inheritdoc IQueryTokenizer
+    function migrate(uint248 parentUniverseId, uint256 childOutcome, uint256 amount) external nonReentrant {
+        if (amount == 0) revert ZeroAmount();
+        IQueryToken parentToken = token[parentUniverseId];
+        if (address(parentToken) == address(0)) revert QueryTokenNotExisting();
+        uint256 wholeTokensTotalSupply = parentToken.totalSupply() / ONE_QUERY;
+        if (wholeTokensTotalSupply == 0) revert NoWholeTokens();
+
+        // The tokens take their share of the pool, rounded down: the holders who stay never lose, and the
+        // last tokens out take the whole pool with them (nothing sweeps a forked universe's pool later).
+        uint256 pooledRepTokens = pooledRep[parentUniverseId];
+        uint256 migratedRep = pooledRepTokens * amount / wholeTokensTotalSupply;
+
+        // Reverts with ERC20InsufficientBalance if the caller holds fewer whole tokens than `amount`.
+        parentToken.burn(msg.sender, amount * ONE_QUERY);
+        pooledRep[parentUniverseId] = pooledRepTokens - migratedRep;
+
+        // The Multiverse burns this contract's parent wREP (owner lane, no approval), routes it through
+        // Zoltar and hands back child wREP, which backs the child tokens from here on. The parent's state,
+        // its window and the child's existence are its checks.
+        (uint248 childUniverseId, uint256 childShares) = multiverse.migrate(parentUniverseId, childOutcome, migratedRep);
+        pooledRep[childUniverseId] += childShares;
+
+        IQueryToken childToken = _getOrDeployToken(childUniverseId);
+        childToken.mint(msg.sender, amount * ONE_QUERY);
+        emit QueryTokensMigrated(msg.sender, parentUniverseId, childUniverseId, amount, migratedRep);
     }
 
     /* ================================================ INTERNALS ================================================ */

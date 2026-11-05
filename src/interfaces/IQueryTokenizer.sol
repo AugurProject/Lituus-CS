@@ -11,13 +11,27 @@ interface IQueryTokenizer {
     /// @notice Mints `amount` whole Query Tokens for the caller, depositing the mint price per token —
     ///         the full demand-inclusive query fee plus a fixed 10% premium, capped at half the fork
     ///         threshold (all in wREP) — times `amount` in Lituus REP into the universe's pool.
-    /// @dev The caller must approve this contract for the universe's Lituus REP. The universe's
-    ///      QueryToken is deployed lazily on the first mint. Reverts with ZeroAmount on a zero amount,
-    ///      with ZeroCost if the total cost rounds to zero (free tokens would dilute the pool average),
+    /// @dev The caller must approve this contract for the universe's Lituus REP, or hold a Permit2 allowance
+    ///      for it (see PermitSupport). The universe's QueryToken is deployed lazily on the first mint. Reverts with
+    /// ZeroAmount on a zero amount, with ZeroCost if the total cost rounds to zero (free tokens would dilute the pool
+    /// average),
     ///      and pricing reverts for a nonexistent or non-current universe.
     /// @param universeId The universe to mint tokens for.
     /// @param amount Number of whole query rights to mint.
     function mint(uint248 universeId, uint256 amount) external;
+
+    /// @notice Applies the caller's ERC-2612 permit on a universe's wREP in favor of this contract, so minting
+    ///         can be approved and paid in one multicall: [permitRep, mint].
+    /// @dev A permit somebody else already submitted goes through as long as the allowance it set is in place;
+    ///      anything that leaves the allowance short of `value` reverts with PermitNotEffective. Reverts for a
+    ///      universe the Multiverse does not know.
+    /// @param universeId The universe whose wREP the permit is for.
+    /// @param value The allowance the permit grants.
+    /// @param deadline The permit's deadline.
+    /// @param v The signature's v.
+    /// @param r The signature's r.
+    /// @param s The signature's s.
+    function permitRep(uint248 universeId, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) external;
 
     /// @notice Redeems one whole Query Token: destroys it and creates a normal Query in the oracle on
     ///         the caller's behalf, paying the pool's per-token average as the fee.
@@ -34,17 +48,24 @@ interface IQueryTokenizer {
 
     /* ============================================= FORK MIGRATION ============================================== */
 
-    /// @notice Migrates `amount` whole Query Tokens from a forking parent universe to a chosen child.
-    ///         NOT IMPLEMENTED YET — always reverts with MigrationNotImplemented.
+    /// @notice Migrates `amount` whole Query Tokens from a forked parent universe into the child of
+    ///         `childOutcome`: the parent tokens burn, their share of the pool (pooledRep × amount /
+    ///         wholeSupply) leaves the parent through the Multiverse as a counted migration vote for the
+    ///         child, and the same number of the child's Query Tokens is minted to the caller.
     /// @dev Query tokens are never forwarded to the heir: once a universe forks, minting and redeeming
-    ///      freeze there and migration is the only path to a child. Intended semantics: during the fork
-    ///      window the parent tokens burn, the matching pool share of Lituus REP migrates via the
-    ///      Multiverse and counts as a vote for the chosen child, and equivalent child tokens are minted
-    ///      to the holder.
-    /// @param parentUniverseId The forking (parent) universe.
-    /// @param childUniverseId The child universe to migrate into.
+    ///      freeze there and migration is the only path to a child. The share is rounded down, so the
+    ///      holders who stay never lose and the last tokens out take the whole pool; what arrives joins the
+    ///      child's pool in child wREP and blends with the child's own mints. Tokens not migrated inside
+    ///      the window stay in the parent with their share of the pool, worthless. The parent's state,
+    ///      the window and the child's existence are checked by the Multiverse (see Multiverse.migrate).
+    ///      Reverts with ZeroAmount on a zero amount, with QueryTokenNotExisting if the parent has no
+    ///      token, with NoWholeTokens if its supply is below one whole token, and with
+    ///      ERC20InsufficientBalance if the caller holds fewer whole tokens than `amount`.
+    /// @param parentUniverseId The forked (parent) universe.
+    /// @param childOutcome The forking query's outcome whose child to migrate into, as passed to
+    ///        spawnChildUniverse.
     /// @param amount Number of whole query rights to migrate.
-    function migrate(uint248 parentUniverseId, uint248 childUniverseId, uint256 amount) external;
+    function migrate(uint248 parentUniverseId, uint256 childOutcome, uint256 amount) external;
 
     /* =============================================== VIEW FUNCTIONS ============================================ */
 
@@ -53,7 +74,8 @@ interface IQueryTokenizer {
     function token(uint248 universeId) external view returns (IQueryToken);
 
     /// @notice The Lituus REP pooled in the universe, backing its outstanding query tokens.
-    /// @dev Grows by the full mint cost on each mint and shrinks by the per-token average on each
-    ///      redemption, so only mints (at new fees) move the average.
+    /// @dev Grows by the full mint cost on each mint and by what a migration brings in from the parent;
+    ///      shrinks by the per-token average on each redemption and by the migrated tokens' share on each
+    ///      migration out, so only mints (at new fees) and arrivals from a parent move the average.
     function pooledRep(uint248 universeId) external view returns (uint256);
 }

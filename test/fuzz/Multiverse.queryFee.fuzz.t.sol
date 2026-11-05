@@ -2,6 +2,7 @@
 pragma solidity ^0.8.35;
 
 import { QueryFeeTestHelpers } from "../unit/Multiverse.queryFee.t.sol";
+import { QueryFeeMirror } from "../unit/QueryFee.mirror.sol";
 
 /// @notice Random-schedule fuzz for the demand modifier: a random timeline of warps and query
 ///         bursts must price every single query exactly as the independent mirror predicts.
@@ -46,7 +47,8 @@ contract MultiverseQueryFeeFuzzTest is QueryFeeTestHelpers {
 
                 _rollGhostForward(windowId);
 
-                uint256 expected = _expectedFee(
+                uint256 expected = QueryFeeMirror.expectedFee(
+                    multiverse,
                     DEFAULT_FEE,
                     windowId,
                     fractionElapsed,
