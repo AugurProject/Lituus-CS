@@ -44,13 +44,13 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
 
     /// @dev Deploys the real tokenizer first, then the Multiverse pointing at it (Deploy.s.sol order).
     function _deployMultiverse(IQueryFeeController controller) internal override returns (Multiverse) {
-        tokenizer = new QueryTokenizer(permit2);
+        tokenizer = new QueryTokenizer(permit2, tokenDeployer);
         return new Multiverse(
             zoltar,
             GENESIS_UID,
             controller,
             address(tokenizer),
-            vaultDeployer,
+            tokenDeployer,
             permit2,
             MIGRATION_DURATION,
             REPORTING_PERIOD,

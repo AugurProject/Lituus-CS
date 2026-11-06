@@ -3,7 +3,7 @@ pragma solidity ^0.8.35;
 
 import { Script, console } from "forge-std/Script.sol";
 
-import { LituusRepDeployer } from "src/LituusRepDeployer.sol";
+import { TokenDeployer } from "src/TokenDeployer.sol";
 import { Multiverse } from "src/Multiverse.sol";
 import { QueryFeeController } from "src/QueryFeeController.sol";
 import { QueryTokenizer } from "src/QueryTokenizer.sol";
@@ -12,10 +12,11 @@ import { IQueryFeeController } from "src/interfaces/IQueryFeeController.sol";
 import { IMultiverse } from "src/interfaces/IMultiverse.sol";
 import { IPermit2 } from "src/interfaces/IPermit2.sol";
 
-/// @notice Deployment script for the Lituus system: QueryFeeController + QueryTokenizer + LituusRepDeployer +
+/// @notice Deployment script for the Lituus system: QueryFeeController + TokenDeployer + QueryTokenizer +
 ///         Multiverse.
-/// @dev The controller, the tokenizer and the vault deployer are deployed before the Multiverse and passed
-///      into its constructor (the constructor deploys the genesis vault through the deployer); the controller
+/// @dev The token deployer comes first: the tokenizer takes it in its constructor (it deploys the query tokens
+///      through it). The controller, the tokenizer and the token deployer are deployed before the Multiverse and
+///      passed into its constructor (the constructor deploys the genesis vault through the deployer); the controller
 ///      and the tokenizer then get their Multiverse back-reference wired via a one-time, deployer-only
 ///      setter (QueryFeeController.setMultiverse / QueryTokenizer.setMultiverse). Requires an
 ///      already-deployed Zoltar: the Multiverse constructor reads its question-data and REP token
@@ -46,7 +47,7 @@ contract Deploy is Script {
         returns (
             QueryFeeController queryFeeController,
             QueryTokenizer queryTokenizer,
-            LituusRepDeployer vaultDeployer,
+            TokenDeployer tokenDeployer,
             Multiverse multiverse
         )
     {
@@ -58,14 +59,14 @@ contract Deploy is Script {
 
         vm.startBroadcast(deployerKey);
         queryFeeController = new QueryFeeController(genesisUniverseId);
-        queryTokenizer = new QueryTokenizer(permit2);
-        vaultDeployer = new LituusRepDeployer();
+        tokenDeployer = new TokenDeployer();
+        queryTokenizer = new QueryTokenizer(permit2, tokenDeployer);
         multiverse = new Multiverse(
             zoltar,
             genesisUniverseId,
             IQueryFeeController(address(queryFeeController)),
             address(queryTokenizer),
-            vaultDeployer,
+            tokenDeployer,
             permit2,
             MIGRATION_DURATION,
             REPORTING_PERIOD,
@@ -78,7 +79,7 @@ contract Deploy is Script {
         console.log("QueryFeeController deployed at :", address(queryFeeController));
         console.log("Multiverse deployed at         :", address(multiverse));
         console.log("QueryTokenizer deployed at     :", address(queryTokenizer));
-        console.log("LituusRepDeployer deployed at  :", address(vaultDeployer));
+        console.log("TokenDeployer deployed at      :", address(tokenDeployer));
         console.log("Permit2                        :", address(permit2));
         console.log("Zoltar                         :", address(zoltar));
         console.log("Genesis universe id            :", uint256(genesisUniverseId));

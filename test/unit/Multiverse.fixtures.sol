@@ -4,7 +4,7 @@ pragma solidity ^0.8.35;
 import { Test } from "forge-std/Test.sol";
 
 import { Multiverse } from "src/Multiverse.sol";
-import { LituusRepDeployer } from "src/LituusRepDeployer.sol";
+import { TokenDeployer } from "src/TokenDeployer.sol";
 import { IPermit2 } from "src/interfaces/IPermit2.sol";
 import { Permit2Deployer } from "../utils/Permit2Deployer.sol";
 import { ILituusRep } from "src/interfaces/ILituusRep.sol";
@@ -58,7 +58,7 @@ abstract contract MultiverseDeployFixture is Test {
     // Set by the default _deployFeeController; suites overriding the hook leave it unset.
     MockQueryFeeController internal feeCtl;
     // Deploys the wREP vaults for the Multiverse; it must exist before the Multiverse's constructor runs.
-    LituusRepDeployer internal vaultDeployer;
+    TokenDeployer internal tokenDeployer;
     // The real Permit2, deployed from its creation code.
     IPermit2 internal permit2;
     Multiverse internal multiverse;
@@ -140,7 +140,7 @@ abstract contract MultiverseDeployFixture is Test {
         zoltarQuestionData = new MockZoltarQuestionData();
         zoltar = new MockZoltar(IReputationToken(address(underlying)), zoltarQuestionData, GENESIS_UID);
         IQueryFeeController controller = _deployFeeController();
-        vaultDeployer = new LituusRepDeployer();
+        tokenDeployer = new TokenDeployer();
         permit2 = Permit2Deployer.deploy();
         multiverse = _deployMultiverse(controller);
 
@@ -169,7 +169,7 @@ abstract contract MultiverseDeployFixture is Test {
             GENESIS_UID,
             controller,
             queryTokenizerStub,
-            vaultDeployer,
+            tokenDeployer,
             permit2,
             MIGRATION_DURATION,
             REPORTING_PERIOD,

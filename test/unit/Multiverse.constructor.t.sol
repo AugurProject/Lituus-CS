@@ -3,9 +3,9 @@ pragma solidity ^0.8.35;
 
 import { Multiverse } from "src/Multiverse.sol";
 import { LituusRep } from "src/LituusRep.sol";
-import { LituusRepDeployer } from "src/LituusRepDeployer.sol";
+import { TokenDeployer } from "src/TokenDeployer.sol";
 import { ILituusRep } from "src/interfaces/ILituusRep.sol";
-import { ILituusRepDeployer } from "src/interfaces/ILituusRepDeployer.sol";
+import { ITokenDeployer } from "src/interfaces/ITokenDeployer.sol";
 import { IZoltar } from "src/interfaces/IZoltar.sol";
 import { IQueryFeeController } from "src/interfaces/IQueryFeeController.sol";
 import { MultiverseFixtures } from "./Multiverse.fixtures.sol";
@@ -18,7 +18,7 @@ contract MultiverseConstructorTest is MultiverseFixtures {
             GENESIS_UID,
             feeCtl,
             queryTokenizerStub,
-            vaultDeployer,
+            tokenDeployer,
             permit2,
             MIGRATION_DURATION,
             REPORTING_PERIOD,
@@ -33,7 +33,7 @@ contract MultiverseConstructorTest is MultiverseFixtures {
             GENESIS_UID,
             IQueryFeeController(address(0)),
             queryTokenizerStub,
-            vaultDeployer,
+            tokenDeployer,
             permit2,
             MIGRATION_DURATION,
             REPORTING_PERIOD,
@@ -48,7 +48,7 @@ contract MultiverseConstructorTest is MultiverseFixtures {
             GENESIS_UID,
             feeCtl,
             address(0),
-            vaultDeployer,
+            tokenDeployer,
             permit2,
             MIGRATION_DURATION,
             REPORTING_PERIOD,
@@ -63,7 +63,7 @@ contract MultiverseConstructorTest is MultiverseFixtures {
             GENESIS_UID,
             feeCtl,
             queryTokenizerStub,
-            ILituusRepDeployer(address(0)),
+            ITokenDeployer(address(0)),
             permit2,
             MIGRATION_DURATION,
             REPORTING_PERIOD,
@@ -79,7 +79,7 @@ contract MultiverseConstructorTest is MultiverseFixtures {
             GENESIS_UID,
             feeCtl,
             queryTokenizerStub,
-            vaultDeployer,
+            tokenDeployer,
             permit2,
             MIGRATION_DURATION,
             REPORTING_PERIOD,
@@ -87,7 +87,7 @@ contract MultiverseConstructorTest is MultiverseFixtures {
         );
 
         assertEq(address(newMultiverse.ZOLTAR()), address(zoltar));
-        assertEq(address(newMultiverse.VAULT_DEPLOYER()), address(vaultDeployer));
+        assertEq(address(newMultiverse.TOKEN_DEPLOYER()), address(tokenDeployer));
         assertEq(newMultiverse.GENESIS_UNIVERSE_ID(), GENESIS_UID);
         assertEq(address(newMultiverse.QUERY_FEE_CONTROLLER()), address(feeCtl));
         assertEq(newMultiverse.GENESIS_TIMESTAMP(), deployTime);
@@ -101,7 +101,7 @@ contract MultiverseConstructorTest is MultiverseFixtures {
         // Values distinct from the fixture defaults, so the assertions prove the immutables come from
         // the constructor arguments rather than from any baked-in constant.
         Multiverse newMultiverse = new Multiverse(
-            zoltar, GENESIS_UID, feeCtl, queryTokenizerStub, vaultDeployer, permit2, 30 days, 2 days, 12 hours
+            zoltar, GENESIS_UID, feeCtl, queryTokenizerStub, tokenDeployer, permit2, 30 days, 2 days, 12 hours
         );
 
         assertEq(newMultiverse.MIGRATION_DURATION(), 30 days);
@@ -115,7 +115,7 @@ contract MultiverseConstructorTest is MultiverseFixtures {
             GENESIS_UID,
             feeCtl,
             queryTokenizerStub,
-            vaultDeployer,
+            tokenDeployer,
             permit2,
             MIGRATION_DURATION,
             REPORTING_PERIOD,
@@ -160,8 +160,9 @@ contract MultiverseConstructorTest is MultiverseFixtures {
 
     function test_Constructor_DeploysRepToken() public view {
         LituusRep rep = LituusRep(address(genesisRep));
-        assertEq(rep.name(), "Lituus Reputation Token");
-        assertEq(rep.symbol(), "REP0");
+        // The genesis REP has no Zoltar repNumber (REPv2), so the vault takes 0.
+        assertEq(rep.name(), "Lituus Reputation Token 0");
+        assertEq(rep.symbol(), "wREP0");
         // The deployer hands the vault to whoever asked for it: the Multiverse, not the deployer itself.
         assertEq(rep.owner(), address(multiverse));
         assertEq(address(rep.UNDERLYING_TOKEN()), address(underlying));
@@ -170,16 +171,16 @@ contract MultiverseConstructorTest is MultiverseFixtures {
 
     function test_Constructor_DeploysRepTokenThroughTheDeployer() public {
         // The deployer's event names the Multiverse as owner, and the vault it announces is the genesis vault.
-        address predictedVault = vm.computeCreateAddress(address(vaultDeployer), vm.getNonce(address(vaultDeployer)));
+        address predictedVault = vm.computeCreateAddress(address(tokenDeployer), vm.getNonce(address(tokenDeployer)));
         address predictedMultiverse = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
-        vm.expectEmit(true, true, true, true, address(vaultDeployer));
-        emit LituusRepDeployer.LituusRepDeployed(predictedMultiverse, address(underlying), predictedVault);
+        vm.expectEmit(true, true, true, true, address(tokenDeployer));
+        emit TokenDeployer.LituusRepDeployed(predictedMultiverse, address(underlying), predictedVault);
         Multiverse newMultiverse = new Multiverse(
             zoltar,
             GENESIS_UID,
             feeCtl,
             queryTokenizerStub,
-            vaultDeployer,
+            tokenDeployer,
             permit2,
             MIGRATION_DURATION,
             REPORTING_PERIOD,
@@ -189,15 +190,6 @@ contract MultiverseConstructorTest is MultiverseFixtures {
         (ILituusRep repToken,,,,,,,,,,,,) = newMultiverse.universes(GENESIS_UID);
         assertEq(address(repToken), predictedVault);
         assertEq(LituusRep(predictedVault).owner(), address(newMultiverse));
-    }
-
-    function test_VaultDeployer_VaultBelongsToTheCaller() public {
-        // Anyone can call the deployer; the vault is owned by the caller and no universe points at it.
-        vm.prank(user);
-        ILituusRep vault = vaultDeployer.deploy(address(underlying), "Stray", "S", 2 ether);
-        assertEq(LituusRep(address(vault)).owner(), user);
-        assertEq(LituusRep(address(vault)).rate(), 2 ether);
-        assertTrue(address(vault) != address(genesisRep));
     }
 
     function test_Constructor_Constants() public view {

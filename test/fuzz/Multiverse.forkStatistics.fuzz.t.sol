@@ -39,7 +39,7 @@ contract MultiverseForkStatisticsFuzzTest is MultiverseFuzzFixtures {
             GENESIS_UID,
             controller,
             queryTokenizerStub,
-            vaultDeployer,
+            tokenDeployer,
             permit2,
             MIGRATION_DURATION,
             REPORTING_PERIOD,

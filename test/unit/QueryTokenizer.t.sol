@@ -8,6 +8,7 @@ import { Multiverse } from "src/Multiverse.sol";
 import { QueryToken } from "src/QueryToken.sol";
 import { QueryTokenizer } from "src/QueryTokenizer.sol";
 import { IMultiverse } from "src/interfaces/IMultiverse.sol";
+import { ITokenDeployer } from "src/interfaces/ITokenDeployer.sol";
 import { QueryTokenizerFixtures } from "./QueryTokenizer.fixtures.sol";
 
 contract QueryTokenizerTest is QueryTokenizerFixtures {
@@ -16,13 +17,19 @@ contract QueryTokenizerTest is QueryTokenizerFixtures {
     //////////////////////////////////////////////////////////////*/
     function test_Constructor_Wiring() public view {
         assertEq(address(tokenizer.multiverse()), address(multiverse));
+        assertEq(address(tokenizer.TOKEN_DEPLOYER()), address(tokenDeployer));
         assertEq(tokenizer.ONE_QUERY(), 1e18);
         assertEq(tokenizer.PREMIUM_NUMERATOR(), 11);
         assertEq(tokenizer.PREMIUM_DENOMINATOR(), 10);
     }
 
+    function test_RevertWhen_Constructor_ZeroTokenDeployer() public {
+        vm.expectRevert(QueryTokenizer.ZeroAddress.selector);
+        new QueryTokenizer(permit2, ITokenDeployer(address(0)));
+    }
+
     function test_RevertWhen_SetMultiverse_NotDeployer() public {
-        QueryTokenizer fresh = new QueryTokenizer(permit2);
+        QueryTokenizer fresh = new QueryTokenizer(permit2, tokenDeployer);
 
         vm.prank(user);
         vm.expectRevert(QueryTokenizer.CannotSet.selector);
@@ -37,7 +44,7 @@ contract QueryTokenizerTest is QueryTokenizerFixtures {
     }
 
     function test_SetMultiverse_SetsOnce() public {
-        QueryTokenizer fresh = new QueryTokenizer(permit2);
+        QueryTokenizer fresh = new QueryTokenizer(permit2, tokenDeployer);
         assertEq(address(fresh.multiverse()), address(0));
 
         fresh.setMultiverse(IMultiverse(address(multiverse)));
@@ -110,9 +117,9 @@ contract QueryTokenizerTest is QueryTokenizerFixtures {
     }
 
     function test_Mint_HappyPath() public {
-        // First mint into the universe also deploys its QueryToken; the address is precomputed
-        // from the tokenizer's CREATE nonce so the event can be checked in full.
-        address predictedToken = vm.computeCreateAddress(address(tokenizer), vm.getNonce(address(tokenizer)));
+        // First mint into the universe also deploys its QueryToken through the token deployer; the address is
+        // precomputed from the deployer's CREATE nonce so the event can be checked in full.
+        address predictedToken = vm.computeCreateAddress(address(tokenDeployer), vm.getNonce(address(tokenDeployer)));
         vm.expectEmit(true, true, true, true, address(tokenizer));
         emit QueryTokenizer.QueryTokenDeployed(GENESIS_UID, predictedToken);
         uint256 cost = _mintTokens(user, 2);
@@ -334,8 +341,8 @@ contract QueryTokenizerTest is QueryTokenizerFixtures {
         _mintTokens(user, 1);
         QueryToken queryToken = _genesisQueryToken();
 
-        assertEq(queryToken.name(), "Lituus Query Token");
-        assertEq(queryToken.symbol(), "QT");
+        assertEq(queryToken.name(), "Lituus Query Token 0");
+        assertEq(queryToken.symbol(), "QT0");
         assertEq(queryToken.decimals(), 18);
         assertEq(queryToken.owner(), address(tokenizer));
     }

@@ -2,6 +2,7 @@
 pragma solidity ^0.8.35;
 
 import { ILituusRep } from "./ILituusRep.sol";
+import { IZoltar } from "./IZoltar.sol";
 
 /// @notice The subset of the Multiverse the QueryTokenizer (and deploy script) depend on.
 interface IMultiverse {
@@ -36,4 +37,7 @@ interface IMultiverse {
     function migrate(uint248 universeId, uint256 outcome, uint256 shares)
         external
         returns (uint248 childUniverseId, uint256 childShares);
+
+    /// @notice The Zoltar the Multiverse mirrors (the tokenizer names its query tokens after Zoltar's REP tokens).
+    function ZOLTAR() external view returns (IZoltar);
 }
