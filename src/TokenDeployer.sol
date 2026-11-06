@@ -12,15 +12,33 @@ import { QueryToken } from "./QueryToken.sol";
 
 /// @notice The one place `new LituusRep` and `new QueryToken` happen. The Multiverse and the QueryTokenizer used to
 ///         deploy their tokens inline, which put the tokens' creation code inside their bytecode; this contract
-///         carries it instead.
+///         carries it instead. Only the Multiverse can deploy vaults, so every vault this address ever announces is
+///         a real one.
+/// @dev The Multiverse's constructor deploys the genesis vault through this contract, so the Multiverse has to
+///      be known here before it exists: its address is computed ahead (CREATE2 over its creation code, which
+///      carries this contract's own address) and passed in. A Multiverse that lands anywhere else fails its
+///      own constructor on that first deploy, so a wrong prediction leaves nothing half-built.
 contract TokenDeployer is ITokenDeployer {
-    event LituusRepDeployed(address indexed owner, address indexed underlyingToken, address vault);
+    /// @inheritdoc ITokenDeployer
+    address public immutable MULTIVERSE;
+
+    event LituusRepDeployed(address indexed underlyingToken, address vault);
+
+    error NotMultiverse();
+    error ZeroAddress();
+
+    /// @param multiverse The Multiverse this deployer serves, at the address it is about to be deployed to.
+    constructor(address multiverse) {
+        if (multiverse == address(0)) revert ZeroAddress();
+        MULTIVERSE = multiverse;
+    }
 
     /// @inheritdoc ITokenDeployer
     function deployLituusRep(address zoltarRepToken, uint256 initialRate) external returns (ILituusRep) {
+        if (msg.sender != MULTIVERSE) revert NotMultiverse();
         (string memory name, string memory symbol) = _nameAndSymbol(zoltarRepToken, "Lituus Reputation Token", "wREP");
-        LituusRep vault = new LituusRep(msg.sender, zoltarRepToken, name, symbol, initialRate);
-        emit LituusRepDeployed(msg.sender, zoltarRepToken, address(vault));
+        LituusRep vault = new LituusRep(MULTIVERSE, zoltarRepToken, name, symbol, initialRate);
+        emit LituusRepDeployed(zoltarRepToken, address(vault));
         return vault;
     }
 

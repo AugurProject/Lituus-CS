@@ -11,15 +11,17 @@ import { IZoltarRepToken } from "src/interfaces/IZoltarRepToken.sol";
 import { MockERC20 } from "src/mock/MockERC20.sol";
 import { MockZoltarRepToken } from "src/mock/MockZoltarRepToken.sol";
 
-/// @notice TokenDeployer in isolation: both token kinds belong to the caller and are named after the Zoltar REP
-///         token's repNumber, with 0 for a token whose repNumber call reverts (the genesis REPv2). A token that
-///         cannot answer at all (no code, malformed return) reverts the deployment.
+/// @notice TokenDeployer in isolation: vaults belong to the Multiverse it serves (this test stands in for it), query
+///         tokens to the caller, and both are named after the Zoltar REP token's repNumber, with 0 for a token whose
+/// repNumber call reverts (the genesis REPv2). A token that cannot answer at all (no code, malformed return) reverts
+/// the deployment.
 contract TokenDeployerTest is Test {
     TokenDeployer internal tokenDeployer;
     address internal caller = makeAddr("caller");
 
+    /// @dev Bound to this test contract, which plays the Multiverse.
     function setUp() public {
-        tokenDeployer = new TokenDeployer();
+        tokenDeployer = new TokenDeployer(address(this));
     }
 
     /// @dev Deploys both token kinds over `zoltarRepToken` and checks they carry `expectedNumber`.
@@ -34,16 +36,15 @@ contract TokenDeployerTest is Test {
 
     /* ================================================ OWNERSHIP =============================================== */
 
-    function test_DeployLituusRep_BelongsToTheCaller() public {
+    function test_DeployLituusRep_BelongsToTheMultiverse() public {
         MockZoltarRepToken zoltarRep = new MockZoltarRepToken(1);
         address predicted = vm.computeCreateAddress(address(tokenDeployer), vm.getNonce(address(tokenDeployer)));
         vm.expectEmit(true, true, true, true, address(tokenDeployer));
-        emit TokenDeployer.LituusRepDeployed(caller, address(zoltarRep), predicted);
-        vm.prank(caller);
+        emit TokenDeployer.LituusRepDeployed(address(zoltarRep), predicted);
         LituusRep vault = LituusRep(address(tokenDeployer.deployLituusRep(address(zoltarRep), 2 ether)));
 
         assertEq(address(vault), predicted);
-        assertEq(vault.owner(), caller);
+        assertEq(vault.owner(), address(this));
         assertEq(address(vault.UNDERLYING_TOKEN()), address(zoltarRep));
         assertEq(vault.rate(), 2 ether);
     }

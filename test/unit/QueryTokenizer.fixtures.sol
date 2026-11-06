@@ -8,6 +8,7 @@ import { ILituusRep } from "src/interfaces/ILituusRep.sol";
 import { IMultiverse } from "src/interfaces/IMultiverse.sol";
 import { IQueryFeeController } from "src/interfaces/IQueryFeeController.sol";
 import { IQueryToken } from "src/interfaces/IQueryToken.sol";
+import { ITokenDeployer } from "src/interfaces/ITokenDeployer.sol";
 import { MultiverseFixtures } from "./Multiverse.fixtures.sol";
 
 /// @notice Wired tokenizer fixture: the funded functional layer with a REAL QueryTokenizer connected
@@ -36,7 +37,12 @@ abstract contract QueryTokenizerFixtures is MultiverseFixtures {
 
     /// @dev Deploys the real tokenizer first, then the Multiverse pointing at it (Deploy.s.sol order).
     function _deployMultiverse(IQueryFeeController controller) internal override returns (Multiverse) {
-        tokenizer = new QueryTokenizer(permit2, tokenDeployer);
+        // Script order: the tokenizer takes the token deployer's address, which is created right after it.
+        tokenizer = new QueryTokenizer(
+            permit2, ITokenDeployer(vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1))
+        );
+        tokenDeployer = _newTokenDeployer();
+        assertEq(address(tokenizer.TOKEN_DEPLOYER()), address(tokenDeployer));
         return new Multiverse(
             zoltar,
             GENESIS_UID,

@@ -23,6 +23,7 @@ abstract contract ForkStatisticsFixtures is MultiverseFixtures {
     MultiverseHarness internal harness;
 
     function _deployMultiverse(IQueryFeeController controller) internal override returns (Multiverse) {
+        tokenDeployer = _newTokenDeployer();
         harness = new MultiverseHarness(
             zoltar,
             GENESIS_UID,
