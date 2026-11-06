@@ -138,6 +138,6 @@ contract QueryTokenizerPermitTest is QueryTokenizerFixtures, PermitSigning {
 
     function test_RevertWhen_Permit2HasNoCode() public {
         vm.expectRevert(PermitSupport.InvalidPermit2.selector);
-        new QueryTokenizer(IPermit2(stranger));
+        new QueryTokenizer(IPermit2(stranger), tokenDeployer);
     }
 }

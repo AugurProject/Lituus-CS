@@ -4,7 +4,7 @@ pragma solidity ^0.8.35;
 import { Test } from "forge-std/Test.sol";
 
 import { Multiverse } from "src/Multiverse.sol";
-import { LituusRepDeployer } from "src/LituusRepDeployer.sol";
+import { TokenDeployer } from "src/TokenDeployer.sol";
 import { IPermit2 } from "src/interfaces/IPermit2.sol";
 import { Permit2Deployer } from "../utils/Permit2Deployer.sol";
 import { ILituusRep } from "src/interfaces/ILituusRep.sol";
@@ -57,9 +57,9 @@ abstract contract MultiverseDeployFixture is Test {
     MockZoltar internal zoltar;
     // Set by the default _deployFeeController; suites overriding the hook leave it unset.
     MockQueryFeeController internal feeCtl;
-    // Deploys the wREP vaults for the Multiverse. Bound to the Multiverse's address before the Multiverse exists,
-    // so it is created right before the Multiverse, by _newVaultDeployer.
-    LituusRepDeployer internal vaultDeployer;
+    // Deploys the wREP vaults for the Multiverse (and the tokenizer's query tokens). Bound to the Multiverse's
+    // address before the Multiverse exists, so it is created right before the Multiverse, by _newTokenDeployer.
+    TokenDeployer internal tokenDeployer;
     // The real Permit2, deployed from its creation code.
     IPermit2 internal permit2;
     Multiverse internal multiverse;
@@ -161,23 +161,23 @@ abstract contract MultiverseDeployFixture is Test {
     ///      controller suite wires `setMultiverse` here.
     function _afterProtocolDeploy() internal virtual { }
 
-    /// @dev A vault deployer bound to the contract this test creates next, which has to be the Multiverse: the
+    /// @dev A token deployer bound to the contract this test creates next, which has to be the Multiverse: the
     ///      production flow computes the Multiverse's CREATE2 address ahead, here the next CREATE address does.
-    function _newVaultDeployer() internal returns (LituusRepDeployer) {
-        return new LituusRepDeployer(vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1));
+    function _newTokenDeployer() internal returns (TokenDeployer) {
+        return new TokenDeployer(vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1));
     }
 
     /// @dev Multiverse deploy hook: the production contract by default. Suites that need a test
-    ///      harness (e.g. exposing internal views) override this. Every override creates the vault
-    ///      deployer right before the Multiverse (see _newVaultDeployer).
+    ///      harness (e.g. exposing internal views) override this. Every override creates the token
+    ///      deployer right before the Multiverse (see _newTokenDeployer).
     function _deployMultiverse(IQueryFeeController controller) internal virtual returns (Multiverse) {
-        vaultDeployer = _newVaultDeployer();
+        tokenDeployer = _newTokenDeployer();
         return new Multiverse(
             zoltar,
             GENESIS_UID,
             controller,
             queryTokenizerStub,
-            vaultDeployer,
+            tokenDeployer,
             permit2,
             MIGRATION_DURATION,
             REPORTING_PERIOD,

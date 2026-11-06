@@ -7,7 +7,7 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { IZoltar, IZoltarQuestionData } from "../interfaces/IZoltar.sol";
 import { ILituusRep } from "../interfaces/ILituusRep.sol";
 import { IReputationToken } from "../interfaces/IReputationToken.sol";
-import { ILituusRepDeployer } from "../interfaces/ILituusRepDeployer.sol";
+import { ITokenDeployer } from "../interfaces/ITokenDeployer.sol";
 import { Multiverse } from "../Multiverse.sol";
 import { MultiverseHelpers } from "./MultiverseHelpers.sol";
 
@@ -239,7 +239,7 @@ library ForkLib {
         mapping(uint248 universeId => mapping(uint256 queryId => Multiverse.QueryResolution)) storage queryResolutions,
         IZoltar zoltar,
         IZoltarQuestionData zoltarQuestionData,
-        ILituusRepDeployer vaultDeployer,
+        ITokenDeployer tokenDeployer,
         uint256 reportingPeriod,
         uint248 universeId,
         uint256 outcome
@@ -275,7 +275,7 @@ library ForkLib {
             queries,
             queryResolutions,
             zoltar,
-            vaultDeployer,
+            tokenDeployer,
             reportingPeriod,
             universeId,
             forkQueryId,
@@ -301,7 +301,7 @@ library ForkLib {
         mapping(uint256 queryId => Multiverse.Query) storage queries,
         mapping(uint248 universeId => mapping(uint256 queryId => Multiverse.QueryResolution)) storage queryResolutions,
         IZoltar zoltar,
-        ILituusRepDeployer vaultDeployer,
+        ITokenDeployer tokenDeployer,
         uint256 reportingPeriod,
         uint248 universeId,
         uint256 queryId,
@@ -327,16 +327,11 @@ library ForkLib {
         // An undeployed/broken Zoltar child reads threshold 0.
         if (zoltar.getForkThreshold(childUniverseId) == 0) revert Multiverse.InvalidUniverse();
 
-        // Deploy a Lituus REP token that wraps the child's Zoltar REP token
-        // TODO: have the same REP token symbol format as in Zoltar
+        // Deploy a Lituus REP token that wraps the child's Zoltar REP token.
         // The child vault starts at the parent's current rate.
         // The deployer makes its caller the owner: under DELEGATECALL that is the Multiverse.
-        ILituusRep childUniverseRepToken = vaultDeployer.deploy(
-            address(childUniverseZoltarRepToken),
-            "Lituus Reputation Token",
-            "REP0.0", // TODO
-            parentUniverse.repToken.rate()
-        );
+        ILituusRep childUniverseRepToken =
+            tokenDeployer.deployLituusRep(address(childUniverseZoltarRepToken), parentUniverse.repToken.rate());
         // migrate() and wrap() through Permit2 bring the underlying here first and wrap it from this contract.
         IERC20(address(childUniverseZoltarRepToken)).forceApprove(address(childUniverseRepToken), type(uint256).max);
         // The child vault spawns with unwrap OPEN: unwrapping child wREP harms nothing — fork

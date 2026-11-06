@@ -9,8 +9,8 @@ import { IQueryToken } from "./interfaces/IQueryToken.sol";
 import { IQueryTokenizer } from "./interfaces/IQueryTokenizer.sol";
 import { ILituusRep } from "./interfaces/ILituusRep.sol";
 import { IPermit2 } from "./interfaces/IPermit2.sol";
+import { ITokenDeployer } from "./interfaces/ITokenDeployer.sol";
 import { PermitSupport } from "./PermitSupport.sol";
-import { QueryToken } from "./QueryToken.sol";
 
 /**
  * @title QueryTokenizer
@@ -51,6 +51,9 @@ contract QueryTokenizer is ReentrancyGuard, PermitSupport, IQueryTokenizer {
 
     // The deployer, allowed to set the Multiverse address once after it is deployed.
     address private immutable DEPLOYER;
+    // Deploys the per-universe QueryTokens with this contract as owner (the same deployer the Multiverse
+    // deploys its wREP vaults through). Kept separate so the token's creation code stays out of this contract.
+    ITokenDeployer public immutable TOKEN_DEPLOYER;
 
     // The Multiverse this tokenizer creates queries in. Set once by the deployer after the Multiverse is
     // deployed.
@@ -68,6 +71,7 @@ contract QueryTokenizer is ReentrancyGuard, PermitSupport, IQueryTokenizer {
     error QueryTokenNotExisting();
     error NoWholeTokens();
     error CannotSet();
+    error ZeroAddress();
 
     /* ================================================= EVENTS ================================================== */
     event QueryTokenDeployed(uint248 indexed universeId, address token);
@@ -83,8 +87,11 @@ contract QueryTokenizer is ReentrancyGuard, PermitSupport, IQueryTokenizer {
 
     /* =========================================== CONSTRUCTOR/SETTER ============================================ */
     /// @param permit2_ Uniswap's Permit2 (see PermitSupport).
-    constructor(IPermit2 permit2_) PermitSupport(permit2_) {
+    /// @param tokenDeployer_ The deployer of the QueryTokens.
+    constructor(IPermit2 permit2_, ITokenDeployer tokenDeployer_) PermitSupport(permit2_) {
+        if (address(tokenDeployer_) == address(0)) revert ZeroAddress();
         DEPLOYER = msg.sender;
+        TOKEN_DEPLOYER = tokenDeployer_;
     }
 
     /**
@@ -200,8 +207,8 @@ contract QueryTokenizer is ReentrancyGuard, PermitSupport, IQueryTokenizer {
     function _getOrDeployToken(uint248 universeId) internal returns (IQueryToken queryToken) {
         queryToken = token[universeId];
         if (address(queryToken) == address(0)) {
-            // TODO: token naming (same pattern as Lituus REP)
-            queryToken = IQueryToken(address(new QueryToken(address(this), "Lituus Query Token", "QT")));
+            // Named after the universe's Zoltar REP token, like its wREP vault.
+            queryToken = TOKEN_DEPLOYER.deployQueryToken(address(multiverse.ZOLTAR().getRepToken(universeId)));
             token[universeId] = queryToken;
             emit QueryTokenDeployed(universeId, address(queryToken));
         }
