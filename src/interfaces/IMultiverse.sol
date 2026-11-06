@@ -40,4 +40,7 @@ interface IMultiverse {
 
     /// @notice The Zoltar the Multiverse mirrors (the tokenizer names its query tokens after Zoltar's REP tokens).
     function ZOLTAR() external view returns (IZoltar);
+
+    /// @notice The QueryTokenizer of this Multiverse (the only caller the token deployer makes query tokens for).
+    function QUERY_TOKENIZER() external view returns (address);
 }

@@ -7,6 +7,7 @@ import { IERC20Errors } from "@openzeppelin/contracts/interfaces/draft-IERC6093.
 import { Multiverse } from "src/Multiverse.sol";
 import { QueryToken } from "src/QueryToken.sol";
 import { QueryTokenizer } from "src/QueryTokenizer.sol";
+import { TokenDeployer } from "src/TokenDeployer.sol";
 import { IMultiverse } from "src/interfaces/IMultiverse.sol";
 import { ITokenDeployer } from "src/interfaces/ITokenDeployer.sol";
 import { QueryTokenizerFixtures } from "./QueryTokenizer.fixtures.sol";
@@ -345,6 +346,19 @@ contract QueryTokenizerTest is QueryTokenizerFixtures {
         assertEq(queryToken.symbol(), "QT0");
         assertEq(queryToken.decimals(), 18);
         assertEq(queryToken.owner(), address(tokenizer));
+    }
+
+    /// @dev A second tokenizer wired to the same deployer and Multiverse is not the Multiverse's tokenizer, so its
+    ///      first mint cannot deploy a query token and reverts whole.
+    function test_RevertWhen_Mint_TokenizerIsNotTheMultiversesTokenizer() public {
+        QueryTokenizer stray = new QueryTokenizer(permit2, tokenDeployer);
+        stray.setMultiverse(IMultiverse(address(multiverse)));
+        vm.prank(user);
+        genesisRep.approve(address(stray), type(uint256).max);
+
+        vm.prank(user);
+        vm.expectRevert(TokenDeployer.NotQueryTokenizer.selector);
+        stray.mint(GENESIS_UID, 1);
     }
 
     function test_RevertWhen_QueryToken_MintNotOwner() public {

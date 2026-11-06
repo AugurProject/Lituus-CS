@@ -4,8 +4,8 @@ pragma solidity ^0.8.35;
 import { ILituusRep } from "./ILituusRep.sol";
 import { IQueryToken } from "./IQueryToken.sol";
 
-/// @notice Deploys the per-universe Lituus tokens: the wREP vaults for one Multiverse (and for nobody else) and
-///         the query tokens for the QueryTokenizer. Kept outside both so the tokens' creation code does not count
+/// @notice Deploys the per-universe Lituus tokens for one Multiverse and for nobody else: its wREP vaults, and the
+///         query tokens of its QueryTokenizer. Kept outside both so the tokens' creation code does not count
 ///         against their own size, and so every universe token is named in one place.
 /// @dev Tokens follow Zoltar's REP naming: Zoltar names the REP token of its n-th child universe
 ///      "Augur Reputation <n>" / "REP<n>", and the Lituus tokens of that universe reuse <n>. The genesis REP is the
@@ -18,8 +18,8 @@ interface ITokenDeployer {
     /// @return The new vault.
     function deployLituusRep(address zoltarRepToken, uint256 initialRate) external returns (ILituusRep);
 
-    /// @notice Deploys a query token owned by the caller for the universe of `zoltarRepToken`, named
-    ///         "Lituus Query Token <n>" / "QT<n>".
+    /// @notice Deploys a query token owned by the QueryTokenizer for the universe of `zoltarRepToken`, named
+    ///         "Lituus Query Token <n>" / "QT<n>". Only the Multiverse's QueryTokenizer may call.
     /// @param zoltarRepToken The Zoltar REP token of the universe the query token belongs to.
     /// @return The new query token.
     function deployQueryToken(address zoltarRepToken) external returns (IQueryToken);

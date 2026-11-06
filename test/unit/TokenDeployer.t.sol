@@ -11,17 +11,24 @@ import { IZoltarRepToken } from "src/interfaces/IZoltarRepToken.sol";
 import { MockERC20 } from "src/mock/MockERC20.sol";
 import { MockZoltarRepToken } from "src/mock/MockZoltarRepToken.sol";
 
-/// @notice TokenDeployer in isolation: vaults belong to the Multiverse it serves (this test stands in for it), query
-///         tokens to the caller, and both are named after the Zoltar REP token's repNumber, with 0 for a token whose
-/// repNumber call reverts (the genesis REPv2). A token that cannot answer at all (no code, malformed return) reverts
-/// the deployment.
+/// @notice TokenDeployer in isolation: vaults belong to the Multiverse it serves and query tokens to that
+///         Multiverse's QueryTokenizer (this test stands in for both), nobody else gets either, and both are named
+///         after the Zoltar REP token's repNumber, with 0 for a token whose repNumber call reverts (the genesis
+///         REPv2). A token that cannot answer at all (no code, malformed return) reverts the deployment.
 contract TokenDeployerTest is Test {
     TokenDeployer internal tokenDeployer;
     address internal caller = makeAddr("caller");
+    // What this test, as the Multiverse, reports as its QueryTokenizer: itself unless a test says otherwise.
+    address internal queryTokenizer = address(this);
 
     /// @dev Bound to this test contract, which plays the Multiverse.
     function setUp() public {
         tokenDeployer = new TokenDeployer(address(this));
+    }
+
+    /// @dev The Multiverse's QueryTokenizer getter, which the deployer reads to authorize query tokens.
+    function QUERY_TOKENIZER() external view returns (address) {
+        return queryTokenizer;
     }
 
     /// @dev Deploys both token kinds over `zoltarRepToken` and checks they carry `expectedNumber`.
@@ -49,7 +56,8 @@ contract TokenDeployerTest is Test {
         assertEq(vault.rate(), 2 ether);
     }
 
-    function test_DeployQueryToken_BelongsToTheCaller() public {
+    function test_DeployQueryToken_BelongsToTheQueryTokenizer() public {
+        queryTokenizer = caller;
         MockZoltarRepToken zoltarRep = new MockZoltarRepToken(1);
         address predicted = vm.computeCreateAddress(address(tokenDeployer), vm.getNonce(address(tokenDeployer)));
         vm.prank(caller);
@@ -58,6 +66,29 @@ contract TokenDeployerTest is Test {
         assertEq(address(queryToken), predicted);
         assertEq(queryToken.owner(), caller);
         assertEq(queryToken.totalSupply(), 0);
+    }
+
+    /* ================================================= ACCESS ================================================= */
+
+    // A vault from anyone but the Multiverse is covered in Multiverse.constructor.t.sol
+    // (test_RevertWhen_TokenDeployer_CallerIsNotTheMultiverse).
+
+    function test_RevertWhen_DeployQueryToken_CallerIsNotTheQueryTokenizer() public {
+        address zoltarRep = address(new MockZoltarRepToken(1));
+        vm.prank(caller);
+        vm.expectRevert(TokenDeployer.NotQueryTokenizer.selector);
+        tokenDeployer.deployQueryToken(zoltarRep);
+    }
+
+    /// @dev Being the Multiverse is not enough: query tokens go to its QueryTokenizer only.
+    function test_RevertWhen_DeployQueryToken_CallerIsTheMultiverse() public {
+        // Change this contract's QueryTokenizer to a different address, so the Multiverse (this contract) is not the
+        // tokenizer.
+        queryTokenizer = makeAddr("queryTokenizer");
+        address zoltarRep = address(new MockZoltarRepToken(1));
+        vm.expectRevert(TokenDeployer.NotQueryTokenizer.selector);
+        // called by Multiverse, but not its QueryTokenizer
+        tokenDeployer.deployQueryToken(zoltarRep);
     }
 
     /* ============================================ NUMBERED TOKENS ============================================= */

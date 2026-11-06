@@ -4,6 +4,7 @@ pragma solidity ^0.8.35;
 import { Strings } from "@openzeppelin/contracts/utils/Strings.sol";
 
 import { ILituusRep } from "./interfaces/ILituusRep.sol";
+import { IMultiverse } from "./interfaces/IMultiverse.sol";
 import { IQueryToken } from "./interfaces/IQueryToken.sol";
 import { ITokenDeployer } from "./interfaces/ITokenDeployer.sol";
 import { IZoltarRepToken } from "./interfaces/IZoltarRepToken.sol";
@@ -12,8 +13,8 @@ import { QueryToken } from "./QueryToken.sol";
 
 /// @notice The one place `new LituusRep` and `new QueryToken` happen. The Multiverse and the QueryTokenizer used to
 ///         deploy their tokens inline, which put the tokens' creation code inside their bytecode; this contract
-///         carries it instead. Only the Multiverse can deploy vaults, so every vault this address ever announces is
-///         a real one.
+///         carries it instead. Only the Multiverse can deploy vaults and only its QueryTokenizer can deploy query
+///         tokens, so every token this address ever creates is a real one.
 /// @dev The Multiverse's constructor deploys the genesis vault through this contract, so the Multiverse has to
 ///      be known here before it exists: its address is computed ahead (CREATE2 over its creation code, which
 ///      carries this contract's own address) and passed in. A Multiverse that lands anywhere else fails its
@@ -25,6 +26,7 @@ contract TokenDeployer is ITokenDeployer {
     event LituusRepDeployed(address indexed underlyingToken, address vault);
 
     error NotMultiverse();
+    error NotQueryTokenizer();
     error ZeroAddress();
 
     /// @param multiverse The Multiverse this deployer serves, at the address it is about to be deployed to.
@@ -44,6 +46,8 @@ contract TokenDeployer is ITokenDeployer {
 
     /// @inheritdoc ITokenDeployer
     function deployQueryToken(address zoltarRepToken) external returns (IQueryToken) {
+        // The tokenizer is read off the Multiverse (an immutable there), so the two can never disagree on it.
+        if (msg.sender != IMultiverse(MULTIVERSE).QUERY_TOKENIZER()) revert NotQueryTokenizer();
         (string memory name, string memory symbol) = _nameAndSymbol(zoltarRepToken, "Lituus Query Token", "QT");
         return new QueryToken(msg.sender, name, symbol);
     }
