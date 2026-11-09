@@ -14,10 +14,10 @@ import { MultiverseFixtures } from "./Multiverse.fixtures.sol";
 /// @notice Wired tokenizer fixture: the funded functional layer with a REAL QueryTokenizer connected
 ///         to the Multiverse (mirroring script/Deploy.s.sol), plus tokenizer approvals and the
 ///         mint/redeem step helpers used by the tokenizer suites.
-/// @dev The tokenizer is deployed inside `_deployMultiverse` (it must exist before the Multiverse,
-///      whose constructor takes its address) and wired via `_afterProtocolDeploy`
-///      (`setMultiverse` — the deployer is this test contract). The funded actors additionally
-///      approve the tokenizer on the genesis Lituus REP, since `mint` pulls wREP from the caller.
+/// @dev The tokenizer is deployed inside `_deployMultiverse` (it must exist before the Multiverse, whose
+///      constructor takes its address) and takes the Multiverse's predicted address, like the production
+///      controller. The funded actors additionally approve the tokenizer on the genesis Lituus REP, since `mint`
+///      pulls wREP from the caller.
 abstract contract QueryTokenizerFixtures is MultiverseFixtures {
     // The funded fixture holds 3200 underlying (3 × 1000 wrapped by the actors plus the 200 top-up
     // that aligns the fee with the cap grid), so MockZoltar's fork threshold is 3200 / 20 = 160 REP.
@@ -35,18 +35,26 @@ abstract contract QueryTokenizerFixtures is MultiverseFixtures {
         _approveTokenizer(challenger);
     }
 
+    /// @dev The tokenizer is one more contract before the Multiverse.
+    function _deploysBeforeMultiverse() internal pure override returns (uint256) {
+        return 1;
+    }
+
     /// @dev Deploys the real tokenizer first, then the Multiverse pointing at it (Deploy.s.sol order).
-    function _deployMultiverse(IQueryFeeController controller) internal override returns (Multiverse) {
-        // Script order: the tokenizer takes the token deployer's address, which is created right after it.
+    function _deployMultiverse(IQueryFeeController feeController) internal override returns (Multiverse) {
+        // Script order: the tokenizer takes the token deployer's address, which is created right after it, and
+        // the Multiverse's, which comes right after that.
         tokenizer = new QueryTokenizer(
-            permit2, ITokenDeployer(vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1))
+            permit2,
+            ITokenDeployer(vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1)),
+            IMultiverse(predictedMultiverse)
         );
         tokenDeployer = _newTokenDeployer();
         assertEq(address(tokenizer.TOKEN_DEPLOYER()), address(tokenDeployer));
         return new Multiverse(
             zoltar,
             GENESIS_UID,
-            controller,
+            feeController,
             address(tokenizer),
             tokenDeployer,
             permit2,
@@ -54,11 +62,6 @@ abstract contract QueryTokenizerFixtures is MultiverseFixtures {
             REPORTING_PERIOD,
             APPEAL_PERIOD
         );
-    }
-
-    /// @dev Completes the deploy wiring: the tokenizer learns the Multiverse address (once).
-    function _afterProtocolDeploy() internal override {
-        tokenizer.setMultiverse(IMultiverse(address(multiverse)));
     }
 
     /// @dev Approves the tokenizer to pull the account's genesis Lituus REP (mint's payment path).

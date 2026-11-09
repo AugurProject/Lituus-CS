@@ -72,8 +72,6 @@ contract MultiverseConstructorTest is MultiverseFixtures {
     }
 
     function test_Constructor_SetsImmutables() public {
-        uint256 deployTime = START_TIME + 5 days;
-        vm.warp(deployTime);
         TokenDeployer newTokenDeployer = _newTokenDeployer();
         Multiverse newMultiverse = new Multiverse(
             zoltar,
@@ -91,7 +89,6 @@ contract MultiverseConstructorTest is MultiverseFixtures {
         assertEq(address(newMultiverse.TOKEN_DEPLOYER()), address(newTokenDeployer));
         assertEq(newMultiverse.GENESIS_UNIVERSE_ID(), GENESIS_UID);
         assertEq(address(newMultiverse.QUERY_FEE_CONTROLLER()), address(feeCtl));
-        assertEq(newMultiverse.GENESIS_TIMESTAMP(), deployTime);
         assertEq(address(newMultiverse.QUERY_TOKENIZER()), address(queryTokenizerStub));
         assertEq(newMultiverse.MIGRATION_DURATION(), MIGRATION_DURATION);
         assertEq(newMultiverse.REPORTING_PERIOD(), REPORTING_PERIOD);

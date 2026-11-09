@@ -33,6 +33,18 @@ contract MultiverseCreateQueryTest is MultiverseFixtures {
         assertEq(genesisRep.balanceOf(user), userBalanceBefore - DEFAULT_FEE);
     }
 
+    function test_CreateQuery_IsPricedAndCountedByTheController() public {
+        // The fee is whatever the controller quotes, and the query reaches it through the pricing path alone.
+        feeCtl.setFee(3 ether);
+
+        uint256 queryId = _createDefaultQuery();
+
+        (,, uint256 fee,,) = multiverse.queries(queryId);
+        assertEq(fee, 3 ether);
+        assertEq(feeCtl.chargedQueries(GENESIS_UID), 1);
+        assertEq(feeCtl.recordedQueries(GENESIS_UID), 0);
+    }
+
     function test_CreateQuery_EmitsEvent() public {
         vm.expectEmit(true, true, true, true, address(multiverse));
         emit Multiverse.QueryCreated(user, 0, GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);

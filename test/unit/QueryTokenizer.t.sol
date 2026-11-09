@@ -14,10 +14,10 @@ import { QueryTokenizerFixtures } from "./QueryTokenizer.fixtures.sol";
 
 contract QueryTokenizerTest is QueryTokenizerFixtures {
     /*//////////////////////////////////////////////////////////////
-                        CONSTRUCTOR / SET MULTIVERSE
+                              CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
     function test_Constructor_Wiring() public view {
-        assertEq(address(tokenizer.multiverse()), address(multiverse));
+        assertEq(address(tokenizer.MULTIVERSE()), address(multiverse));
         assertEq(address(tokenizer.TOKEN_DEPLOYER()), address(tokenDeployer));
         assertEq(tokenizer.ONE_QUERY(), 1e18);
         assertEq(tokenizer.PREMIUM_NUMERATOR(), 11);
@@ -26,31 +26,12 @@ contract QueryTokenizerTest is QueryTokenizerFixtures {
 
     function test_RevertWhen_Constructor_ZeroTokenDeployer() public {
         vm.expectRevert(QueryTokenizer.ZeroAddress.selector);
-        new QueryTokenizer(permit2, ITokenDeployer(address(0)));
+        new QueryTokenizer(permit2, ITokenDeployer(address(0)), IMultiverse(address(multiverse)));
     }
 
-    function test_RevertWhen_SetMultiverse_NotDeployer() public {
-        QueryTokenizer fresh = new QueryTokenizer(permit2, tokenDeployer);
-
-        vm.prank(user);
-        vm.expectRevert(QueryTokenizer.CannotSet.selector);
-        fresh.setMultiverse(IMultiverse(address(multiverse)));
-    }
-
-    function test_RevertWhen_SetMultiverse_AlreadySet() public {
-        // The fixture already wired `tokenizer` (deployer = this test contract), so a second set —
-        // even by the deployer — must fail.
-        vm.expectRevert(QueryTokenizer.CannotSet.selector);
-        tokenizer.setMultiverse(IMultiverse(address(multiverse)));
-    }
-
-    function test_SetMultiverse_SetsOnce() public {
-        QueryTokenizer fresh = new QueryTokenizer(permit2, tokenDeployer);
-        assertEq(address(fresh.multiverse()), address(0));
-
-        fresh.setMultiverse(IMultiverse(address(multiverse)));
-
-        assertEq(address(fresh.multiverse()), address(multiverse));
+    function test_RevertWhen_Constructor_ZeroMultiverse() public {
+        vm.expectRevert(QueryTokenizer.ZeroAddress.selector);
+        new QueryTokenizer(permit2, tokenDeployer, IMultiverse(address(0)));
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -64,13 +45,12 @@ contract QueryTokenizerTest is QueryTokenizerFixtures {
         assertEq(tokenizer.mintPrice(GENESIS_UID), DEFAULT_FEE * 11 / 10);
     }
 
-    function test_MintPrice_TracksPreviewAfterVolume() public {
-        // Volume moves the preview; the price must keep tracking preview × 11/10.
-        _createDefaultQuery();
-        _createDefaultQuery();
+    function test_MintPrice_TracksPreviewWhenTheFeeMoves() public {
+        // The fee moves; the price must keep tracking preview × 11/10.
+        feeCtl.setFee(3 ether);
 
         uint256 preview = _previewUncappedFee();
-        assertGt(preview, DEFAULT_FEE);
+        assertEq(preview, 3 ether);
         assertEq(tokenizer.mintPrice(GENESIS_UID), preview * 11 / 10);
     }
 
@@ -295,12 +275,11 @@ contract QueryTokenizerTest is QueryTokenizerFixtures {
     function test_Redeem_CountsDemandVolume() public {
         _mintTokens(user, 1);
 
-        uint256 previewBefore = _previewUncappedFee();
-
         _redeemToken(user);
 
-        // The redemption registered as demand: the same-block preview strictly rises.
-        assertGt(_previewUncappedFee(), previewBefore);
+        // The redemption registered as demand with the controller, at the tokenizer's price rather than a charge.
+        assertEq(feeCtl.recordedQueries(GENESIS_UID), 1);
+        assertEq(feeCtl.chargedQueries(GENESIS_UID), 0);
     }
 
     function test_RevertWhen_Redeem_OracleRejectsQuery_PrepaidRightSurvives() public {
@@ -324,15 +303,15 @@ contract QueryTokenizerTest is QueryTokenizerFixtures {
     function test_Redeem_VolumeParityWithDirectQuery() public {
         _mintTokens(user, 1);
 
-        // A direct query and a redemption must move future fees identically.
+        // A direct query and a redemption each reach the controller as exactly one query.
         uint256 snapshot = vm.snapshotState();
         vm.prank(user);
         multiverse.createQuery(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
-        uint256 previewAfterDirect = _previewUncappedFee();
+        assertEq(feeCtl.chargedQueries(GENESIS_UID) + feeCtl.recordedQueries(GENESIS_UID), 1);
         vm.revertToState(snapshot);
 
         _redeemToken(user);
-        assertEq(_previewUncappedFee(), previewAfterDirect);
+        assertEq(feeCtl.chargedQueries(GENESIS_UID) + feeCtl.recordedQueries(GENESIS_UID), 1);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -351,8 +330,7 @@ contract QueryTokenizerTest is QueryTokenizerFixtures {
     /// @dev A second tokenizer wired to the same deployer and Multiverse is not the Multiverse's tokenizer, so its
     ///      first mint cannot deploy a query token and reverts whole.
     function test_RevertWhen_Mint_TokenizerIsNotTheMultiversesTokenizer() public {
-        QueryTokenizer stray = new QueryTokenizer(permit2, tokenDeployer);
-        stray.setMultiverse(IMultiverse(address(multiverse)));
+        QueryTokenizer stray = new QueryTokenizer(permit2, tokenDeployer, IMultiverse(address(multiverse)));
         vm.prank(user);
         genesisRep.approve(address(stray), type(uint256).max);
 

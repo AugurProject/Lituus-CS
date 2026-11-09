@@ -5,6 +5,7 @@ import { Multiverse } from "src/Multiverse.sol";
 import { PermitSupport } from "src/PermitSupport.sol";
 import { QueryToken } from "src/QueryToken.sol";
 import { QueryTokenizer } from "src/QueryTokenizer.sol";
+import { IMultiverse } from "src/interfaces/IMultiverse.sol";
 import { IPermit2 } from "src/interfaces/IPermit2.sol";
 import { QueryTokenizerFixtures } from "./QueryTokenizer.fixtures.sol";
 import { PermitSigning } from "../utils/PermitSigning.sol";
@@ -138,6 +139,6 @@ contract QueryTokenizerPermitTest is QueryTokenizerFixtures, PermitSigning {
 
     function test_RevertWhen_Permit2HasNoCode() public {
         vm.expectRevert(PermitSupport.InvalidPermit2.selector);
-        new QueryTokenizer(IPermit2(stranger), tokenDeployer);
+        new QueryTokenizer(IPermit2(stranger), tokenDeployer, IMultiverse(address(multiverse)));
     }
 }

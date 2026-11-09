@@ -16,17 +16,14 @@ import { IPermit2 } from "src/interfaces/IPermit2.sol";
 /// @notice Deployment script for the Lituus system: QueryFeeController + QueryTokenizer + TokenDeployer +
 ///         Multiverse.
 /// @dev The controller, the tokenizer and the token deployer are deployed before the Multiverse and passed
-///      into its constructor (the constructor deploys the genesis vault through the deployer); the controller
-///      and the tokenizer then get their Multiverse back-reference wired via a one-time, deployer-only
-///      setter (QueryFeeController.setMultiverse / QueryTokenizer.setMultiverse).
-///      The token deployer serves one Multiverse, fixed in its constructor, and the Multiverse's constructor
-///      already uses it, so the Multiverse's address is computed before either exists: the token deployer
-///      lands at a known CREATE address of the broadcasting account, the Multiverse at the CREATE2 address of its
-///      creation code with that deployer address among the constructor arguments, under MULTIVERSE_SALT and
-///      the standard CREATE2 deployer forge routes `new C{salt: ...}` through. The tokenizer, which deploys its
-///      query tokens through the token deployer, is created just before it and takes its predicted address. The
-///      script checks every predicted address; a Multiverse landing anywhere else would fail its own constructor
-///      on the genesis vault.
+///      into its constructor (the constructor deploys the genesis vault through the deployer), and each of the
+///      three serves that one Multiverse, fixed in its own constructor. So the Multiverse's address is computed
+///      before any of them exists: the three land at the broadcasting account's next three CREATE addresses, in
+///      that order, and the Multiverse at the CREATE2 address of its creation code with those three addresses
+///      among the constructor arguments, under MULTIVERSE_SALT and the standard CREATE2 deployer forge routes
+///      `new C{salt: ...}` through. The tokenizer also takes the token deployer's predicted address, since it
+///      deploys its query tokens through it. The script checks every predicted address; a Multiverse landing
+///      anywhere else would fail its own constructor on the genesis vault.
 ///      Requires an
 ///      already-deployed Zoltar: the Multiverse constructor reads its question-data and REP token
 ///      addresses (the tokenizer reads everything, the mint-price cap included, off the Multiverse).
@@ -71,16 +68,17 @@ contract Deploy is Script {
         bytes32 salt = vm.envOr("MULTIVERSE_SALT", DEFAULT_MULTIVERSE_SALT);
 
         vm.startBroadcast(deployerKey);
-        queryFeeController = new QueryFeeController(genesisUniverseId);
-        // The token deployer is the account's contract right after the tokenizer, which takes its address; with
-        // it the Multiverse's creation code is complete and its CREATE2 address follows.
-        address tokenDeployerAddress = vm.computeCreateAddress(deployer, vm.getNonce(deployer) + 1);
-        queryTokenizer = new QueryTokenizer(permit2, ITokenDeployer(tokenDeployerAddress));
+        // The account's next three contracts, in deploy order; with them the Multiverse's creation code is
+        // complete and its CREATE2 address follows.
+        uint64 nonce = vm.getNonce(deployer);
+        address controllerAddress = vm.computeCreateAddress(deployer, nonce);
+        address tokenizerAddress = vm.computeCreateAddress(deployer, nonce + 1);
+        address tokenDeployerAddress = vm.computeCreateAddress(deployer, nonce + 2);
         bytes memory multiverseArguments = abi.encode(
             zoltar,
             genesisUniverseId,
-            IQueryFeeController(address(queryFeeController)),
-            address(queryTokenizer),
+            IQueryFeeController(controllerAddress),
+            tokenizerAddress,
             ITokenDeployer(tokenDeployerAddress),
             permit2,
             MIGRATION_DURATION,
@@ -91,12 +89,17 @@ contract Deploy is Script {
             salt, keccak256(abi.encodePacked(type(Multiverse).creationCode, multiverseArguments))
         );
 
+        queryFeeController = new QueryFeeController(genesisUniverseId, predictedMultiverse);
+        require(address(queryFeeController) == controllerAddress, "fee controller landed elsewhere");
+        queryTokenizer =
+            new QueryTokenizer(permit2, ITokenDeployer(tokenDeployerAddress), IMultiverse(predictedMultiverse));
+        require(address(queryTokenizer) == tokenizerAddress, "tokenizer landed elsewhere");
         tokenDeployer = new TokenDeployer(predictedMultiverse);
         require(address(tokenDeployer) == tokenDeployerAddress, "token deployer landed elsewhere");
         multiverse = new Multiverse{ salt: salt }(
             zoltar,
             genesisUniverseId,
-            IQueryFeeController(address(queryFeeController)),
+            queryFeeController,
             address(queryTokenizer),
             tokenDeployer,
             permit2,
@@ -105,8 +108,6 @@ contract Deploy is Script {
             APPEAL_PERIOD
         );
         require(address(multiverse) == predictedMultiverse, "Multiverse landed elsewhere");
-        queryFeeController.setMultiverse(address(multiverse));
-        queryTokenizer.setMultiverse(IMultiverse(address(multiverse)));
         vm.stopBroadcast();
 
         console.log("QueryFeeController deployed at :", address(queryFeeController));
