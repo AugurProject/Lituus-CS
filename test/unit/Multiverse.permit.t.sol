@@ -453,7 +453,7 @@ contract MultiversePermitTest is MultiverseFixtures, PermitSigning {
             GENESIS_UID,
             feeCtl,
             queryTokenizerStub,
-            vaultDeployer,
+            tokenDeployer,
             IPermit2(stranger),
             MIGRATION_DURATION,
             REPORTING_PERIOD,

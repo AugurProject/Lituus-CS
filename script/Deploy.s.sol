@@ -3,28 +3,30 @@ pragma solidity ^0.8.35;
 
 import { Script, console } from "forge-std/Script.sol";
 
-import { LituusRepDeployer } from "src/LituusRepDeployer.sol";
+import { TokenDeployer } from "src/TokenDeployer.sol";
 import { Multiverse } from "src/Multiverse.sol";
 import { QueryFeeController } from "src/QueryFeeController.sol";
 import { QueryTokenizer } from "src/QueryTokenizer.sol";
 import { IZoltar } from "src/interfaces/IZoltar.sol";
 import { IQueryFeeController } from "src/interfaces/IQueryFeeController.sol";
 import { IMultiverse } from "src/interfaces/IMultiverse.sol";
-import { ILituusRepDeployer } from "src/interfaces/ILituusRepDeployer.sol";
+import { ITokenDeployer } from "src/interfaces/ITokenDeployer.sol";
 import { IPermit2 } from "src/interfaces/IPermit2.sol";
 
-/// @notice Deployment script for the Lituus system: QueryFeeController + QueryTokenizer + LituusRepDeployer +
+/// @notice Deployment script for the Lituus system: QueryFeeController + QueryTokenizer + TokenDeployer +
 ///         Multiverse.
-/// @dev The controller, the tokenizer and the vault deployer are deployed before the Multiverse and passed
+/// @dev The controller, the tokenizer and the token deployer are deployed before the Multiverse and passed
 ///      into its constructor (the constructor deploys the genesis vault through the deployer); the controller
 ///      and the tokenizer then get their Multiverse back-reference wired via a one-time, deployer-only
 ///      setter (QueryFeeController.setMultiverse / QueryTokenizer.setMultiverse).
-///      The vault deployer serves one Multiverse, fixed in its constructor, and the Multiverse's constructor
-///      already uses it, so the Multiverse's address is computed before either exists: the vault deployer
-///      lands at the broadcasting account's next CREATE address, the Multiverse at the CREATE2 address of its
+///      The token deployer serves one Multiverse, fixed in its constructor, and the Multiverse's constructor
+///      already uses it, so the Multiverse's address is computed before either exists: the token deployer
+///      lands at a known CREATE address of the broadcasting account, the Multiverse at the CREATE2 address of its
 ///      creation code with that deployer address among the constructor arguments, under MULTIVERSE_SALT and
-///      the standard CREATE2 deployer forge routes `new C{salt: ...}` through. The script checks both
-///      addresses; a Multiverse landing anywhere else would fail its own constructor on the genesis vault.
+///      the standard CREATE2 deployer forge routes `new C{salt: ...}` through. The tokenizer, which deploys its
+///      query tokens through the token deployer, is created just before it and takes its predicted address. The
+///      script checks every predicted address; a Multiverse landing anywhere else would fail its own constructor
+///      on the genesis vault.
 ///      Requires an
 ///      already-deployed Zoltar: the Multiverse constructor reads its question-data and REP token
 ///      addresses (the tokenizer reads everything, the mint-price cap included, off the Multiverse).
@@ -57,7 +59,7 @@ contract Deploy is Script {
         returns (
             QueryFeeController queryFeeController,
             QueryTokenizer queryTokenizer,
-            LituusRepDeployer vaultDeployer,
+            TokenDeployer tokenDeployer,
             Multiverse multiverse
         )
     {
@@ -70,17 +72,16 @@ contract Deploy is Script {
 
         vm.startBroadcast(deployerKey);
         queryFeeController = new QueryFeeController(genesisUniverseId);
-        queryTokenizer = new QueryTokenizer(permit2);
-
-        // The vault deployer is the account's next contract; with its address the Multiverse's creation code is
-        // complete and its CREATE2 address follows.
-        address vaultDeployerAddress = vm.computeCreateAddress(deployer, vm.getNonce(deployer));
+        // The token deployer is the account's contract right after the tokenizer, which takes its address; with
+        // it the Multiverse's creation code is complete and its CREATE2 address follows.
+        address tokenDeployerAddress = vm.computeCreateAddress(deployer, vm.getNonce(deployer) + 1);
+        queryTokenizer = new QueryTokenizer(permit2, ITokenDeployer(tokenDeployerAddress));
         bytes memory multiverseArguments = abi.encode(
             zoltar,
             genesisUniverseId,
             IQueryFeeController(address(queryFeeController)),
             address(queryTokenizer),
-            ILituusRepDeployer(vaultDeployerAddress),
+            ITokenDeployer(tokenDeployerAddress),
             permit2,
             MIGRATION_DURATION,
             REPORTING_PERIOD,
@@ -90,14 +91,14 @@ contract Deploy is Script {
             salt, keccak256(abi.encodePacked(type(Multiverse).creationCode, multiverseArguments))
         );
 
-        vaultDeployer = new LituusRepDeployer(predictedMultiverse);
-        require(address(vaultDeployer) == vaultDeployerAddress, "vault deployer landed elsewhere");
+        tokenDeployer = new TokenDeployer(predictedMultiverse);
+        require(address(tokenDeployer) == tokenDeployerAddress, "token deployer landed elsewhere");
         multiverse = new Multiverse{ salt: salt }(
             zoltar,
             genesisUniverseId,
             IQueryFeeController(address(queryFeeController)),
             address(queryTokenizer),
-            vaultDeployer,
+            tokenDeployer,
             permit2,
             MIGRATION_DURATION,
             REPORTING_PERIOD,
@@ -111,7 +112,7 @@ contract Deploy is Script {
         console.log("QueryFeeController deployed at :", address(queryFeeController));
         console.log("Multiverse deployed at         :", address(multiverse));
         console.log("QueryTokenizer deployed at     :", address(queryTokenizer));
-        console.log("LituusRepDeployer deployed at  :", address(vaultDeployer));
+        console.log("TokenDeployer deployed at      :", address(tokenDeployer));
         console.log("Permit2                        :", address(permit2));
         console.log("Zoltar                         :", address(zoltar));
         console.log("Genesis universe id            :", uint256(genesisUniverseId));

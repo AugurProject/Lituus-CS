@@ -4,6 +4,7 @@ pragma solidity ^0.8.35;
 import { IZoltar, IZoltarQuestionData } from "../interfaces/IZoltar.sol";
 import { IReputationToken } from "../interfaces/IReputationToken.sol";
 import { MockERC20 } from "./MockERC20.sol";
+import { MockZoltarRepToken } from "./MockZoltarRepToken.sol";
 
 contract MockZoltar is IZoltar {
     uint256 constant FORK_THRESHOLD_DIVISOR = 50; // 2% of total supply atm
@@ -21,6 +22,9 @@ contract MockZoltar is IZoltar {
     // Per-universe REP tokens: the genesis is registered at construction, children by deployChild.
     // No entry (address 0) means the universe does not exist — same signal as real Zoltar.
     mapping(uint248 universeId => IReputationToken) public childRepTokens;
+    // Child REP tokens deployed so far, across the whole tree: the n-th deployChild gets repNumber n,
+    // like real Zoltar's childReputationTokenCount.
+    uint256 public childReputationTokenCount;
     // Theoretical supply per universe, like real Zoltar: the genesis is snapshotted from the REP token
     // at construction (genesis REP is never minted afterwards), a child from its parent's
     // childSupplySnapshot at deployChild; every burn in a universe lowers it.
@@ -128,7 +132,7 @@ contract MockZoltar is IZoltar {
         if (forkTimes[universeId] == 0) revert UniverseNotForked();
         uint248 childUniverseId = getChildUniverseId(universeId, outcomeIndex);
         if (address(childRepTokens[childUniverseId]) != address(0)) revert ChildAlreadyDeployed();
-        childRepTokens[childUniverseId] = new MockERC20("Child Reputation", "CREP");
+        childRepTokens[childUniverseId] = new MockZoltarRepToken(++childReputationTokenCount);
         parentUniverseIds[childUniverseId] = universeId;
         forkingOutcomeIndexes[childUniverseId] = outcomeIndex;
         forkQuestionIds[childUniverseId] = forkQuestionIds[universeId];

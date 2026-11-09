@@ -8,7 +8,7 @@ import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import { IZoltar, IZoltarQuestionData } from "./interfaces/IZoltar.sol";
 import { ILituusRep } from "./interfaces/ILituusRep.sol";
-import { ILituusRepDeployer } from "./interfaces/ILituusRepDeployer.sol";
+import { ITokenDeployer } from "./interfaces/ITokenDeployer.sol";
 import { IReputationToken } from "./interfaces/IReputationToken.sol";
 import { IQueryFeeController } from "./interfaces/IQueryFeeController.sol";
 import { IMultiverse } from "./interfaces/IMultiverse.sol";
@@ -56,9 +56,8 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
     // The QueryTokenizer allowed to create queries at a tokenizer-supplied price.
     // One immutable contract serves every universe.
     address public immutable QUERY_TOKENIZER;
-    // Deploys the wREP vaults (genesis and every child) with this contract as owner. Kept separate so the
-    // vault's creation code stays out of this contract's bytecode.
-    ILituusRepDeployer public immutable VAULT_DEPLOYER;
+    // Deploy factory for Lituus wREP tokens and for query tokens.
+    ITokenDeployer public immutable TOKEN_DEPLOYER;
 
     // Time periods
     uint256 public immutable MIGRATION_DURATION;
@@ -296,7 +295,7 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
      * @param _queryFeeController The controller owning each universe's monthly base fee.
      * @param _queryTokenizer The QueryTokenizer allowed to create queries at a tokenizer-supplied price
      * (one immutable contract for all universes).
-     * @param _vaultDeployer The deployer of the wREP vaults.
+     * @param _tokenDeployer The deployer of the wREP vaults and of the query tokens.
      * @param _permit2 Uniswap's Permit2, for approving and paying in one transaction (see PermitSupport).
      */
     constructor(
@@ -304,7 +303,7 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
         uint248 _initialZoltarUniverseId,
         IQueryFeeController _queryFeeController,
         address _queryTokenizer,
-        ILituusRepDeployer _vaultDeployer,
+        ITokenDeployer _tokenDeployer,
         IPermit2 _permit2,
         uint256 _migrationDuration,
         uint256 _reportingPeriod,
@@ -315,8 +314,8 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
         APPEAL_PERIOD = _appealPeriod;
         QUERY_TOKENIZER = _queryTokenizer;
         if (QUERY_TOKENIZER == address(0)) revert ZeroAddress();
-        VAULT_DEPLOYER = _vaultDeployer;
-        if (address(VAULT_DEPLOYER) == address(0)) revert ZeroAddress();
+        TOKEN_DEPLOYER = _tokenDeployer;
+        if (address(TOKEN_DEPLOYER) == address(0)) revert ZeroAddress();
         ZOLTAR = _zoltar;
         if (address(ZOLTAR) == address(0)) revert ZeroAddress();
         ZOLTAR_QUESTION_DATA = ZOLTAR.zoltarQuestionData();
@@ -326,11 +325,8 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
 
         // get the REP token address from the initial universe in Zoltar
         IReputationToken initialZoltarRepToken = ZOLTAR.getRepToken(_initialZoltarUniverseId);
-        // deploy a Lituus REP token that wraps the Zoltar REP token
-        // token symbol will use a per-universe suffix. Genesis universe will have symbol "REP0"
-        // TODO: Discuss the format of the suffix if the forks are for binary queries.
-        ILituusRep repToken =
-            VAULT_DEPLOYER.deploy(address(initialZoltarRepToken), "Lituus Reputation Token", "REP0", SCALE);
+        // deploy a Lituus REP token that wraps the Zoltar REP token (named after it by the deployer)
+        ILituusRep repToken = TOKEN_DEPLOYER.deployLituusRep(address(initialZoltarRepToken), SCALE);
         // wrap() through Permit2 brings the underlying here first and wraps it from this contract.
         IERC20(address(initialZoltarRepToken)).forceApprove(address(repToken), type(uint256).max);
 
@@ -1564,7 +1560,7 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
             queryResolutions,
             ZOLTAR,
             ZOLTAR_QUESTION_DATA,
-            VAULT_DEPLOYER,
+            TOKEN_DEPLOYER,
             REPORTING_PERIOD,
             universeId,
             outcome

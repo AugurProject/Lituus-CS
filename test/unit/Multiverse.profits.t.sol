@@ -17,13 +17,13 @@ contract MultiverseProfitsTest is MultiverseDeployFixture {
     MultiverseHarness internal harness;
 
     function _deployMultiverse(IQueryFeeController controller) internal override returns (Multiverse) {
-        vaultDeployer = _newVaultDeployer();
+        tokenDeployer = _newTokenDeployer();
         harness = new MultiverseHarness(
             zoltar,
             GENESIS_UID,
             controller,
             queryTokenizerStub,
-            vaultDeployer,
+            tokenDeployer,
             permit2,
             MIGRATION_DURATION,
             REPORTING_PERIOD,
