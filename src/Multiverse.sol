@@ -56,7 +56,6 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
     // The QueryTokenizer allowed to create queries at a tokenizer-supplied price.
     // One immutable contract serves every universe.
     address public immutable QUERY_TOKENIZER;
-    // Deploys the wREP vaults (genesis and every child) with this contract as owner. Kept separate so the
     // Deploy factory for Lituus wREP tokens and for query tokens.
     ITokenDeployer public immutable TOKEN_DEPLOYER;
 
