@@ -6,7 +6,16 @@ import { QueryFeeController } from "src/QueryFeeController.sol";
 /// @notice Test harness over the fee controller: the production code plus a base fee setter and the internal
 ///         views the fee suites assert on. The fee fixtures deploy it in place of the controller.
 contract QueryFeeControllerHarness is QueryFeeController {
-    constructor(uint248 genesisUniverseId, address multiverse) QueryFeeController(genesisUniverseId, multiverse) { }
+    /// @param genesisBaseFee The genesis base fee to start from instead of INITIAL_BASE_FEE. Set here rather than
+    ///        through `setBaseFee` so the fixture makes no call between predicting the Multiverse's address and
+    ///        deploying it: in isolated test mode every call is its own transaction and moves this contract's
+    ///        deployer nonce.
+    constructor(uint248 genesisUniverseId, address multiverse, uint256 genesisBaseFee)
+        QueryFeeController(genesisUniverseId, multiverse)
+    {
+        // forge-lint: disable-next-line(unsafe-typecast)
+        feeStates[genesisUniverseId].baseFee = uint128(genesisBaseFee);
+    }
 
     /// @dev Pins a universe's base fee outside the hill-climb, so a fee expectation can be stated from a known base.
     function setBaseFee(uint248 universeId, uint256 baseFee) external {

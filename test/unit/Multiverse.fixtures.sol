@@ -148,7 +148,9 @@ abstract contract MultiverseDeployFixture is Test {
         zoltarQuestionData = new MockZoltarQuestionData();
         zoltar = new MockZoltar(IReputationToken(address(underlying)), zoltarQuestionData, GENESIS_UID);
         // The fee controller, Permit2, the token deployer and whatever a suite adds come first, all CREATEs of
-        // this contract, so the Multiverse lands at a known nonce.
+        // this contract, so the Multiverse lands at a known nonce. Nothing in between may call another contract:
+        // in isolated test mode (`forge test --isolate`) every call is its own transaction and bumps this
+        // contract's nonce, which the assert below would catch.
         predictedMultiverse =
             vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 3 + _deploysBeforeMultiverse());
         IQueryFeeController feeController = _deployFeeController();
@@ -177,8 +179,7 @@ abstract contract MultiverseDeployFixture is Test {
     ///      bucket reads and a base fee setter. The genesis base fee is pinned to DEFAULT_FEE, so the fee
     ///      expectations read the same as with the flat mock.
     function _deployProductionFeeController() internal returns (IQueryFeeController) {
-        controller = new QueryFeeControllerHarness(GENESIS_UID, predictedMultiverse);
-        controller.setBaseFee(GENESIS_UID, DEFAULT_FEE);
+        controller = new QueryFeeControllerHarness(GENESIS_UID, predictedMultiverse, DEFAULT_FEE);
         return IQueryFeeController(address(controller));
     }
 
