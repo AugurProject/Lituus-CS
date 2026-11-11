@@ -16,7 +16,7 @@ contract MultiverseCreateQueryTest is MultiverseFixtures {
         assertEq(queryId, 0);
         assertEq(multiverse.queryCount(), 1);
 
-        (uint8 numberOfOutcomes, uint248 originUniverse, uint256 fee, string memory question) =
+        (uint8 numberOfOutcomes, uint248 originUniverse, uint256 fee, string memory question,) =
             multiverse.queries(queryId);
         assertEq(numberOfOutcomes, DEFAULT_NUMBER_OF_OUTCOMES);
         assertEq(originUniverse, GENESIS_UID);
@@ -25,12 +25,24 @@ contract MultiverseCreateQueryTest is MultiverseFixtures {
 
         ResolutionView memory r = _resolution(queryId);
         uint48 queryCreateTime = r.queryCreateTime;
-        uint8 outcome = r.outcome;
+        uint256 outcome = r.outcome;
         assertEq(queryCreateTime, uint48(block.timestamp));
         assertEq(outcome, multiverse.UNRESOLVED());
 
         assertEq(genesisRep.balanceOf(address(multiverse)), DEFAULT_FEE);
         assertEq(genesisRep.balanceOf(user), userBalanceBefore - DEFAULT_FEE);
+    }
+
+    function test_CreateQuery_IsPricedAndCountedByTheController() public {
+        // The fee is whatever the controller quotes, and the query reaches it through the pricing path alone.
+        feeCtl.setFee(3 ether);
+
+        uint256 queryId = _createDefaultQuery();
+
+        (,, uint256 fee,,) = multiverse.queries(queryId);
+        assertEq(fee, 3 ether);
+        assertEq(feeCtl.chargedQueries(GENESIS_UID), 1);
+        assertEq(feeCtl.recordedQueries(GENESIS_UID), 0);
     }
 
     function test_CreateQuery_EmitsEvent() public {
@@ -45,7 +57,7 @@ contract MultiverseCreateQueryTest is MultiverseFixtures {
         vm.prank(user);
         multiverse.createQuery(GENESIS_UID, inputQuestion, 2);
 
-        (uint8 numberOfOutcomes,,,) = multiverse.queries(0);
+        (uint8 numberOfOutcomes,,,,) = multiverse.queries(0);
         assertEq(numberOfOutcomes, 2);
     }
 
@@ -55,7 +67,7 @@ contract MultiverseCreateQueryTest is MultiverseFixtures {
         vm.prank(user);
         multiverse.createQuery(GENESIS_UID, inputQuestion, max);
 
-        (uint8 numberOfOutcomes,,,) = multiverse.queries(0);
+        (uint8 numberOfOutcomes,,,,) = multiverse.queries(0);
         assertEq(numberOfOutcomes, max);
     }
 
@@ -71,9 +83,9 @@ contract MultiverseCreateQueryTest is MultiverseFixtures {
 
         assertEq(multiverse.queryCount(), 3);
 
-        (uint8 n0,,, string memory q0) = multiverse.queries(0);
-        (uint8 n1,,, string memory q1) = multiverse.queries(1);
-        (uint8 n2,,, string memory q2) = multiverse.queries(2);
+        (uint8 n0,,, string memory q0,) = multiverse.queries(0);
+        (uint8 n1,,, string memory q1,) = multiverse.queries(1);
+        (uint8 n2,,, string memory q2,) = multiverse.queries(2);
 
         assertEq(n0, 3);
         assertEq(q0, "q0");
@@ -92,8 +104,8 @@ contract MultiverseCreateQueryTest is MultiverseFixtures {
 
         assertEq(multiverse.queryCount(), 2);
 
-        (uint8 n0, uint248 u0,, string memory q0) = multiverse.queries(0);
-        (uint8 n1, uint248 u1,, string memory q1) = multiverse.queries(1);
+        (uint8 n0, uint248 u0,, string memory q0,) = multiverse.queries(0);
+        (uint8 n1, uint248 u1,, string memory q1,) = multiverse.queries(1);
         assertEq(n0, 3);
         assertEq(u0, GENESIS_UID);
         assertEq(q0, "by user");
@@ -107,7 +119,7 @@ contract MultiverseCreateQueryTest is MultiverseFixtures {
         vm.prank(user);
         multiverse.createQuery(GENESIS_UID, "", 3);
 
-        (,,, string memory question) = multiverse.queries(0);
+        (,,, string memory question,) = multiverse.queries(0);
         assertEq(question, "");
     }
 
@@ -128,7 +140,7 @@ contract MultiverseCreateQueryTest is MultiverseFixtures {
         vm.prank(user);
         multiverse.createQuery(GENESIS_UID, long, 3);
 
-        (,,, string memory question) = multiverse.queries(0);
+        (,,, string memory question,) = multiverse.queries(0);
         assertEq(question, long);
     }
 
@@ -187,11 +199,12 @@ contract MultiverseCreateQueryTest is MultiverseFixtures {
 
     function test_RevertWhen_InsufficientAllowance() public {
         address noAllowance = makeAddr("noAllowance");
-        // Fund with REP but do NOT approve the multiverse to spend it.
-        underlying.mint(noAllowance, USER_REP_BALANCE);
+        // Fund with REP from the genesis pool but do NOT approve the multiverse to spend it.
+        uint256 amount = 100 ether;
+        underlying.transfer(noAllowance, amount);
         vm.startPrank(noAllowance);
         underlying.approve(address(genesisRep), type(uint256).max);
-        multiverse.wrap(GENESIS_UID, USER_REP_BALANCE, 0);
+        multiverse.wrap(GENESIS_UID, amount, 0);
         vm.expectRevert();
         multiverse.createQuery(GENESIS_UID, "q", 3);
         vm.stopPrank();

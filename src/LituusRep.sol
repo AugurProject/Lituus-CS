@@ -2,6 +2,8 @@
 pragma solidity ^0.8.35;
 
 import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import { ERC20Permit } from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Permit.sol";
+import { IERC20Permit } from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Permit.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
@@ -16,8 +18,9 @@ import { ILituusRep } from "./interfaces/ILituusRep.sol";
 ///      so direct underlying transfers are inert; and the rate persists through an emptied vault.
 ///      All mutations are owner-only (the Multiverse) - the vault exposes no public deposit/redeem
 ///      surface. The underlying is assumed to be a standard ERC20 (no transfer fees, no rebasing,
-///      no hooks).
-contract LituusRep is ERC20, Ownable, ReentrancyGuard, ILituusRep {
+///      no hooks). The share token supports ERC-2612 permits, so fees and stakes can be approved and
+///      paid in one transaction.
+contract LituusRep is ERC20, ERC20Permit, Ownable, ReentrancyGuard, ILituusRep {
     using SafeERC20 for IERC20;
 
     /* =========================================== CONSTANTS/IMMUTABLES ========================================== */
@@ -57,11 +60,17 @@ contract LituusRep is ERC20, Ownable, ReentrancyGuard, ILituusRep {
     /// carries across universes.
     constructor(address owner, address underlyingToken, string memory name, string memory symbol, uint256 initialRate)
         ERC20(name, symbol)
+        ERC20Permit(name)
         Ownable(owner)
     {
         if (initialRate == 0) revert ZeroRate();
         UNDERLYING_TOKEN = IERC20(underlyingToken);
         rate = initialRate;
+    }
+
+    /// @inheritdoc IERC20Permit
+    function nonces(address owner) public view override(ERC20Permit, IERC20Permit) returns (uint256) {
+        return super.nonces(owner);
     }
 
     /* ============================================== WRAP FUNCTIONS ============================================= */
@@ -116,6 +125,18 @@ contract LituusRep is ERC20, Ownable, ReentrancyGuard, ILituusRep {
         UNDERLYING_TOKEN.safeTransfer(sender, assets);
 
         emit Unwrapped(sender, shares, assets);
+    }
+
+    /// @inheritdoc ILituusRep
+    function migrateOut(address from, uint256 shares) external onlyOwner nonReentrant returns (uint256 assets) {
+        assets = convertToAssets(shares);
+        if (assets == 0) revert ZeroAssets();
+
+        _burn(from, shares);
+        totalAssets -= assets;
+        UNDERLYING_TOKEN.safeTransfer(msg.sender, assets);
+
+        emit Unwrapped(from, shares, assets);
     }
 
     /* ============================================== BURN FUNCTIONS ============================================= */

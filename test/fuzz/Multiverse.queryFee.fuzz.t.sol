@@ -2,9 +2,11 @@
 pragma solidity ^0.8.35;
 
 import { QueryFeeTestHelpers } from "../unit/Multiverse.queryFee.t.sol";
+import { QueryFeeMirror } from "../unit/QueryFee.mirror.sol";
 
 /// @notice Random-schedule fuzz for the demand modifier: a random timeline of warps and query
-///         bursts must price every single query exactly as the independent mirror predicts.
+///         bursts must price every single query exactly as the independent mirror predicts, and the
+///         preview must say the same before each charge.
 /// @dev Generalizes the unit suite's hand-picked points (neutral, floor, cliff, handoff) to
 ///      arbitrary interleavings: random window gaps (including gaps of 20+ windows, exercising
 ///      the recompute branch), random in-window fractions, and random burst sizes. The test
@@ -32,8 +34,8 @@ contract MultiverseQueryFeeFuzzTest is QueryFeeTestHelpers {
     /// @dev Property: for every query in a random schedule, the charged fee equals the mirror's
     /// prediction for the ghost state at charge time.
     function testFuzz_QueryFee_ChargedAlwaysMatchesMirror(uint256 seed) public {
-        uint256 threeDays = multiverse.THREE_DAYS();
-        uint256 scale = multiverse.SCALE();
+        uint256 threeDays = controller.THREE_DAYS();
+        uint256 scale = controller.SCALE();
 
         for (uint256 step = 0; step < STEPS; step++) {
             uint256 delta = uint256(keccak256(abi.encode(seed, step, "warp"))) % (MAX_GAP_WINDOWS * threeDays + 1);
@@ -46,7 +48,8 @@ contract MultiverseQueryFeeFuzzTest is QueryFeeTestHelpers {
 
                 _rollGhostForward(windowId);
 
-                uint256 expected = _expectedFee(
+                uint256 expected = QueryFeeMirror.expectedFee(
+                    controller,
                     DEFAULT_FEE,
                     windowId,
                     fractionElapsed,
@@ -56,6 +59,7 @@ contract MultiverseQueryFeeFuzzTest is QueryFeeTestHelpers {
                     windowId >= 20 ? ghostVolume[windowId - 20] : 0
                 );
 
+                assertEq(controller.previewFee(GENESIS_UID), expected);
                 assertEq(_chargedFee(), expected);
 
                 // Count-after-fee, mirrored: the query enters its bucket only after being priced.
