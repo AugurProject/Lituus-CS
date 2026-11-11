@@ -43,18 +43,26 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
         return ACTOR_COUNT * ACTOR_REP_BALANCE + 200 ether;
     }
 
+    /// @dev The tokenizer is one more contract before the Multiverse.
+    function _deploysBeforeMultiverse() internal pure override returns (uint256) {
+        return 1;
+    }
+
     /// @dev Deploys the real tokenizer first, then the Multiverse pointing at it (Deploy.s.sol order).
-    function _deployMultiverse(IQueryFeeController controller) internal override returns (Multiverse) {
-        // Script order: the tokenizer takes the token deployer's address, which is created right after it.
+    function _deployMultiverse(IQueryFeeController feeController) internal override returns (Multiverse) {
+        // Script order: the tokenizer takes the token deployer's address, which is created right after it, and
+        // the Multiverse's, which comes right after that.
         tokenizer = new QueryTokenizer(
-            permit2, ITokenDeployer(vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1))
+            permit2,
+            ITokenDeployer(vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1)),
+            IMultiverse(predictedMultiverse)
         );
         tokenDeployer = _newTokenDeployer();
         assertEq(address(tokenizer.TOKEN_DEPLOYER()), address(tokenDeployer));
         return new Multiverse(
             zoltar,
             GENESIS_UID,
-            controller,
+            feeController,
             address(tokenizer),
             tokenDeployer,
             permit2,
@@ -62,10 +70,6 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
             REPORTING_PERIOD,
             APPEAL_PERIOD
         );
-    }
-
-    function _afterProtocolDeploy() internal override {
-        tokenizer.setMultiverse(IMultiverse(address(multiverse)));
     }
 
     function setUp() public override {

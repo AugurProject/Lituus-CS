@@ -15,6 +15,7 @@ import { MockERC20 } from "src/mock/MockERC20.sol";
 import { MockZoltar } from "src/mock/MockZoltar.sol";
 import { MockZoltarQuestionData } from "src/mock/MockZoltarQuestionData.sol";
 import { MockQueryFeeController } from "src/mock/MockQueryFeeController.sol";
+import { QueryFeeControllerHarness } from "./QueryFeeController.harness.sol";
 
 /// @notice Protocol deployment fixture: mocks + Multiverse wired at START_TIME, no actor funding.
 /// @dev The bottom fixture layer. It deploys the protocol and nothing else — actor balances are the
@@ -23,8 +24,8 @@ import { MockQueryFeeController } from "src/mock/MockQueryFeeController.sol";
 ///      the genesis REP supply (`_genesisSupply`), minted to this contract as a pool BEFORE the
 ///      Zoltar mock is deployed: like real Zoltar, the mock snapshots the genesis supply once at
 ///      construction, and genesis REP is never minted afterwards — actors are funded from the pool.
-///      Suites that need a different fee controller override `_deployFeeController` (and
-///      `_afterProtocolDeploy` for post-wiring) instead of rewriting the deployment.
+///      Suites that exercise the fee math return `_deployProductionFeeController()` from
+///      `_deployFeeController` instead of rewriting the deployment.
 abstract contract MultiverseDeployFixture is Test {
     // Nonzero on purpose: Lituus universe ids mirror Zoltar universe ids, and a nonzero genesis
     // catches any code path that wrongly assumes the genesis universe lives at id 0.
@@ -60,9 +61,15 @@ abstract contract MultiverseDeployFixture is Test {
     // Deploys the wREP vaults for the Multiverse (and the tokenizer's query tokens). Bound to the Multiverse's
     // address before the Multiverse exists, so it is created right before the Multiverse, by _newTokenDeployer.
     TokenDeployer internal tokenDeployer;
+    // The production fee controller, through its test harness; set by _deployProductionFeeController, unset
+    // for the suites on the mock.
+    QueryFeeControllerHarness internal controller;
     // The real Permit2, deployed from its creation code.
     IPermit2 internal permit2;
     Multiverse internal multiverse;
+    // Where the Multiverse is about to land, computed before the contracts that take its address are deployed
+    // (the production fee controller and the tokenizer); the deploy asserts it.
+    address internal predictedMultiverse;
     ILituusRep internal genesisRep;
 
     address internal user = makeAddr("user");
@@ -140,26 +147,41 @@ abstract contract MultiverseDeployFixture is Test {
         underlying.mint(address(this), _genesisSupply());
         zoltarQuestionData = new MockZoltarQuestionData();
         zoltar = new MockZoltar(IReputationToken(address(underlying)), zoltarQuestionData, GENESIS_UID);
-        IQueryFeeController controller = _deployFeeController();
+        // The fee controller, Permit2, the token deployer and whatever a suite adds come first, all CREATEs of
+        // this contract, so the Multiverse lands at a known nonce. Nothing in between may call another contract:
+        // in isolated test mode (`forge test --isolate`) every call is its own transaction and bumps this
+        // contract's nonce, which the assert below would catch.
+        predictedMultiverse =
+            vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 3 + _deploysBeforeMultiverse());
+        IQueryFeeController feeController = _deployFeeController();
         permit2 = Permit2Deployer.deploy();
-        multiverse = _deployMultiverse(controller);
+        multiverse = _deployMultiverse(feeController);
+        assertEq(address(multiverse), predictedMultiverse, "fixture deploy order changed");
 
         (ILituusRep repToken,,,,,,,,,,,,) = multiverse.universes(GENESIS_UID);
         genesisRep = repToken;
+    }
 
-        _afterProtocolDeploy();
+    /// @dev Contracts a suite creates between Permit2 and the token deployer in its `_deployMultiverse` (the
+    ///      tokenizer fixtures create the tokenizer there). Counted into the Multiverse's predicted address.
+    function _deploysBeforeMultiverse() internal pure virtual returns (uint256) {
+        return 0;
     }
 
     /// @dev Fee controller hook: the mock with a settable flat fee by default. Suites that need the
-    ///      production controller override this (deploy order: controller first, then the Multiverse).
+    ///      production controller override this to return `_deployProductionFeeController()`.
     function _deployFeeController() internal virtual returns (IQueryFeeController) {
         feeCtl = new MockQueryFeeController(DEFAULT_FEE);
         return IQueryFeeController(address(feeCtl));
     }
 
-    /// @dev Post-deploy hook, runs after the Multiverse exists. Empty by default; the production
-    ///      controller suite wires `setMultiverse` here.
-    function _afterProtocolDeploy() internal virtual { }
+    /// @dev The production controller, bound to the Multiverse's predicted address, through a harness that adds
+    ///      bucket reads and a base fee setter. The genesis base fee is pinned to DEFAULT_FEE, so the fee
+    ///      expectations read the same as with the flat mock.
+    function _deployProductionFeeController() internal returns (IQueryFeeController) {
+        controller = new QueryFeeControllerHarness(GENESIS_UID, predictedMultiverse, DEFAULT_FEE);
+        return IQueryFeeController(address(controller));
+    }
 
     /// @dev A token deployer bound to the contract this test creates next, which has to be the Multiverse: the
     ///      production flow computes the Multiverse's CREATE2 address ahead, here the next CREATE address does.
@@ -167,15 +189,15 @@ abstract contract MultiverseDeployFixture is Test {
         return new TokenDeployer(vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1));
     }
 
-    /// @dev Multiverse deploy hook: the production contract by default. Suites that need a test
-    ///      harness (e.g. exposing internal views) override this. Every override creates the token
-    ///      deployer right before the Multiverse (see _newTokenDeployer).
-    function _deployMultiverse(IQueryFeeController controller) internal virtual returns (Multiverse) {
+    /// @dev Multiverse deploy hook: the production contract by default. Suites that deploy more around it (the
+    ///      tokenizer ones) override this. Every override creates the token deployer right before the
+    ///      Multiverse (see _newTokenDeployer).
+    function _deployMultiverse(IQueryFeeController feeController) internal virtual returns (Multiverse) {
         tokenDeployer = _newTokenDeployer();
         return new Multiverse(
             zoltar,
             GENESIS_UID,
-            controller,
+            feeController,
             queryTokenizerStub,
             tokenDeployer,
             permit2,
@@ -251,9 +273,10 @@ abstract contract MultiverseDeployFixture is Test {
         return amount + amount * totalDistributable / winnerStaked;
     }
 
-    /// @dev Warps to window `window` with `elapsed` seconds of it gone by (windows are GENESIS_TIMESTAMP-anchored).
+    /// @dev Warps to window `window` with `elapsed` seconds of it gone by (windows are anchored at the controller's
+    ///      GENESIS_TIMESTAMP, its deploy time).
     function _warpToWindow(uint256 window, uint256 elapsed) internal {
-        vm.warp(multiverse.GENESIS_TIMESTAMP() + window * multiverse.THREE_DAYS() + elapsed);
+        vm.warp(controller.GENESIS_TIMESTAMP() + window * controller.THREE_DAYS() + elapsed);
     }
 
     /* ============================================ FORK HELPERS ============================================ */

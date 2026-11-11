@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.35;
 
-import { Multiverse } from "src/Multiverse.sol";
 import { IQueryFeeController } from "src/interfaces/IQueryFeeController.sol";
 import { MultiverseDeployFixture } from "./Multiverse.fixtures.sol";
-import { MultiverseHarness } from "./Multiverse.harness.sol";
 
 /// @notice Unit suite for _getProfits: month bucketing, the currentWindow-10 boundary split, sum conservation
 ///         across the boundary migration, the currentWindow-20 tail, and the pre-genesis BOOT_PROFIT fallback.
@@ -14,22 +12,8 @@ import { MultiverseHarness } from "./Multiverse.harness.sol";
 ///      window. The seeded amount is read back from the query record, so the assertions are exact
 ///      regardless of what the demand modifier charged.
 contract MultiverseProfitsTest is MultiverseDeployFixture {
-    MultiverseHarness internal harness;
-
-    function _deployMultiverse(IQueryFeeController controller) internal override returns (Multiverse) {
-        tokenDeployer = _newTokenDeployer();
-        harness = new MultiverseHarness(
-            zoltar,
-            GENESIS_UID,
-            controller,
-            queryTokenizerStub,
-            tokenDeployer,
-            permit2,
-            MIGRATION_DURATION,
-            REPORTING_PERIOD,
-            APPEAL_PERIOD
-        );
-        return Multiverse(address(harness));
+    function _deployFeeController() internal override returns (IQueryFeeController) {
+        return _deployProductionFeeController();
     }
 
     function _genesisSupply() internal pure override returns (uint256) {
@@ -45,7 +29,7 @@ contract MultiverseProfitsTest is MultiverseDeployFixture {
     /// @dev Warp to `elapsed` seconds into the given window (windows are GENESIS_TIMESTAMP-anchored,
     ///      which the fixture pins to START_TIME).
     function _warpTo(uint256 windowId, uint256 elapsed) internal {
-        vm.warp(START_TIME + windowId * multiverse.THREE_DAYS() + elapsed);
+        vm.warp(START_TIME + windowId * controller.THREE_DAYS() + elapsed);
     }
 
     /// @dev Books profit of exactly the query fee into the window containing `resolveWindow` +
@@ -53,7 +37,7 @@ contract MultiverseProfitsTest is MultiverseDeployFixture {
     ///      elapsed reporting time, so it is zero), then resolve at the target time (the one-day
     ///      appeal window has strictly passed). Returns the booked profit.
     function _seedProfitAt(uint256 resolveWindow, uint256 resolveElapsed) internal returns (uint256 profit) {
-        uint256 resolveTime = START_TIME + resolveWindow * multiverse.THREE_DAYS() + resolveElapsed;
+        uint256 resolveTime = START_TIME + resolveWindow * controller.THREE_DAYS() + resolveElapsed;
         vm.warp(resolveTime - 2 days);
 
         uint256 queryId = multiverse.queryCount();
@@ -76,7 +60,7 @@ contract MultiverseProfitsTest is MultiverseDeployFixture {
         uint256 profit = _seedProfitAt(37, 1 hours);
 
         _warpTo(40, 0);
-        (uint256 currentProfit, uint256 lastProfit) = harness.exposed_getProfits(GENESIS_UID);
+        (uint256 currentProfit, uint256 lastProfit) = controller.exposed_getProfits(GENESIS_UID);
 
         assertEq(currentProfit, profit);
         assertEq(lastProfit, 0);
@@ -88,15 +72,15 @@ contract MultiverseProfitsTest is MultiverseDeployFixture {
         // and fraction = 0.75 - swapped fractions must swap the shares. A fraction mix-up in the split
         // is invisible to the direction-only integration tests; this pins it directly.
         uint256 profit = _seedProfitAt(30, 1 hours);
-        uint256 scale = multiverse.SCALE();
+        uint256 scale = controller.SCALE();
 
-        _warpTo(40, multiverse.THREE_DAYS() / 4);
-        (uint256 currentProfit, uint256 lastProfit) = harness.exposed_getProfits(GENESIS_UID);
+        _warpTo(40, controller.THREE_DAYS() / 4);
+        (uint256 currentProfit, uint256 lastProfit) = controller.exposed_getProfits(GENESIS_UID);
         assertEq(currentProfit, (scale - scale / 4) * profit / scale);
         assertEq(lastProfit, scale / 4 * profit / scale);
 
-        _warpTo(40, 3 * multiverse.THREE_DAYS() / 4);
-        (currentProfit, lastProfit) = harness.exposed_getProfits(GENESIS_UID);
+        _warpTo(40, 3 * controller.THREE_DAYS() / 4);
+        (currentProfit, lastProfit) = controller.exposed_getProfits(GENESIS_UID);
         assertEq(currentProfit, (scale - 3 * scale / 4) * profit / scale);
         assertEq(lastProfit, 3 * scale / 4 * profit / scale);
     }
@@ -111,8 +95,8 @@ contract MultiverseProfitsTest is MultiverseDeployFixture {
         uint256 previousCurrent = type(uint256).max;
         uint256 previousLast = 0;
         for (uint256 tenth = 1; tenth <= 9; tenth += 4) {
-            _warpTo(40, tenth * multiverse.THREE_DAYS() / 10);
-            (uint256 currentProfit, uint256 lastProfit) = harness.exposed_getProfits(GENESIS_UID);
+            _warpTo(40, tenth * controller.THREE_DAYS() / 10);
+            (uint256 currentProfit, uint256 lastProfit) = controller.exposed_getProfits(GENESIS_UID);
 
             assertEq(currentProfit + lastProfit, profit);
             assertLt(currentProfit, previousCurrent);
@@ -129,20 +113,20 @@ contract MultiverseProfitsTest is MultiverseDeployFixture {
         // grows the contribution fades toward zero - leaving the 60-day span is gradual, not a
         // cliff.
         uint256 profit = _seedProfitAt(20, 1 hours);
-        uint256 scale = multiverse.SCALE();
+        uint256 scale = controller.SCALE();
 
         _warpTo(40, 0);
-        (uint256 currentProfit, uint256 lastProfit) = harness.exposed_getProfits(GENESIS_UID);
+        (uint256 currentProfit, uint256 lastProfit) = controller.exposed_getProfits(GENESIS_UID);
         assertEq(currentProfit, 0);
         assertEq(lastProfit, profit);
 
-        _warpTo(40, multiverse.THREE_DAYS() / 2);
-        (currentProfit, lastProfit) = harness.exposed_getProfits(GENESIS_UID);
+        _warpTo(40, controller.THREE_DAYS() / 2);
+        (currentProfit, lastProfit) = controller.exposed_getProfits(GENESIS_UID);
         assertEq(currentProfit, 0);
         assertEq(lastProfit, (scale - scale / 2) * profit / scale);
 
-        _warpTo(40, 9 * multiverse.THREE_DAYS() / 10);
-        (currentProfit, lastProfit) = harness.exposed_getProfits(GENESIS_UID);
+        _warpTo(40, 9 * controller.THREE_DAYS() / 10);
+        (currentProfit, lastProfit) = controller.exposed_getProfits(GENESIS_UID);
         assertEq(currentProfit, 0);
         assertEq(lastProfit, (scale - 9 * scale / 10) * profit / scale);
     }
@@ -174,8 +158,8 @@ contract MultiverseProfitsTest is MultiverseDeployFixture {
         assertEq(seedC, FLOOR_FEE);
         assertEq(seedD, FLOOR_FEE);
 
-        _warpTo(40, multiverse.THREE_DAYS() / 2);
-        (uint256 currentProfit, uint256 lastProfit) = harness.exposed_getProfits(GENESIS_UID);
+        _warpTo(40, controller.THREE_DAYS() / 2);
+        (uint256 currentProfit, uint256 lastProfit) = controller.exposed_getProfits(GENESIS_UID);
 
         assertEq(currentProfit, 24_752_475_247_524_750);
         assertEq(lastProfit, 1_004_950_495_049_504_950);
@@ -190,9 +174,9 @@ contract MultiverseProfitsTest is MultiverseDeployFixture {
         // hill-climb's deterministic first-month raise grows from.
         _warpTo(2, 0);
 
-        (uint256 currentProfit, uint256 lastProfit) = harness.exposed_getProfits(GENESIS_UID);
+        (uint256 currentProfit, uint256 lastProfit) = controller.exposed_getProfits(GENESIS_UID);
 
-        assertEq(currentProfit, 8 * multiverse.BOOT_PROFIT());
-        assertEq(lastProfit, 10 * multiverse.BOOT_PROFIT());
+        assertEq(currentProfit, 8 * controller.BOOT_PROFIT());
+        assertEq(lastProfit, 10 * controller.BOOT_PROFIT());
     }
 }

@@ -723,6 +723,47 @@ contract MultiverseResolveTest is MultiverseFixtures {
     }
 
     /*//////////////////////////////////////////////////////////////
+                RESOLVE - PROFIT REPORTED TO THE CONTROLLER
+    //////////////////////////////////////////////////////////////*/
+    function test_Resolve_Invalid_RecordsTheProfitWithTheController() public {
+        // Resolved 36 hours past the deadline: half the 1 ether fee goes to the resolver, the other half is the
+        // profit, burned here and recorded with the controller.
+        uint256 queryId = _createDefaultQuery();
+        vm.warp(START_TIME + 3 days + 36 hours);
+
+        _resolve(bystander, queryId);
+
+        assertEq(feeCtl.recordedProfit(GENESIS_UID), 0.5 ether);
+    }
+
+    function test_Resolve_Ladder_RecordsTheProfitWithTheController() public {
+        // The LastOutcomeWins ladder: 0.2 ether of loser burn plus the 0.75 ether fee remainder after the 18-hour
+        // reporter pay.
+        uint256 queryId = _createDefaultQuery();
+        _report(user, queryId, OUTCOME_A);
+        vm.warp(START_TIME + 18 hours);
+        _report(bystander, queryId, OUTCOME_B);
+        _warpPastAppealWindow(queryId);
+
+        _resolve(challenger, queryId);
+
+        assertEq(feeCtl.recordedProfit(GENESIS_UID), 0.95 ether);
+    }
+
+    function test_Resolve_SingleStake_FullReporterPayLeavesNoProfitToRecord() public {
+        // Reported at the deadline, the reporter earns the whole fee and nobody lost a stake: zero profit, and
+        // the controller is told nothing.
+        uint256 queryId = _createDefaultQuery();
+        vm.warp(START_TIME + 3 days);
+        _report(user, queryId, OUTCOME_A);
+        _warpPastAppealWindow(queryId);
+
+        _resolve(bystander, queryId);
+
+        assertEq(feeCtl.recordedProfit(GENESIS_UID), 0);
+    }
+
+    /*//////////////////////////////////////////////////////////////
                           RESOLVE - REVERTS
     //////////////////////////////////////////////////////////////*/
     function test_RevertWhen_UniverseDoesNotExist() public {

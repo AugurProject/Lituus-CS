@@ -2,15 +2,14 @@
 pragma solidity ^0.8.35;
 
 import { Multiverse } from "src/Multiverse.sol";
-import { QueryFeeController } from "src/QueryFeeController.sol";
 import { ILituusRep } from "src/interfaces/ILituusRep.sol";
 import { IQueryFeeController } from "src/interfaces/IQueryFeeController.sol";
 import { MultiverseFixtures } from "./Multiverse.fixtures.sol";
-import { MultiverseHarness } from "./Multiverse.harness.sol";
 import { QueryFeeMirror } from "./QueryFee.mirror.sol";
 
-/// @notice Shared layer for the fork statistics suites: the funded fork fixture deployed through the harness
-///         (bucket reads), plus seeding helpers that build a parent history through the real pipeline.
+/// @notice Shared layer for the fork statistics suites: the funded fork fixture on the production fee controller
+///         (through its harness, for the bucket reads), plus seeding helpers that build a parent history through
+///         the real pipeline.
 /// @dev Windows are GENESIS_TIMESTAMP-anchored (START_TIME). Volume is seeded with createQuery (one count per
 ///      query), profit with create + report in one block (reporterPay = 0, so profit = fee, read back from the
 ///      query record) and a resolve in the target window. Expectations are hand-known literals: bucket counts,
@@ -20,28 +19,14 @@ import { QueryFeeMirror } from "./QueryFee.mirror.sol";
 ///      power, or a non-terminating up-branch ratio) the shared mirror is called with the scenario's volumes
 ///      instead, which reads as the scenario itself.
 abstract contract ForkStatisticsFixtures is MultiverseFixtures {
-    MultiverseHarness internal harness;
-
-    function _deployMultiverse(IQueryFeeController controller) internal override returns (Multiverse) {
-        tokenDeployer = _newTokenDeployer();
-        harness = new MultiverseHarness(
-            zoltar,
-            GENESIS_UID,
-            controller,
-            queryTokenizerStub,
-            tokenDeployer,
-            permit2,
-            MIGRATION_DURATION,
-            REPORTING_PERIOD,
-            APPEAL_PERIOD
-        );
-        return Multiverse(address(harness));
+    function _deployFeeController() internal override returns (IQueryFeeController) {
+        return _deployProductionFeeController();
     }
 
     /* ============================================== READS ============================================== */
 
     function _stats(uint248 universeId) internal view returns (uint256 sixtyDayVolume, uint256 lastWindowId) {
-        (uint128 sixty, uint128 last) = multiverse.universeStatistics(universeId);
+        (,,, uint32 last, uint40 sixty) = controller.feeStates(universeId);
         return (sixty, last);
     }
 
@@ -50,11 +35,11 @@ abstract contract ForkStatisticsFixtures is MultiverseFixtures {
     }
 
     function _currentWindow() internal view returns (uint256) {
-        return (vm.getBlockTimestamp() - START_TIME) / multiverse.THREE_DAYS();
+        return (vm.getBlockTimestamp() - START_TIME) / controller.THREE_DAYS();
     }
 
     function _assertBucket(uint248 universeId, uint256 windowId, uint256 profit, uint256 volume) internal view {
-        (uint128 storedProfit, uint128 storedVolume) = harness.exposed_threeDayInfo(universeId, windowId);
+        (uint128 storedProfit, uint128 storedVolume) = controller.threeDayInfo(universeId, windowId);
         assertEq(storedVolume, volume, string.concat("volume at window ", vm.toString(windowId)));
         assertEq(storedProfit, profit, string.concat("profit at window ", vm.toString(windowId)));
     }
@@ -215,7 +200,7 @@ contract MultiverseForkStatisticsTest is ForkStatisticsFixtures {
         _assertBucket(child, 11, profit, 0);
         _assertBucketEmpty(child, forkWindow);
         // The carried profit is the whole of the child's current month (no other profit, no bootstrap there).
-        (uint256 currentProfit,) = harness.exposed_getProfits(child);
+        (uint256 currentProfit,) = controller.exposed_getProfits(child);
         assertEq(currentProfit, profit);
     }
 
@@ -244,7 +229,7 @@ contract MultiverseForkStatisticsTest is ForkStatisticsFixtures {
         _assertBucket(child, 9, 0, 1);
         _assertBucketEmpty(child, 10);
         _assertBucket(child, 11, profit, 0);
-        (uint256 currentProfit,) = harness.exposed_getProfits(child);
+        (uint256 currentProfit,) = controller.exposed_getProfits(child);
         assertEq(currentProfit, profit);
 
         // A sibling at the start of window 14 gets the gap from the mirroring resolve on filled from the
@@ -314,7 +299,7 @@ contract MultiverseForkStatisticsTest is ForkStatisticsFixtures {
         // and nothing to the windows after it. (Had the fill been the parent's recent volume at the trigger,
         // 4 + floor(0.75 * 0) = 4, a spawn at the window's end would have read 4 + 3 = 7 against the parent's 4.)
         _seedVolumeAt(24, 4);
-        _warpToWindow(40, multiverse.THREE_DAYS() / 4);
+        _warpToWindow(40, controller.THREE_DAYS() / 4);
         _createDefaultQuery();
         _createDefaultQuery();
         _createDefaultQuery();
@@ -323,7 +308,7 @@ contract MultiverseForkStatisticsTest is ForkStatisticsFixtures {
         assertEq(parentFee, 2.8 ether);
 
         // Child A three quarters into window 40: recent = 4 + floor(0.25 * 0) = 4, sixty 8 -> the parent's quote.
-        _warpToWindow(40, 3 * multiverse.THREE_DAYS() / 4);
+        _warpToWindow(40, 3 * controller.THREE_DAYS() / 4);
         uint248 childA = _spawn(GENESIS_UID, OUTCOME_A);
         _assertBucket(childA, 40, 0, 4);
         assertEq(_uncappedFee(childA), 2.8 ether);
@@ -358,7 +343,7 @@ contract MultiverseForkStatisticsTest is ForkStatisticsFixtures {
         uint256 p1 = _seedProfitAt(35);
         uint256 p2 = _seedProfitAt(38);
         _seedVolumeAt(39, 4);
-        _warpToWindow(40, multiverse.THREE_DAYS() / 2);
+        _warpToWindow(40, controller.THREE_DAYS() / 2);
         _createDefaultQuery();
         (, uint256 parentFee) = _forkGenesisWithPreview();
         // Parent's own quote at the trigger: recent 2 + 2 = 4 over sixty 2 + 6 = 8 -> ratio 10 -> 2.8 REP.
@@ -366,7 +351,7 @@ contract MultiverseForkStatisticsTest is ForkStatisticsFixtures {
         uint256 profitPerWindow = (p1 + p2) / 10;
 
         // Child A spawns five windows later, a quarter into window 45.
-        _warpToWindow(45, multiverse.THREE_DAYS() / 4);
+        _warpToWindow(45, controller.THREE_DAYS() / 4);
         uint248 childA = _spawn(GENESIS_UID, OUTCOME_A);
 
         // Real windows copied; the rest of window 40 (half) from vol[39] = 4 and the per-window profit; 41..44 whole;
@@ -389,7 +374,7 @@ contract MultiverseForkStatisticsTest is ForkStatisticsFixtures {
         // Child B spawns in the same window three quarters in: same recent 3 + floor(0.25 * 4) = 4, only the
         // 60-day side moves (sixty = 3 + 26 = 29): ratio 80e18 / 29 = 2758620689655172413 floored
         // -> 1351724137931034482, within 3% of A. Without the fill both would sit at the floor.
-        _warpToWindow(45, 3 * multiverse.THREE_DAYS() / 4);
+        _warpToWindow(45, 3 * controller.THREE_DAYS() / 4);
         uint248 childB = _spawn(GENESIS_UID, OUTCOME_B);
         _assertBucket(childB, 45, 3 * profitPerWindow / 4, 3);
         (uint256 sixtyB,) = _stats(childB);
@@ -404,13 +389,13 @@ contract MultiverseForkStatisticsTest is ForkStatisticsFixtures {
         // and half the per-window profit, and nothing else changes.
         uint256 p = _seedProfitAt(38);
         _seedVolumeAt(39, 4);
-        _warpToWindow(40, multiverse.THREE_DAYS() / 4);
+        _warpToWindow(40, controller.THREE_DAYS() / 4);
         (, uint256 parentFee) = _forkGenesisWithPreview();
         // Parent's own quote at the trigger: recent 4 over sixty 1 + 5 = 6, ratio 80e18 / 6 -> 3.466... REP.
         assertEq(parentFee, 3_466_666_666_666_666_666);
         uint256 profitPerWindow = p / 10;
 
-        _warpToWindow(40, 3 * multiverse.THREE_DAYS() / 4);
+        _warpToWindow(40, 3 * controller.THREE_DAYS() / 4);
         uint248 child = _spawn(GENESIS_UID, OUTCOME_A);
 
         _assertBucket(child, 38, p, 1);
@@ -443,7 +428,7 @@ contract MultiverseForkStatisticsTest is ForkStatisticsFixtures {
         // beyond the 21-window horizon, so the child's whole history is the fill.
         uint256 p = _seedProfitAt(38);
         _seedVolumeAt(39, 4);
-        _warpToWindow(40, multiverse.THREE_DAYS() / 4);
+        _warpToWindow(40, controller.THREE_DAYS() / 4);
         _forkGenesisWithPreview();
         uint256 profitPerWindow = p / 10;
 
@@ -469,8 +454,8 @@ contract MultiverseForkStatisticsTest is ForkStatisticsFixtures {
         // A steady state at the trigger rates: recent = 0 + vol[69] = 4 over sixty 80 (ratio exactly 1, the branch
         // boundary — the mirror with those volumes is the readable expectation), and both profit months read the
         // parent's trigger-time 30-day profit: ten windows at a tenth of it each.
-        assertEq(_uncappedFee(child), QueryFeeMirror.expectedFee(multiverse, DEFAULT_FEE, 70, 0, 0, 4, 80, 4));
-        (uint256 currentProfit, uint256 lastProfit) = harness.exposed_getProfits(child);
+        assertEq(_uncappedFee(child), QueryFeeMirror.expectedFee(controller, DEFAULT_FEE, 70, 0, 0, 4, 80, 4));
+        (uint256 currentProfit, uint256 lastProfit) = controller.exposed_getProfits(child);
         assertEq(currentProfit, 10 * profitPerWindow);
         assertEq(lastProfit, 10 * profitPerWindow);
     }
@@ -533,14 +518,14 @@ contract MultiverseForkStatisticsTest is ForkStatisticsFixtures {
         // recent 4 over sixty 1 + 4 + 16 * 3 + 3 = 56, ratio 80/56 on the up-branch -> 1.0857... REP. The mirror
         // with those volumes is the readable expectation; the same fee the parent quoted.
         uint256 childFee = _uncappedFee(child);
-        assertEq(childFee, QueryFeeMirror.expectedFee(multiverse, DEFAULT_FEE, 3, 0, 1, 3, 4, 0));
+        assertEq(childFee, QueryFeeMirror.expectedFee(controller, DEFAULT_FEE, 3, 0, 1, 3, 4, 0));
         assertEq(childFee, parentFee);
 
         // Profit view at the start of window 3: the current month is windows 3..-6 plus the whole boundary
         // window -7 -> p + 7 * BOOT_PROFIT; the previous month is windows -8..-16 plus the whole oldest window
         // -17 -> 10 * BOOT_PROFIT.
-        uint256 boot = multiverse.BOOT_PROFIT();
-        (uint256 currentProfit, uint256 lastProfit) = harness.exposed_getProfits(child);
+        uint256 boot = controller.BOOT_PROFIT();
+        (uint256 currentProfit, uint256 lastProfit) = controller.exposed_getProfits(child);
         assertEq(currentProfit, profit + 7 * boot);
         assertEq(lastProfit, 10 * boot);
 
@@ -548,7 +533,7 @@ contract MultiverseForkStatisticsTest is ForkStatisticsFixtures {
         // vol[0..3] = 5; sixty = 5 + 15 * 3 + 3 = 53 puts the ratio 20/53 on the down-branch (a sixth power,
         // 0.1464... REP), so the mirror with prevVol = 1 and sixtyStorage = 5 is the readable expectation.
         _warpToWindow(4, 0);
-        assertEq(_uncappedFee(child), QueryFeeMirror.expectedFee(multiverse, DEFAULT_FEE, 4, 0, 0, 1, 5, 0));
+        assertEq(_uncappedFee(child), QueryFeeMirror.expectedFee(controller, DEFAULT_FEE, 4, 0, 0, 1, 5, 0));
     }
 
     function test_Spawn_ChildHistoryIsACopyNotAnAlias() public {
@@ -609,7 +594,7 @@ contract MultiverseForkStatisticsTest is ForkStatisticsFixtures {
         // vol[24] = 2, vol[43] = 3, forking query mid-window 44 (f = 0.5): vol[44] = 1, cache 5.
         _seedVolumeAt(24, 2);
         _seedVolumeAt(43, 3);
-        _warpToWindow(44, multiverse.THREE_DAYS() / 2);
+        _warpToWindow(44, controller.THREE_DAYS() / 2);
         (, uint256 parentFee) = _forkGenesisWithPreview();
         uint248 child = _spawn(GENESIS_UID, OUTCOME_A);
         _fundUserInChild(OUTCOME_A, 100 ether);
@@ -638,23 +623,12 @@ contract MultiverseForkStatisticsTest is ForkStatisticsFixtures {
 }
 
 /// @notice The child's monthly base-fee hill-climb runs on the inherited profit history.
-/// @dev Production controller. The read is placed at window 20 so no BOOT_PROFIT term enters either month, and
+/// @dev The read is placed at window 20 so no BOOT_PROFIT term enters either month, and
 ///      inherited profit (three fees, booked in window 9) sits entirely in the previous month while the child's
 ///      own profit (one down-curve fee, booked in window 20) is the current month. Profit "did not improve", so
 ///      the controller flips its fresh direction and RAISES; without the inherited history the current month
 ///      would beat an empty previous month and the fee would be cut instead.
 contract MultiverseForkStatisticsHillClimbTest is ForkStatisticsFixtures {
-    QueryFeeController internal controller;
-
-    function _deployFeeController() internal override returns (IQueryFeeController) {
-        controller = new QueryFeeController(GENESIS_UID);
-        return IQueryFeeController(address(controller));
-    }
-
-    function _afterProtocolDeploy() internal override {
-        controller.setMultiverse(address(multiverse));
-    }
-
     /// @dev Three genesis queries created in window 8 and resolved in window 9: three fees of profit booked in
     ///      window 9 for a child to inherit. Returns their sum.
     function _seedInheritedProfit() internal returns (uint256 inheritedProfit) {
@@ -693,13 +667,13 @@ contract MultiverseForkStatisticsHillClimbTest is ForkStatisticsFixtures {
         _escalateToFork(GENESIS_UID, forkQueryId, user, challenger);
         uint248 child = _spawn(GENESIS_UID, OUTCOME_A);
         uint256 inheritedBase = controller.getQueryFee(child);
-        assertEq(inheritedBase, controller.INITIAL_BASE_FEE());
+        assertEq(inheritedBase, controller.getQueryFee(GENESIS_UID));
         _fundUserInChild(OUTCOME_A, 200 ether);
         uint256 ownFee = _bookOwnProfitAt(child, 20);
 
         // Window 20, one day in: previous month = exactly the inherited profit, current month = the own fee.
         _warpToWindow(20, 1 days);
-        (uint256 currentProfit, uint256 lastProfit) = harness.exposed_getProfits(child);
+        (uint256 currentProfit, uint256 lastProfit) = controller.exposed_getProfits(child);
         assertEq(lastProfit, inheritedProfit);
         assertEq(currentProfit, ownFee);
         assertLt(currentProfit, lastProfit);
@@ -732,9 +706,9 @@ contract MultiverseForkStatisticsHillClimbTest is ForkStatisticsFixtures {
         // Previous month = windows 18..10 at the per-window profit plus the (1 - f) tail of window 9's inherited
         // profit; the own fee is the whole current month. An unfilled gap would have left only the window-9 tail.
         _warpToWindow(29, 1 days);
-        uint256 scale = multiverse.SCALE();
-        uint256 fraction = 1 days * scale / multiverse.THREE_DAYS();
-        (uint256 currentProfit, uint256 lastProfit) = harness.exposed_getProfits(child);
+        uint256 scale = controller.SCALE();
+        uint256 fraction = 1 days * scale / controller.THREE_DAYS();
+        (uint256 currentProfit, uint256 lastProfit) = controller.exposed_getProfits(child);
         assertEq(currentProfit, ownFee);
         assertEq(lastProfit, 9 * profitPerWindow + (scale - fraction) * inheritedProfit / scale);
         assertLt(currentProfit, lastProfit);

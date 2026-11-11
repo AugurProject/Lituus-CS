@@ -1,23 +1,23 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.35;
 
-import { Multiverse } from "src/Multiverse.sol";
+import { QueryFeeController } from "src/QueryFeeController.sol";
 
 /// @notice Expected-fee mirror shared by the query fee, fork statistics and fuzz suites. Reimplements the
 ///         contract's integer operations (same order, same floors), so an expectation can be stated from the
 ///         scenario's volumes where a hand-derived literal would be opaque, and so a random fuzz schedule can
 ///         be checked at all. The hand-derived literal anchors in the unit suites are what keep it honest.
-/// @dev A library taking the deployed Multiverse as its first argument, so it attaches to any fixture layer
-///      without inheritance; called explicitly as `QueryFeeMirror.expectedFee(multiverse, ...)`. SCALE and
+/// @dev A library taking the deployed controller as its first argument, so it attaches to any fixture layer
+///      without inheritance; called explicitly as `QueryFeeMirror.expectedFee(controller, ...)`. SCALE and
 ///      BOOT_VOLUME are read from the contract.
 library QueryFeeMirror {
     /// @dev Mirror of `_calculateCurveModifier`.
-    function curveModifier(Multiverse multiverse, uint256 sixty, uint256 recent)
+    function curveModifier(QueryFeeController controller, uint256 sixty, uint256 recent)
         internal
         view
         returns (uint256 modifier_)
     {
-        uint256 scale = multiverse.SCALE();
+        uint256 scale = controller.SCALE();
         uint256 ratio = sixty == 0 ? scale : 20 * recent * scale / sixty;
 
         if (ratio >= scale) {
@@ -33,23 +33,23 @@ library QueryFeeMirror {
     }
 
     /// @dev The deepest down-curve point: an empty recent window over any nonzero sixty.
-    function floorModifier(Multiverse multiverse) internal view returns (uint256) {
-        return curveModifier(multiverse, 1, 0);
+    function floorModifier(QueryFeeController controller) internal view returns (uint256) {
+        return curveModifier(controller, 1, 0);
     }
 
-    /// @dev Mirror of `_calculateFeeAndApplyVolume`'s local-volume math, both regimes. Volumes are
+    /// @dev Mirror of `chargeQuery`'s local-volume math, both regimes. Volumes are
     ///      the test-known query counts. The mirror predicts the UNCAPPED fee: the half-fork-threshold
     ///      cap applied by createQuery is asserted directly in the cap tests, never mirrored.
-    /// @param multiverse The deployed contract, for SCALE and BOOT_VOLUME.
+    /// @param controller The deployed controller, for SCALE and BOOT_VOLUME.
     /// @param baseFee The controller base fee the modifier applies to.
     /// @param windowId The current window id.
     /// @param fractionElapsed Fraction of the current window elapsed, SCALE-scaled.
     /// @param currentVol Real query count already in window `windowId`.
     /// @param prevVol Real query count in window `windowId-1` (ignored for windowId == 0: bootstrap is used).
-    /// @param sixtyStorage The real running sum of windows windowId-1..windowId-20 (universeStatistics value).
+    /// @param sixtyStorage The real running sum of windows windowId-1..windowId-20 (the cached sixtyDayVolume).
     /// @param oldestVol Real query count in window `windowId-20` (only read in the real regime, windowId >= 20).
     function expectedFee(
-        Multiverse multiverse,
+        QueryFeeController controller,
         uint256 baseFee,
         uint256 windowId,
         uint256 fractionElapsed,
@@ -58,8 +58,8 @@ library QueryFeeMirror {
         uint256 sixtyStorage,
         uint256 oldestVol
     ) internal view returns (uint256) {
-        uint256 scale = multiverse.SCALE();
-        uint256 boot = multiverse.BOOT_VOLUME();
+        uint256 scale = controller.SCALE();
+        uint256 boot = controller.BOOT_VOLUME();
 
         uint256 previous = windowId >= 1 ? prevVol : boot;
         uint256 recent = currentVol + (scale - fractionElapsed) * previous / scale;
@@ -73,6 +73,6 @@ library QueryFeeMirror {
             sixty += (20 - windowId - 1) * boot + (scale - fractionElapsed) * boot / scale;
         }
 
-        return baseFee * curveModifier(multiverse, sixty, recent) / scale;
+        return baseFee * curveModifier(controller, sixty, recent) / scale;
     }
 }

@@ -5,7 +5,6 @@ import { Multiverse } from "src/Multiverse.sol";
 import { LituusRep } from "src/LituusRep.sol";
 import { ILituusRep } from "src/interfaces/ILituusRep.sol";
 import { MultiverseFixtures } from "./Multiverse.fixtures.sol";
-import { QueryFeeMirror } from "./QueryFee.mirror.sol";
 
 /// @notice Minimal forking flow: trigger inside report(), lazy spawn, migration voting, resolution, and
 ///         the forking query's payouts in the children.
@@ -333,10 +332,10 @@ contract MultiverseForkTest is MultiverseFixtures {
         uint256 nestedQueryId = multiverse.queryCount();
         vm.prank(user);
         multiverse.createQuery(child1, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
-        // The child inherits the genesis demand history (vol[0] = 2: the open and the forking query), so its fee
-        // is demand-adjusted: at window 0, f = 0, recent 2 + bootstrap 3 = 5 over a bootstrap-filled sixty.
+        // The mock controller charges the flat default in the child too (the inherited demand history is the
+        // fork statistics suite's subject); what matters here is that the fee joins child1's pot.
         (,, uint256 nestedFee,,) = multiverse.queries(nestedQueryId);
-        assertEq(nestedFee, QueryFeeMirror.expectedFee(multiverse, DEFAULT_FEE, 0, 0, 2, 0, 0, 0));
+        assertEq(nestedFee, DEFAULT_FEE);
         assertEq(_totalQueryFees(child1), DEFAULT_FEE + nestedFee);
         _escalateToFork(child1, nestedQueryId, user, user);
 
@@ -349,6 +348,21 @@ contract MultiverseForkTest is MultiverseFixtures {
         uint248 grandchild = _childId(child1, OUTCOME_A);
         assertEq(_totalQueryFees(grandchild), DEFAULT_FEE);
         assertEq(multiverse.getOutcome(grandchild, openQueryId), 0); // still unresolved
+    }
+
+    function test_Spawn_SeedsTheChildFromTheParentWithTheController() public {
+        _forkGenesis();
+        (,, uint48 parentForkTime,,,,,,,,,,) = multiverse.universes(GENESIS_UID);
+        vm.warp(vm.getBlockTimestamp() + 2 days);
+
+        uint248 child = _childId(GENESIS_UID, OUTCOME_A);
+        vm.prank(bystander);
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
+
+        // Seeded from its parent as of the fork trigger, not the spawn.
+        assertEq(feeCtl.seededFrom(child), GENESIS_UID);
+        assertEq(feeCtl.seededAt(child), parentForkTime);
+        assertLt(parentForkTime, vm.getBlockTimestamp());
     }
 
     function test_Spawn_Reverts() public {

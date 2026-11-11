@@ -287,13 +287,12 @@ contract MultiverseReportTest is MultiverseFixtures {
         _report(user, queryId0, OUTCOME_A);
         _report(bystander, queryId0, OUTCOME_B);
 
-        // The untouched query still has an empty ladder and a first-report stake requirement.
-        // The second query costs more than the first one because the first one already raised
-        // the demand modifier, but its slightly higher fee still rounds to the same grid step.
+        // The untouched query still has an empty ladder and a first-report stake requirement: its fee,
+        // which the flat mock controller keeps at the base.
         assertEq(_resolution(queryId1).stakeCount, 0);
         (,, uint256 fee1,,) = multiverse.queries(queryId1);
         uint256 requiredStake = multiverse.getNextRequiredStake(GENESIS_UID, queryId1, OUTCOME_A);
-        assertGt(fee1, DEFAULT_FEE);
+        assertEq(fee1, DEFAULT_FEE);
         assertEq(requiredStake, DEFAULT_FEE);
     }
 
@@ -393,11 +392,7 @@ contract MultiverseReportTest is MultiverseFixtures {
         vm.warp(vm.getBlockTimestamp() + 6 hours);
         _report(bystander, queryId0, OUTCOME_A);
 
-        // Each query's ladder runs from its own first stake. The second query's fee is higher than
-        // the base fee (the first one already raised the demand modifier) but rounds to the same
-        // grid step, so both ladders start at DEFAULT_FEE.
-        (,, uint256 fee1,,) = multiverse.queries(queryId1);
-        assertGt(fee1, DEFAULT_FEE);
+        // Each query's ladder runs from its own first stake; both start at DEFAULT_FEE.
         ResolutionView memory r0 = _resolution(queryId0);
         ResolutionView memory r1 = _resolution(queryId1);
         assertEq(r0.stakeCount, 3);
