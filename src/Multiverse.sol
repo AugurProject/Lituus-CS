@@ -414,8 +414,9 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
 
     /* ============================================ PERMIT FUNCTIONS ============================================= */
     /**
-     * @notice Applies the caller's ERC-2612 permit on a universe's wREP in favor of this contract, so a fee or
-     *         a stake can be approved and paid in one multicall: [permitRep, createQuery] or [permitRep, report].
+     * @notice Applies the caller's ERC-2612 permit on a universe's wREP in favor of this contract, so a fee, a
+     *         stake or a tip can be approved and paid in one multicall: [permitRep, createQuery],
+     *         [permitRep, report] or [permitRep, tip].
      * @dev A permit somebody else already submitted goes through as long as the allowance it set is in place;
      *      anything that leaves the allowance short of `value` reverts with PermitNotEffective.
      * @param universeId The universe whose wREP the permit is for.
@@ -810,7 +811,8 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
         // A first touch anchors the record: its clock now, its inherited tips with the new tip below.
         if (resolution.queryCreateTime == 0) resolution.queryCreateTime = queryCreateTime;
 
-        universe.repToken.safeTransferFrom(msg.sender, address(this), amount);
+        // Take the tip: plain allowance, or the caller's Permit2 allowance (see PermitSupport).
+        _pull(universe.repToken, amount);
         // On a first touch the record held no tips, otherwise nothing is inherited: one write covers both.
         // Tips are REP amounts within uint128.
         // forge-lint: disable-next-line(unsafe-typecast)

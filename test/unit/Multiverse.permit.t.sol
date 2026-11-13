@@ -17,6 +17,7 @@ import { PermitSigning } from "../utils/PermitSigning.sol";
 contract MultiversePermitTest is MultiverseFixtures, PermitSigning {
     uint256 internal constant SIGNER_REP = 100 ether;
     uint256 internal constant SIGNER_UNDERLYING = 50 ether;
+    uint256 internal constant TIP = 5 ether;
 
     address internal signer;
     uint256 internal signerKey;
@@ -62,6 +63,10 @@ contract MultiversePermitTest is MultiverseFixtures, PermitSigning {
         returns (bytes memory)
     {
         return abi.encodeCall(PermitSupport.permit2, (permitSingle, signature));
+    }
+
+    function _tipCall(uint256 queryId, uint256 amount) internal pure returns (bytes memory) {
+        return abi.encodeCall(Multiverse.tip, (GENESIS_UID, queryId, amount));
     }
 
     function _multicall(address caller, bytes memory first, bytes memory second) internal {
@@ -371,6 +376,89 @@ contract MultiversePermitTest is MultiverseFixtures, PermitSigning {
 
         assertEq(multiverse.queryCount(), queryCount);
         assertEq(genesisRep.balanceOf(signer), SIGNER_REP);
+    }
+
+    /* ================================================ TIP ================================================== */
+
+    function test_PermitRep_ThenTipInOneTransaction() public {
+        uint256 queryId = _createDefaultQuery();
+        uint256 deadline = vm.getBlockTimestamp() + 1 hours;
+        (uint8 v, bytes32 r, bytes32 s) = _signerPermit(TIP, deadline);
+        uint256 multiverseBefore = genesisRep.balanceOf(address(multiverse));
+
+        vm.expectEmit(true, true, true, true, address(multiverse));
+        emit Multiverse.QueryTipped(signer, GENESIS_UID, queryId, TIP);
+        _multicall(signer, _permitRepCall(TIP, deadline, v, r, s), _tipCall(queryId, TIP));
+
+        assertEq(multiverse.getTips(GENESIS_UID, queryId), TIP);
+        assertEq(genesisRep.balanceOf(signer), SIGNER_REP - TIP);
+        assertEq(genesisRep.balanceOf(address(multiverse)), multiverseBefore + TIP);
+        // The permit granted exactly the tip, and the tip spent it.
+        assertEq(genesisRep.allowance(signer, address(multiverse)), 0);
+        assertEq(genesisRep.nonces(signer), 1);
+    }
+
+    function test_Permit2_ThenTipInOneTransaction() public {
+        uint256 queryId = _createDefaultQuery();
+        (IPermit2.PermitSingle memory permitSingle, bytes memory signature) =
+            _signerPermit2(address(genesisRep), uint160(TIP));
+        uint256 multiverseBefore = genesisRep.balanceOf(address(multiverse));
+
+        vm.expectEmit(true, true, true, true, address(multiverse));
+        emit Multiverse.QueryTipped(signer, GENESIS_UID, queryId, TIP);
+        _multicall(signer, _permit2Call(permitSingle, signature), _tipCall(queryId, TIP));
+
+        assertEq(multiverse.getTips(GENESIS_UID, queryId), TIP);
+        assertEq(genesisRep.balanceOf(signer), SIGNER_REP - TIP);
+        assertEq(genesisRep.balanceOf(address(multiverse)), multiverseBefore + TIP);
+        // No plain allowance was ever involved; the Permit2 allowance was spent down.
+        assertEq(genesisRep.allowance(signer, address(multiverse)), 0);
+        assertEq(_permit2Allowance(address(genesisRep)), 0);
+    }
+
+    function test_Permit2_CreateQueryAndTipItInOneTransaction() public {
+        // A creator who wants the query picked up fast tips it in the same transaction: one Permit2 grant covers
+        // both the fee and the tip.
+        uint256 fee = _nextFee();
+        (IPermit2.PermitSingle memory permitSingle, bytes memory signature) =
+            _signerPermit2(address(genesisRep), uint160(fee + TIP));
+        uint256 queryId = multiverse.queryCount();
+
+        bytes[] memory calls = new bytes[](3);
+        calls[0] = _permit2Call(permitSingle, signature);
+        calls[1] = _createQueryCall();
+        calls[2] = _tipCall(queryId, TIP);
+        vm.prank(signer);
+        multiverse.multicall(calls);
+
+        assertEq(multiverse.queryCount(), queryId + 1);
+        assertEq(multiverse.getTips(GENESIS_UID, queryId), TIP);
+        assertEq(genesisRep.balanceOf(signer), SIGNER_REP - fee - TIP);
+        assertEq(_permit2Allowance(address(genesisRep)), 0);
+    }
+
+    function test_RevertWhen_Tip_NoAllowanceAnywhere() public {
+        uint256 queryId = _createDefaultQuery();
+
+        vm.prank(signer);
+        vm.expectRevert(abi.encodeWithSelector(AllowanceExpired.selector, 0));
+        multiverse.tip(GENESIS_UID, queryId, TIP);
+    }
+
+    function test_Multicall_ATipBeatenByAReportRevertsThePermitToo() public {
+        // The tipper signs, but a report lands first and closes tipping. The whole multicall reverts, so the
+        // permit is never used: no allowance is left behind and the nonce stays unspent.
+        uint256 queryId = _createDefaultQuery();
+        uint256 deadline = vm.getBlockTimestamp() + 1 hours;
+        (uint8 v, bytes32 r, bytes32 s) = _signerPermit(TIP, deadline);
+        _report(user, queryId, OUTCOME_A);
+
+        vm.expectRevert(Multiverse.QueryAlreadyReported.selector);
+        _multicall(signer, _permitRepCall(TIP, deadline, v, r, s), _tipCall(queryId, TIP));
+
+        assertEq(genesisRep.balanceOf(signer), SIGNER_REP);
+        assertEq(genesisRep.allowance(signer, address(multiverse)), 0);
+        assertEq(genesisRep.nonces(signer), 0);
     }
 
     /* =============================================== WRAP ================================================== */
