@@ -118,12 +118,12 @@ contract MultiverseTokenizerTest is QueryTokenizerFixtures {
     }
 
     function test_CreateQueryFromTokenizer_CountsDemandVolume() public {
-        uint256 previewBefore = _previewUncappedFee();
-
         vm.prank(address(tokenizer));
         multiverse.createQueryFromTokenizer(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES, 1 ether, user);
 
-        assertGt(_previewUncappedFee(), previewBefore);
+        // Reported to the controller as demand, not priced by it: the tokenizer set the price.
+        assertEq(feeCtl.recordedQueries(GENESIS_UID), 1);
+        assertEq(feeCtl.chargedQueries(GENESIS_UID), 0);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -144,7 +144,9 @@ contract MultiverseTokenizerTest is QueryTokenizerFixtures {
                           GET MINT PRICING
     //////////////////////////////////////////////////////////////*/
     function test_GetMintPricing_FeeMatchesChargedFee() public {
-        // Same block, below the cap: the preview equals exactly what createQuery then charges.
+        // Below the cap, the preview is exactly what createQuery then charges (the controller's preview against
+        // its charge across idle gaps is the query fee suite's subject).
+        feeCtl.setFee(3 ether);
         uint256 preview = _previewUncappedFee();
 
         vm.prank(user);
@@ -152,24 +154,7 @@ contract MultiverseTokenizerTest is QueryTokenizerFixtures {
 
         (,, uint256 chargedFee,,) = multiverse.queries(0);
         assertEq(chargedFee, preview);
-
-        // Idle two windows plus a partial-window offset: the view must catch the 60-day cache up
-        // in memory (only the mutating path persists it) and interpolate the partial window —
-        // parity must survive a stale cache.
-        vm.warp(vm.getBlockTimestamp() + 2 * multiverse.REPORTING_PERIOD() + 1 days);
-        preview = _previewUncappedFee();
-        vm.prank(user);
-        multiverse.createQuery(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
-        (,, chargedFee,,) = multiverse.queries(1);
-        assertEq(chargedFee, preview);
-
-        // Idle past 20 windows: the cache roll switches to the full recompute branch.
-        vm.warp(vm.getBlockTimestamp() + 21 * multiverse.REPORTING_PERIOD() + 36 hours);
-        preview = _previewUncappedFee();
-        vm.prank(user);
-        multiverse.createQuery(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
-        (,, chargedFee,,) = multiverse.queries(2);
-        assertEq(chargedFee, preview);
+        assertEq(chargedFee, 3 ether);
     }
 
     function test_GetMintPricing_FeeIsUncappedAndCapIsHalfThreshold() public {

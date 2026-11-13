@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.35;
 
-import { Multiverse } from "src/Multiverse.sol";
 import { IQueryFeeController } from "src/interfaces/IQueryFeeController.sol";
 import { MultiverseFuzzFixtures } from "./Multiverse.fuzz.fixtures.sol";
-import { MultiverseHarness } from "../unit/Multiverse.harness.sol";
 import { QueryFeeMirror } from "../unit/QueryFee.mirror.sol";
 
 /// @notice Property-based test for the history a child inherits at spawn: a random parent history (volume and
@@ -22,8 +20,6 @@ contract MultiverseForkStatisticsFuzzTest is MultiverseFuzzFixtures {
     // High enough that the one-query tolerance of the pricing checks below is small against the volumes.
     uint256 internal constant MAX_VOLUME_PER_WINDOW = 6;
 
-    MultiverseHarness internal harness;
-
     struct Fill {
         uint256 triggerWindow;
         uint256 triggerFraction;
@@ -33,20 +29,17 @@ contract MultiverseForkStatisticsFuzzTest is MultiverseFuzzFixtures {
         uint256 profitPerWindow;
     }
 
-    function _deployMultiverse(IQueryFeeController controller) internal override returns (Multiverse) {
-        harness = new MultiverseHarness(
-            zoltar, GENESIS_UID, controller, queryTokenizerStub, MIGRATION_DURATION, REPORTING_PERIOD, APPEAL_PERIOD
-        );
-        return Multiverse(address(harness));
+    function _deployFeeController() internal override returns (IQueryFeeController) {
+        return _deployProductionFeeController();
     }
 
     function _volume(uint248 universeId, uint256 windowId) internal view returns (uint256 volume) {
-        (, volume) = harness.exposed_threeDayInfo(universeId, windowId);
+        (, volume) = controller.threeDayInfo(universeId, windowId);
     }
 
     function _fraction() internal view returns (uint256) {
-        uint256 threeDays = multiverse.THREE_DAYS();
-        return (vm.getBlockTimestamp() - START_TIME) % threeDays * multiverse.SCALE() / threeDays;
+        uint256 threeDays = controller.THREE_DAYS();
+        return (vm.getBlockTimestamp() - START_TIME) % threeDays * controller.SCALE() / threeDays;
     }
 
     /// @dev The moment a window's history seeding is complete: the profit seed's resolve.
@@ -73,8 +66,8 @@ contract MultiverseForkStatisticsFuzzTest is MultiverseFuzzFixtures {
         view
         returns (uint256 profit, uint256 volume)
     {
-        uint256 scale = multiverse.SCALE();
-        if (windowId <= fill.triggerWindow) (profit, volume) = harness.exposed_threeDayInfo(GENESIS_UID, windowId);
+        uint256 scale = controller.SCALE();
+        if (windowId <= fill.triggerWindow) (profit, volume) = controller.threeDayInfo(GENESIS_UID, windowId);
         if (windowId >= fill.triggerWindow) {
             uint256 frozenEnd = windowId == fill.spawnWindow ? fill.spawnFraction : scale;
             uint256 frozenStart = windowId == fill.triggerWindow ? fill.triggerFraction : 0;
@@ -91,7 +84,7 @@ contract MultiverseForkStatisticsFuzzTest is MultiverseFuzzFixtures {
     ) public {
         forkWindow = bound(forkWindow, 0, MAX_FORK_WINDOW);
         // Anywhere in the fork window after its history is seeded (one day and an hour in).
-        triggerOffset = bound(triggerOffset, _historyEnd() + 1, multiverse.THREE_DAYS() - 1);
+        triggerOffset = bound(triggerOffset, _historyEnd() + 1, controller.THREE_DAYS() - 1);
         // Up to three migration windows after the trigger: past the first one the fork is resolved before the spawn.
         delay = bound(delay, 0, 3 * MIGRATION_DURATION);
 
@@ -116,16 +109,16 @@ contract MultiverseForkStatisticsFuzzTest is MultiverseFuzzFixtures {
         // The parent's per-window values as of the trigger, as the contract defines them: the count of the
         // window before the trigger window, and a tenth of the 30-day profit its hill-climb read. Read now: the
         // parent is frozen. Its own recent volume at the trigger is kept for the pricing check below.
-        fill.volumePerWindow = forkWindow >= 1 ? _volume(GENESIS_UID, forkWindow - 1) : multiverse.BOOT_VOLUME();
-        (uint256 parentCurrentProfit,) = harness.exposed_getProfits(GENESIS_UID);
+        fill.volumePerWindow = forkWindow >= 1 ? _volume(GENESIS_UID, forkWindow - 1) : controller.BOOT_VOLUME();
+        (uint256 parentCurrentProfit,) = controller.exposed_getProfits(GENESIS_UID);
         fill.profitPerWindow = parentCurrentProfit / 10;
-        uint256 parentRecentVolume = harness.exposed_recentVolume(GENESIS_UID);
+        uint256 parentRecentVolume = controller.exposed_recentVolume(GENESIS_UID);
 
         vm.warp(forkTime + delay);
         if (delay >= MIGRATION_DURATION) multiverse.advanceForkState(GENESIS_UID);
         multiverse.spawnChildUniverse(GENESIS_UID, 1);
         uint248 child = _childId(GENESIS_UID, 1);
-        fill.spawnWindow = (vm.getBlockTimestamp() - START_TIME) / multiverse.THREE_DAYS();
+        fill.spawnWindow = (vm.getBlockTimestamp() - START_TIME) / controller.THREE_DAYS();
         fill.spawnFraction = _fraction();
 
         // The 21 buckets ending at the spawn window, and nothing older.
@@ -134,19 +127,19 @@ contract MultiverseForkStatisticsFuzzTest is MultiverseFuzzFixtures {
             if (fill.spawnWindow < i) break;
             uint256 w = fill.spawnWindow - i;
             (uint256 expectedProfit, uint256 expectedVolume) = _expectedBucket(fill, w);
-            (uint256 profit, uint256 volume) = harness.exposed_threeDayInfo(child, w);
+            (uint256 profit, uint256 volume) = controller.threeDayInfo(child, w);
             assertEq(volume, expectedVolume, "volume");
             assertEq(profit, expectedProfit, "profit");
             if (i >= 1) expectedSixty += expectedVolume;
         }
         if (fill.spawnWindow >= 21) {
-            (uint256 profit, uint256 volume) = harness.exposed_threeDayInfo(child, fill.spawnWindow - 21);
+            (uint256 profit, uint256 volume) = controller.threeDayInfo(child, fill.spawnWindow - 21);
             assertEq(volume, 0, "horizon volume");
             assertEq(profit, 0, "horizon profit");
         }
 
         // The cache the child's own roll would produce from those buckets.
-        (uint128 childSixty, uint128 childLast) = multiverse.universeStatistics(child);
+        (,,, uint32 childLast, uint40 childSixty) = controller.feeStates(child);
         assertEq(childLast, fill.spawnWindow, "lastWindowId");
         assertEq(childSixty, expectedSixty, "sixtyDayVolume");
 
@@ -155,7 +148,7 @@ contract MultiverseForkStatisticsFuzzTest is MultiverseFuzzFixtures {
         // extrapolating it); from the second window after the trigger, the previous window's count, whatever
         // the spawn moment. In between the two blend. The span is split across two buckets floored separately,
         // so one query can be lost against a single floor, never gained.
-        uint256 childRecentVolume = harness.exposed_recentVolume(child);
+        uint256 childRecentVolume = controller.exposed_recentVolume(child);
         if (fill.spawnWindow == fill.triggerWindow) {
             assertLe(childRecentVolume, parentRecentVolume, "child recent volume (trigger window)");
             assertGe(childRecentVolume + 1, parentRecentVolume, "child recent volume (trigger window)");
@@ -166,8 +159,8 @@ contract MultiverseForkStatisticsFuzzTest is MultiverseFuzzFixtures {
 
         // A spawn in the trigger's own block is a plain copy: the profit view is the parent's.
         if (delay == 0) {
-            (uint256 childCurrent, uint256 childLastProfit) = harness.exposed_getProfits(child);
-            (uint256 parentCurrent, uint256 parentLastProfit) = harness.exposed_getProfits(GENESIS_UID);
+            (uint256 childCurrent, uint256 childLastProfit) = controller.exposed_getProfits(child);
+            (uint256 parentCurrent, uint256 parentLastProfit) = controller.exposed_getProfits(GENESIS_UID);
             assertEq(childCurrent, parentCurrent, "current profit");
             assertEq(childLastProfit, parentLastProfit, "last profit");
         }
@@ -182,7 +175,7 @@ contract MultiverseForkStatisticsFuzzTest is MultiverseFuzzFixtures {
         assertEq(
             childFee,
             QueryFeeMirror.expectedFee(
-                multiverse,
+                controller,
                 DEFAULT_FEE,
                 fill.spawnWindow,
                 fill.spawnFraction,

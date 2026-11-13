@@ -12,12 +12,17 @@ import { MockZoltarQuestionData } from "src/mock/MockZoltarQuestionData.sol";
 import { MultiverseDeployFixture } from "./Multiverse.fixtures.sol";
 import { QueryFeeMirror } from "./QueryFee.mirror.sol";
 
-/// @notice Shared helper for the query fee suites. The expected-fee mirror is the shared
-///         `QueryFeeMirror` library; the window warp lives in the fixtures.
+/// @notice Shared helper for the query fee suites: the production fee controller (through its harness, genesis
+///         base pinned to DEFAULT_FEE), the expected-fee mirror from the shared `QueryFeeMirror` library, and the
+///         window warp from the fixtures.
 abstract contract QueryFeeTestHelpers is MultiverseDeployFixture {
     /// @dev The single funded payer holds the whole supply; the stress suite pins a larger one.
     function _genesisSupply() internal view virtual override returns (uint256) {
         return USER_REP_BALANCE;
+    }
+
+    function _deployFeeController() internal override returns (IQueryFeeController) {
+        return _deployProductionFeeController();
     }
 
     /// @dev Creates a query as `user` and returns the fee actually charged (balance delta).
@@ -30,10 +35,8 @@ abstract contract QueryFeeTestHelpers is MultiverseDeployFixture {
 }
 
 /// @notice Unit suite for the per-query demand modifier (volume windows, interpolation, bootstrap).
-
-/// @notice Unit suite for the per-query demand modifier (volume windows, interpolation, bootstrap).
-/// @dev Uses the mock controller from the deploy fixture; only `user` is funded — the modifier
-///      tests have no other actors and no economic assumptions beyond the base fee constant.
+/// @dev Only `user` is funded — the modifier tests have no other actors and no economic assumptions beyond
+///      the pinned base fee.
 contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
     function setUp() public override {
         super.setUp();
@@ -62,8 +65,26 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
         // The first query is now in the current bucket: one real query on top of the bootstrap.
         uint256 second = _chargedFee();
 
-        assertEq(second, QueryFeeMirror.expectedFee(multiverse, DEFAULT_FEE, 0, 0, 1, 0, 0, 0));
+        assertEq(second, QueryFeeMirror.expectedFee(controller, DEFAULT_FEE, 0, 0, 1, 0, 0, 0));
         assertGt(second, first);
+    }
+
+    function test_QueryFee_PreviewMatchesChargeAcrossIdleGaps() public {
+        // Same block: the preview is exactly what createQuery then charges.
+        (uint256 preview,,) = multiverse.getMintPricing(GENESIS_UID);
+        assertEq(_chargedFee(), preview);
+
+        // Idle two windows plus a partial-window offset: the view must catch the 60-day cache up in memory
+        // (only the mutating path persists it) and interpolate the partial window. Parity must survive a
+        // stale cache.
+        vm.warp(vm.getBlockTimestamp() + 2 * controller.THREE_DAYS() + 1 days);
+        (preview,,) = multiverse.getMintPricing(GENESIS_UID);
+        assertEq(_chargedFee(), preview);
+
+        // Idle past 20 windows: the cache roll switches to the full recompute branch.
+        vm.warp(vm.getBlockTimestamp() + 21 * controller.THREE_DAYS() + 36 hours);
+        (preview,,) = multiverse.getMintPricing(GENESIS_UID);
+        assertEq(_chargedFee(), preview);
     }
 
     function test_QueryFee_FeeIncreasesMonotonicallyWithVolume() public {
@@ -78,11 +99,11 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
     function test_QueryFee_IdleMidWindowDipsBelowBase() public {
         // Half the genesis window with zero real volume: recent decays below the bootstrap average
         // and the steep down-branch prices below base.
-        _warpToWindow(0, multiverse.THREE_DAYS() / 2);
+        _warpToWindow(0, controller.THREE_DAYS() / 2);
 
         uint256 charged = _chargedFee();
 
-        assertEq(charged, QueryFeeMirror.expectedFee(multiverse, DEFAULT_FEE, 0, multiverse.SCALE() / 2, 0, 0, 0, 0));
+        assertEq(charged, QueryFeeMirror.expectedFee(controller, DEFAULT_FEE, 0, controller.SCALE() / 2, 0, 0, 0, 0));
         // Hand-derived anchor: recent = floor(0.5 * 3) = 1, sixty = 57 + floor(0.5 * 3) = 58,
         // ratio = 20/58, modifier = 1e36 / (1e18 + 100 * (1e18 - 20e18/58)^6 / 1e18^5), every
         // intermediate floored -> fee = 112243280195776293 wei.
@@ -104,10 +125,10 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
         _warpToWindow(1, 0);
         uint256 charged = _chargedFee();
 
-        assertEq(charged, QueryFeeMirror.expectedFee(multiverse, DEFAULT_FEE, 1, 0, 0, 3, 3, 0));
+        assertEq(charged, QueryFeeMirror.expectedFee(controller, DEFAULT_FEE, 1, 0, 0, 3, 3, 0));
         assertEq(charged, DEFAULT_FEE);
 
-        (uint128 sixtyDayVolume, uint128 lastWindowId) = multiverse.universeStatistics(GENESIS_UID);
+        (,,, uint32 lastWindowId, uint40 sixtyDayVolume) = controller.feeStates(GENESIS_UID);
         assertEq(sixtyDayVolume, 3);
         assertEq(lastWindowId, 1);
     }
@@ -123,10 +144,10 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
         _warpToWindow(3, 0);
         uint256 charged = _chargedFee();
 
-        assertEq(charged, QueryFeeMirror.expectedFee(multiverse, DEFAULT_FEE, 3, 0, 0, 0, 2, 0));
-        assertEq(charged, DEFAULT_FEE * QueryFeeMirror.floorModifier(multiverse) / multiverse.SCALE());
+        assertEq(charged, QueryFeeMirror.expectedFee(controller, DEFAULT_FEE, 3, 0, 0, 0, 2, 0));
+        assertEq(charged, DEFAULT_FEE * QueryFeeMirror.floorModifier(controller) / controller.SCALE());
 
-        (uint128 sixtyDayVolume, uint128 lastWindowId) = multiverse.universeStatistics(GENESIS_UID);
+        (,,, uint32 lastWindowId, uint40 sixtyDayVolume) = controller.feeStates(GENESIS_UID);
         assertEq(sixtyDayVolume, 2);
         assertEq(lastWindowId, 3);
     }
@@ -140,7 +161,7 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
         _warpToWindow(25, 0);
         assertEq(_chargedFee(), DEFAULT_FEE);
 
-        (uint128 sixtyDayVolume, uint128 lastWindowId) = multiverse.universeStatistics(GENESIS_UID);
+        (,,, uint32 lastWindowId, uint40 sixtyDayVolume) = controller.feeStates(GENESIS_UID);
         assertEq(sixtyDayVolume, 0);
         assertEq(lastWindowId, 25);
     }
@@ -156,10 +177,10 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
 
         uint256 charged = _chargedFee();
 
-        assertEq(charged, QueryFeeMirror.expectedFee(multiverse, DEFAULT_FEE, 5, 0, 0, 0, 0, 0));
-        assertEq(charged, DEFAULT_FEE * QueryFeeMirror.floorModifier(multiverse) / multiverse.SCALE());
+        assertEq(charged, QueryFeeMirror.expectedFee(controller, DEFAULT_FEE, 5, 0, 0, 0, 0, 0));
+        assertEq(charged, DEFAULT_FEE * QueryFeeMirror.floorModifier(controller) / controller.SCALE());
 
-        (uint128 sixtyDayVolume, uint128 lastWindowId) = multiverse.universeStatistics(GENESIS_UID);
+        (,,, uint32 lastWindowId, uint40 sixtyDayVolume) = controller.feeStates(GENESIS_UID);
         assertEq(sixtyDayVolume, 0);
         assertEq(lastWindowId, 5);
     }
@@ -178,16 +199,16 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
         _chargedFee();
         _chargedFee();
 
-        _warpToWindow(20, multiverse.THREE_DAYS() / 2);
+        _warpToWindow(20, controller.THREE_DAYS() / 2);
         uint256 charged = _chargedFee();
 
-        assertEq(charged, QueryFeeMirror.expectedFee(multiverse, DEFAULT_FEE, 20, multiverse.SCALE() / 2, 0, 3, 5, 2));
+        assertEq(charged, QueryFeeMirror.expectedFee(controller, DEFAULT_FEE, 20, controller.SCALE() / 2, 0, 3, 5, 2));
         // Hand-derived anchor: recent = floor(0.5 * 3) = 1, sixty = 5 - floor(0.5 * 2) = 4,
         // ratio = 20 * 1 / 4 = 5.0 -> modifier = 0.8 + 5.0 / 5 = 1.8 -> fee = 1.8 REP.
         assertEq(charged, 1.8 ether);
         assertGt(charged, DEFAULT_FEE);
 
-        (uint128 sixtyDayVolume, uint128 lastWindowId) = multiverse.universeStatistics(GENESIS_UID);
+        (,,, uint32 lastWindowId, uint40 sixtyDayVolume) = controller.feeStates(GENESIS_UID);
         assertEq(sixtyDayVolume, 5);
         assertEq(lastWindowId, 20);
     }
@@ -205,9 +226,9 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
         _warpToWindow(4, 0);
         uint256 charged = _chargedFee();
 
-        assertEq(charged, QueryFeeMirror.expectedFee(multiverse, DEFAULT_FEE, 4, 0, 0, 1, 3, 0));
+        assertEq(charged, QueryFeeMirror.expectedFee(controller, DEFAULT_FEE, 4, 0, 0, 1, 3, 0));
 
-        (uint128 sixtyDayVolume, uint128 lastWindowId) = multiverse.universeStatistics(GENESIS_UID);
+        (,,, uint32 lastWindowId, uint40 sixtyDayVolume) = controller.feeStates(GENESIS_UID);
         assertEq(sixtyDayVolume, 3);
         assertEq(lastWindowId, 4);
     }
@@ -221,14 +242,14 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
         _chargedFee();
         _chargedFee();
 
-        _warpToWindow(1, multiverse.THREE_DAYS() / 4);
+        _warpToWindow(1, controller.THREE_DAYS() / 4);
         uint256 earlyProbe = _chargedFee();
-        assertEq(earlyProbe, QueryFeeMirror.expectedFee(multiverse, DEFAULT_FEE, 1, multiverse.SCALE() / 4, 0, 4, 4, 0));
+        assertEq(earlyProbe, QueryFeeMirror.expectedFee(controller, DEFAULT_FEE, 1, controller.SCALE() / 4, 0, 4, 4, 0));
 
-        _warpToWindow(1, 3 * multiverse.THREE_DAYS() / 4);
+        _warpToWindow(1, 3 * controller.THREE_DAYS() / 4);
         uint256 lateProbe = _chargedFee();
         assertEq(
-            lateProbe, QueryFeeMirror.expectedFee(multiverse, DEFAULT_FEE, 1, 3 * multiverse.SCALE() / 4, 1, 4, 4, 0)
+            lateProbe, QueryFeeMirror.expectedFee(controller, DEFAULT_FEE, 1, 3 * controller.SCALE() / 4, 1, 4, 4, 0)
         );
         // Hand-derived anchor: recent = 1 + floor(0.25 * 4) = 2, sixty = 1 + 4 + 54 + floor(0.25 * 3)
         // = 59, ratio = 40/59 on the down-branch -> fee = 899657120952168936 wei.
@@ -247,7 +268,7 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
         _warpToWindow(20, 0);
         uint256 charged = _chargedFee();
 
-        assertEq(charged, DEFAULT_FEE * QueryFeeMirror.floorModifier(multiverse) / multiverse.SCALE());
+        assertEq(charged, DEFAULT_FEE * QueryFeeMirror.floorModifier(controller) / controller.SCALE());
     }
 
     function test_QueryFee_EmptySixtyBoundary_AfterTheCliff() public {
@@ -263,7 +284,7 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
 
         assertEq(charged, DEFAULT_FEE);
 
-        (uint128 sixtyDayVolume, uint128 lastWindowId) = multiverse.universeStatistics(GENESIS_UID);
+        (,,, uint32 lastWindowId, uint40 sixtyDayVolume) = controller.feeStates(GENESIS_UID);
         assertEq(sixtyDayVolume, 0);
         assertEq(lastWindowId, 21);
     }
@@ -272,7 +293,7 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
         // Steady baseline demand (exactly BOOT_VOLUME queries per window) from genesis through the
         // real regime: the first query of every window prices exactly neutral, including across the
         // bootstrap-to-real handoff at window 20 — real data replaces the bootstrap with no step.
-        uint256 boot = multiverse.BOOT_VOLUME();
+        uint256 boot = controller.BOOT_VOLUME();
 
         for (uint256 w = 0; w <= 20; w++) {
             _warpToWindow(w, 0);
@@ -290,7 +311,7 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
                             FEE VALIDATIONS
     //////////////////////////////////////////////////////////////*/
     function test_QueryFee_RevertsOnZeroFinalFee() public {
-        feeCtl.setFee(0);
+        controller.setBaseFee(GENESIS_UID, 0);
 
         vm.prank(user);
         vm.expectRevert(Multiverse.ZeroFee.selector);
@@ -306,7 +327,7 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
         // supply/20) the cap is 25e18; the base is set to double that so the clamp is observable,
         // not a no-op.
         uint256 cap = _queryFeeCapWrep();
-        feeCtl.setFee(2 * cap);
+        controller.setBaseFee(GENESIS_UID, 2 * cap);
 
         uint256 chargedFee = _chargedFee();
 
@@ -319,7 +340,7 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
         // The cap's lower boundary: a base one wei below the cap (genesis-neutral modifier is exactly
         // 1.0) is charged unchanged — the cap never touches legal fees.
         uint256 cap = _queryFeeCapWrep();
-        feeCtl.setFee(cap - 1);
+        controller.setBaseFee(GENESIS_UID, cap - 1);
 
         uint256 chargedFee = _chargedFee();
 
@@ -335,10 +356,10 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
         // exactly the cap.
         uint256 cap = _queryFeeCapWrep();
         uint256 base = cap / 2;
-        feeCtl.setFee(base);
+        controller.setBaseFee(GENESIS_UID, base);
 
         uint256 volume = 0;
-        while (QueryFeeMirror.expectedFee(multiverse, base, 0, 0, volume, 0, 0, 0) < cap) {
+        while (QueryFeeMirror.expectedFee(controller, base, 0, 0, volume, 0, 0, 0) < cap) {
             _chargedFee();
             volume++;
         }
@@ -352,13 +373,13 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
         // above neutral, matching the mirror with currentVol = 1. If the capped query were not
         // counted, the second charge would be exactly DEFAULT_FEE.
         uint256 cap = _queryFeeCapWrep();
-        feeCtl.setFee(2 * cap);
+        controller.setBaseFee(GENESIS_UID, 2 * cap);
         assertEq(_chargedFee(), cap);
 
-        feeCtl.setFee(DEFAULT_FEE);
+        controller.setBaseFee(GENESIS_UID, DEFAULT_FEE);
         uint256 chargedFee = _chargedFee();
 
-        assertEq(chargedFee, QueryFeeMirror.expectedFee(multiverse, DEFAULT_FEE, 0, 0, 1, 0, 0, 0));
+        assertEq(chargedFee, QueryFeeMirror.expectedFee(controller, DEFAULT_FEE, 0, 0, 1, 0, 0, 0));
         assertGt(chargedFee, DEFAULT_FEE);
     }
 
@@ -369,7 +390,7 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
         // at its cap opens a ladder well below the fork level. Lives here to keep the cap tests
         // self-contained.
         uint256 feeCap = _queryFeeCapWrep();
-        feeCtl.setFee(2 * feeCap);
+        controller.setBaseFee(GENESIS_UID, 2 * feeCap);
         assertEq(_chargedFee(), feeCap);
 
         uint256 firstStakeCap = _capWrep() / multiverse.FIRST_STAKE_CAP_DIVISOR();
@@ -383,13 +404,6 @@ contract MultiverseQueryFeeTest is QueryFeeTestHelpers {
 
         assertEq(_resolution(0).stakeCount, 1);
         assertEq(multiverse.getUserStake(GENESIS_UID, 0, user, OUTCOME_A), firstStakeCap);
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                          CONTROLLER COUPLING
-    //////////////////////////////////////////////////////////////*/
-    function test_QueryFee_BootProfitDerivedFromControllerInitialFee() public view {
-        assertEq(multiverse.BOOT_PROFIT(), 2 * feeCtl.INITIAL_BASE_FEE());
     }
 }
 
@@ -419,7 +433,7 @@ contract MultiverseQueryFeeStressTest is QueryFeeTestHelpers {
     function test_QueryFee_Stress_OneWeiBaseAtNeutralCharges1Wei() public {
         // 1 wei base at the genesis-neutral point: modifier 1.0, fee = 1 wei. Passes ZeroFee and is
         // reportable (the first stake is derived from the 1 wei fee).
-        feeCtl.setFee(1);
+        controller.setBaseFee(GENESIS_UID, 1);
 
         assertEq(_chargedFee(), 1);
     }
@@ -428,7 +442,7 @@ contract MultiverseQueryFeeStressTest is QueryFeeTestHelpers {
         // Deepest down-curve point (recent = 0): a 1 wei base rounds the final fee to zero, so query
         // creation is blocked by ZeroFee while the universe idles — tiny bases DoS query creation
         // instead of minting free queries. This is the no-floor limit.
-        feeCtl.setFee(1);
+        controller.setBaseFee(GENESIS_UID, 1);
         _warpToWindow(1, 0); // vol[0] = 0 -> recent tail 0 -> ratio 0
 
         vm.prank(user);
@@ -441,17 +455,17 @@ contract MultiverseQueryFeeStressTest is QueryFeeTestHelpers {
         // modifier itself: bases below it hit ZeroFee, the boundary base charges exactly 1 wei.
         _warpToWindow(1, 0);
 
-        uint256 scale = multiverse.SCALE();
+        uint256 scale = controller.SCALE();
         // ceil(SCALE / floorModifier)
-        uint256 floorModifier = QueryFeeMirror.floorModifier(multiverse);
+        uint256 floorModifier = QueryFeeMirror.floorModifier(controller);
         uint256 minBase = (scale + floorModifier - 1) / floorModifier;
 
-        feeCtl.setFee(minBase - 1);
+        controller.setBaseFee(GENESIS_UID, minBase - 1);
         vm.prank(user);
         vm.expectRevert(Multiverse.ZeroFee.selector);
         multiverse.createQuery(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
 
-        feeCtl.setFee(minBase);
+        controller.setBaseFee(GENESIS_UID, minBase);
         assertEq(_chargedFee(), 1);
     }
 
@@ -462,10 +476,10 @@ contract MultiverseQueryFeeStressTest is QueryFeeTestHelpers {
         // it. High demand throttles the price at 1% of supply instead of denying service.
         uint256 cap = _queryFeeCapWrep();
         uint256 base = cap / 2;
-        feeCtl.setFee(base);
+        controller.setBaseFee(GENESIS_UID, base);
 
         uint256 volume = 0;
-        while (QueryFeeMirror.expectedFee(multiverse, base, 0, 0, volume, 0, 0, 0) < cap) {
+        while (QueryFeeMirror.expectedFee(controller, base, 0, 0, volume, 0, 0, 0) < cap) {
             _chargedFee();
             volume++;
         }
@@ -481,29 +495,16 @@ contract MultiverseQueryFeeStressTest is QueryFeeTestHelpers {
         _warpToWindow(1, 0);
 
         uint256 charged = _chargedFee();
-        assertEq(charged, DEFAULT_FEE * QueryFeeMirror.floorModifier(multiverse) / multiverse.SCALE());
+        assertEq(charged, DEFAULT_FEE * QueryFeeMirror.floorModifier(controller) / controller.SCALE());
         // Hand-derived anchor: ratio 0 -> modifier = 1e36 / (101e18) = 9900990099009900 (floored),
         // fee = 1e18 * 9900990099009900 / 1e18 = 9900990099009900 wei (~base / 101).
         assertEq(charged, 9_900_990_099_009_900);
     }
 }
 
-/// @notice Integration suite for updateBaseFee with the real QueryFeeController wired in.
-/// @dev Uses the deploy fixture's controller hooks: `_deployFeeController` returns the production
-///      controller (deployed before the Multiverse) and `_afterProtocolDeploy` wires setMultiverse.
-///      The monthly hill-climb is then driven through the Multiverse push path.
+/// @notice Integration suite for updateBaseFee through the Multiverse: the Active gate here, the monthly
+///         hill-climb in the controller, and the resolve -> recordProfit -> updateBaseFee pipeline.
 contract MultiverseUpdateBaseFeeTest is QueryFeeTestHelpers {
-    QueryFeeController internal controller;
-
-    function _deployFeeController() internal override returns (IQueryFeeController) {
-        controller = new QueryFeeController(GENESIS_UID);
-        return IQueryFeeController(address(controller));
-    }
-
-    function _afterProtocolDeploy() internal override {
-        controller.setMultiverse(address(multiverse));
-    }
-
     function setUp() public override {
         super.setUp();
 
@@ -567,7 +568,7 @@ contract MultiverseUpdateBaseFeeTest is QueryFeeTestHelpers {
 
         uint256 charged = _chargedFee();
 
-        assertEq(charged, newBase * QueryFeeMirror.floorModifier(multiverse) / multiverse.SCALE());
+        assertEq(charged, newBase * QueryFeeMirror.floorModifier(controller) / controller.SCALE());
 
         (,, uint256 storedFee,,) = multiverse.queries(0);
         assertEq(storedFee, charged);
@@ -579,7 +580,7 @@ contract MultiverseUpdateBaseFeeTest is QueryFeeTestHelpers {
     function test_UpdateBaseFee_ResolvedProfitReachesTheController() public {
         // A query left unreported and resolved right after the reporting deadline pays the resolver
         // ~nothing, so ~the full fee lands as profit in the resolution window. What this pins is the
-        // full pipeline: resolve records profit, _getProfits feeds it, the controller moves and
+        // full pipeline: resolve records the profit in the controller, its hill-climb reads it, moves and
         // re-arms its clock.
         uint256 initial = controller.getQueryFee(GENESIS_UID);
 
@@ -589,12 +590,12 @@ contract MultiverseUpdateBaseFeeTest is QueryFeeTestHelpers {
         vm.warp(START_TIME + multiverse.REPORTING_PERIOD() + 1);
         multiverse.resolve(GENESIS_UID, 0);
 
-        (,, uint48 timeBefore) = controller.feeStates(GENESIS_UID);
+        (,, uint48 timeBefore,,) = controller.feeStates(GENESIS_UID);
 
         vm.warp(START_TIME + controller.THIRTY_DAYS() + 1);
         multiverse.updateBaseFee(GENESIS_UID);
 
-        (,, uint48 timeAfter) = controller.feeStates(GENESIS_UID);
+        (,, uint48 timeAfter,,) = controller.feeStates(GENESIS_UID);
         assertGt(timeAfter, timeBefore);
         assertNotEq(controller.getQueryFee(GENESIS_UID), initial);
     }

@@ -11,13 +11,27 @@ interface IQueryTokenizer {
     /// @notice Mints `amount` whole Query Tokens for the caller, depositing the mint price per token —
     ///         the full demand-inclusive query fee plus a fixed 10% premium, capped at half the fork
     ///         threshold (all in wREP) — times `amount` in Lituus REP into the universe's pool.
-    /// @dev The caller must approve this contract for the universe's Lituus REP. The universe's
-    ///      QueryToken is deployed lazily on the first mint. Reverts with ZeroAmount on a zero amount,
-    ///      with ZeroCost if the total cost rounds to zero (free tokens would dilute the pool average),
+    /// @dev The caller must approve this contract for the universe's Lituus REP, or hold a Permit2 allowance
+    ///      for it (see PermitSupport). The universe's QueryToken is deployed lazily on the first mint. Reverts with
+    /// ZeroAmount on a zero amount, with ZeroCost if the total cost rounds to zero (free tokens would dilute the pool
+    /// average),
     ///      and pricing reverts for a nonexistent or non-current universe.
     /// @param universeId The universe to mint tokens for.
     /// @param amount Number of whole query rights to mint.
     function mint(uint248 universeId, uint256 amount) external;
+
+    /// @notice Applies the caller's ERC-2612 permit on a universe's wREP in favor of this contract, so minting
+    ///         can be approved and paid in one multicall: [permitRep, mint].
+    /// @dev A permit somebody else already submitted goes through as long as the allowance it set is in place;
+    ///      anything that leaves the allowance short of `value` reverts with PermitNotEffective. Reverts for a
+    ///      universe the Multiverse does not know.
+    /// @param universeId The universe whose wREP the permit is for.
+    /// @param value The allowance the permit grants.
+    /// @param deadline The permit's deadline.
+    /// @param v The signature's v.
+    /// @param r The signature's r.
+    /// @param s The signature's s.
+    function permitRep(uint248 universeId, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) external;
 
     /// @notice Redeems one whole Query Token: destroys it and creates a normal Query in the oracle on
     ///         the caller's behalf, paying the pool's per-token average as the fee.

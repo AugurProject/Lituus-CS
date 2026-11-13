@@ -8,7 +8,9 @@ import { IMultiverse } from "./interfaces/IMultiverse.sol";
 import { IQueryToken } from "./interfaces/IQueryToken.sol";
 import { IQueryTokenizer } from "./interfaces/IQueryTokenizer.sol";
 import { ILituusRep } from "./interfaces/ILituusRep.sol";
-import { QueryToken } from "./QueryToken.sol";
+import { IPermit2 } from "./interfaces/IPermit2.sol";
+import { ITokenDeployer } from "./interfaces/ITokenDeployer.sol";
+import { PermitSupport } from "./PermitSupport.sol";
 
 /**
  * @title QueryTokenizer
@@ -33,8 +35,11 @@ import { QueryToken } from "./QueryToken.sol";
  *      their share of the pool migrates through the Multiverse as a counted vote for that child, and the
  *      same number of the child's tokens is minted to the holder. Tokens not migrated stay in the parent
  *      with their share of the pool, worthless.
+ *
+ *      Minting takes the wREP on a plain allowance or through Permit2, and `permitRep` applies an ERC-2612
+ *      permit on the wREP, so approving and minting fit in one `multicall` (see PermitSupport).
  */
-contract QueryTokenizer is ReentrancyGuard, IQueryTokenizer {
+contract QueryTokenizer is ReentrancyGuard, PermitSupport, IQueryTokenizer {
     using SafeERC20 for ILituusRep;
 
     /* ========================================== CONSTANTS/IMMUTABLES =========================================== */
@@ -44,12 +49,12 @@ contract QueryTokenizer is ReentrancyGuard, IQueryTokenizer {
     uint256 public constant PREMIUM_NUMERATOR = 11;
     uint256 public constant PREMIUM_DENOMINATOR = 10;
 
-    // The deployer, allowed to set the Multiverse address once after it is deployed.
-    address private immutable DEPLOYER;
-
-    // The Multiverse this tokenizer creates queries in. Set once by the deployer after the Multiverse is
-    // deployed.
-    IMultiverse public multiverse;
+    // Deploys the per-universe QueryTokens with this contract as owner (the same deployer the Multiverse
+    // deploys its wREP vaults through). Kept separate so the token's creation code stays out of this contract.
+    ITokenDeployer public immutable TOKEN_DEPLOYER;
+    // The Multiverse this tokenizer creates queries in. Bound at construction to the address the Multiverse is
+    // about to be deployed to (see Deploy.s.sol).
+    IMultiverse public immutable MULTIVERSE;
 
     /* ================================================ VARIABLES ================================================ */
     // The per-universe QueryToken ERC20, deployed lazily on first mint into a universe.
@@ -62,7 +67,7 @@ contract QueryTokenizer is ReentrancyGuard, IQueryTokenizer {
     error ZeroCost();
     error QueryTokenNotExisting();
     error NoWholeTokens();
-    error CannotSet();
+    error ZeroAddress();
 
     /* ================================================= EVENTS ================================================== */
     event QueryTokenDeployed(uint248 indexed universeId, address token);
@@ -76,19 +81,14 @@ contract QueryTokenizer is ReentrancyGuard, IQueryTokenizer {
         uint256 migratedRep
     );
 
-    /* =========================================== CONSTRUCTOR/SETTER ============================================ */
-    constructor() {
-        DEPLOYER = msg.sender;
-    }
-
-    /**
-     * @notice Sets the Multiverse. Callable once, by the deployer, after the Multiverse is deployed.
-     * @dev Deploy order: this tokenizer first, then the Multiverse with this address, then call this.
-     * @param multiverse_ The Multiverse contract.
-     */
-    function setMultiverse(IMultiverse multiverse_) external {
-        if (msg.sender != DEPLOYER || address(multiverse) != address(0)) revert CannotSet();
-        multiverse = multiverse_;
+    /* =============================================== CONSTRUCTOR =============================================== */
+    /// @param permit2_ Uniswap's Permit2 (see PermitSupport).
+    /// @param tokenDeployer_ The deployer of the QueryTokens.
+    /// @param multiverse_ The Multiverse this tokenizer serves, at the address it is about to be deployed to.
+    constructor(IPermit2 permit2_, ITokenDeployer tokenDeployer_, IMultiverse multiverse_) PermitSupport(permit2_) {
+        if (address(tokenDeployer_) == address(0) || address(multiverse_) == address(0)) revert ZeroAddress();
+        TOKEN_DEPLOYER = tokenDeployer_;
+        MULTIVERSE = multiverse_;
     }
 
     /* ============================================== PRICE (VIEW) =============================================== */
@@ -100,14 +100,14 @@ contract QueryTokenizer is ReentrancyGuard, IQueryTokenizer {
      * @return The mint price per whole query, in Lituus REP.
      */
     function mintPrice(uint248 universeId) public view returns (uint256) {
-        (uint256 price,) = _mintPrice(multiverse, universeId);
+        (uint256 price,) = _mintPrice(universeId);
         return price;
     }
 
-    /// @dev `mintPrice` body taking the Multiverse as a parameter to reduce storage reads. Also returns
-    ///      the universe's Lituus REP so `mint` prices and pays with a single Multiverse call.
-    function _mintPrice(IMultiverse multiverse_, uint248 universeId) internal view returns (uint256, ILituusRep) {
-        (uint256 uncappedFee, uint256 cap, ILituusRep repToken) = multiverse_.getMintPricing(universeId);
+    /// @dev `mintPrice` body, also returning the universe's Lituus REP so `mint` prices and pays with a single
+    ///      Multiverse call.
+    function _mintPrice(uint248 universeId) internal view returns (uint256, ILituusRep) {
+        (uint256 uncappedFee, uint256 cap, ILituusRep repToken) = MULTIVERSE.getMintPricing(universeId);
         uint256 price = uncappedFee * PREMIUM_NUMERATOR / PREMIUM_DENOMINATOR;
         return (price > cap ? cap : price, repToken);
     }
@@ -116,15 +116,14 @@ contract QueryTokenizer is ReentrancyGuard, IQueryTokenizer {
     /// @inheritdoc IQueryTokenizer
     function mint(uint248 universeId, uint256 amount) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
-        IMultiverse multiverse_ = multiverse;
 
         // Price first: _mintPrice reverts for a nonexistent or non-current universe, so no QueryToken
         // is ever deployed for an invalid universe. A zero cost is rejected — free tokens would dilute
         // the pool average for every existing holder.
-        (uint256 price, ILituusRep repToken) = _mintPrice(multiverse_, universeId);
+        (uint256 price, ILituusRep repToken) = _mintPrice(universeId);
         uint256 cost = price * amount;
         if (cost == 0) revert ZeroCost();
-        repToken.safeTransferFrom(msg.sender, address(this), cost);
+        _pull(repToken, cost);
         pooledRep[universeId] += cost;
 
         IQueryToken queryToken = _getOrDeployToken(universeId);
@@ -149,14 +148,18 @@ contract QueryTokenizer is ReentrancyGuard, IQueryTokenizer {
         pooledRep[universeId] = pooledRepTokens - price;
 
         // Push the REP to the oracle, then create the query at exactly `price`, attributed to the redeemer.
-        IMultiverse multiverse_ = multiverse;
-        multiverse_.repTokenOf(universeId).safeTransfer(address(multiverse_), price);
-        multiverse_.createQueryFromTokenizer(universeId, question, numberOfOutcomes, price, msg.sender);
+        MULTIVERSE.repTokenOf(universeId).safeTransfer(address(MULTIVERSE), price);
+        MULTIVERSE.createQueryFromTokenizer(universeId, question, numberOfOutcomes, price, msg.sender);
 
         emit Redeemed(msg.sender, universeId, price);
     }
 
     /* ============================================ FORK MIGRATION =============================================== */
+    /// @inheritdoc IQueryTokenizer
+    function permitRep(uint248 universeId, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) external {
+        _permit(MULTIVERSE.repTokenOf(universeId), value, deadline, v, r, s);
+    }
+
     /// @inheritdoc IQueryTokenizer
     function migrate(uint248 parentUniverseId, uint256 childOutcome, uint256 amount) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
@@ -177,7 +180,7 @@ contract QueryTokenizer is ReentrancyGuard, IQueryTokenizer {
         // The Multiverse burns this contract's parent wREP (owner lane, no approval), routes it through
         // Zoltar and hands back child wREP, which backs the child tokens from here on. The parent's state,
         // its window and the child's existence are its checks.
-        (uint248 childUniverseId, uint256 childShares) = multiverse.migrate(parentUniverseId, childOutcome, migratedRep);
+        (uint248 childUniverseId, uint256 childShares) = MULTIVERSE.migrate(parentUniverseId, childOutcome, migratedRep);
         pooledRep[childUniverseId] += childShares;
 
         IQueryToken childToken = _getOrDeployToken(childUniverseId);
@@ -189,8 +192,8 @@ contract QueryTokenizer is ReentrancyGuard, IQueryTokenizer {
     function _getOrDeployToken(uint248 universeId) internal returns (IQueryToken queryToken) {
         queryToken = token[universeId];
         if (address(queryToken) == address(0)) {
-            // TODO: token naming (same pattern as Lituus REP)
-            queryToken = IQueryToken(address(new QueryToken(address(this), "Lituus Query Token", "QT")));
+            // Named after the universe's Zoltar REP token, like its wREP vault.
+            queryToken = TOKEN_DEPLOYER.deployQueryToken(address(MULTIVERSE.ZOLTAR().getRepToken(universeId)));
             token[universeId] = queryToken;
             emit QueryTokenDeployed(universeId, address(queryToken));
         }

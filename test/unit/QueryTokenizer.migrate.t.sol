@@ -73,7 +73,7 @@ contract QueryTokenizerMigrateTest is QueryTokenizerFixtures {
 
     function test_Migrate_DeploysChildTokenOnFirstArrival() public {
         _mintAndFork();
-        address predictedToken = vm.computeCreateAddress(address(tokenizer), vm.getNonce(address(tokenizer)));
+        address predictedToken = vm.computeCreateAddress(address(tokenDeployer), vm.getNonce(address(tokenDeployer)));
         uint256 migratedRep = tokenizer.pooledRep(GENESIS_UID) / MINTED;
 
         // Emission order: the Multiverse's wallet migration, then the child token's deployment, then the

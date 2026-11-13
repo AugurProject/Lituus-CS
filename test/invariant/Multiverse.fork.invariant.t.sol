@@ -6,6 +6,7 @@ import { QueryTokenizer } from "src/QueryTokenizer.sol";
 import { IMultiverse } from "src/interfaces/IMultiverse.sol";
 import { IQueryFeeController } from "src/interfaces/IQueryFeeController.sol";
 import { IQueryToken } from "src/interfaces/IQueryToken.sol";
+import { ITokenDeployer } from "src/interfaces/ITokenDeployer.sol";
 import { MultiverseDeployFixture } from "../unit/Multiverse.fixtures.sol";
 import { MultiverseForkHandler } from "./handlers/MultiverseForkHandler.sol";
 
@@ -50,16 +51,33 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
         return ACTOR_COUNT * ACTOR_REP_BALANCE + 200 ether;
     }
 
-    /// @dev Deploys the real tokenizer first, then the Multiverse pointing at it (Deploy.s.sol order).
-    function _deployMultiverse(IQueryFeeController controller) internal override returns (Multiverse) {
-        tokenizer = new QueryTokenizer();
-        return new Multiverse(
-            zoltar, GENESIS_UID, controller, address(tokenizer), MIGRATION_DURATION, REPORTING_PERIOD, APPEAL_PERIOD
-        );
+    /// @dev The tokenizer is one more contract before the Multiverse.
+    function _deploysBeforeMultiverse() internal pure override returns (uint256) {
+        return 1;
     }
 
-    function _afterProtocolDeploy() internal override {
-        tokenizer.setMultiverse(IMultiverse(address(multiverse)));
+    /// @dev Deploys the real tokenizer first, then the Multiverse pointing at it (Deploy.s.sol order).
+    function _deployMultiverse(IQueryFeeController feeController) internal override returns (Multiverse) {
+        // Script order: the tokenizer takes the token deployer's address, which is created right after it, and
+        // the Multiverse's, which comes right after that.
+        tokenizer = new QueryTokenizer(
+            permit2,
+            ITokenDeployer(vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1)),
+            IMultiverse(predictedMultiverse)
+        );
+        tokenDeployer = _newTokenDeployer();
+        assertEq(address(tokenizer.TOKEN_DEPLOYER()), address(tokenDeployer));
+        return new Multiverse(
+            zoltar,
+            GENESIS_UID,
+            feeController,
+            address(tokenizer),
+            tokenDeployer,
+            permit2,
+            MIGRATION_DURATION,
+            REPORTING_PERIOD,
+            APPEAL_PERIOD
+        );
     }
 
     function setUp() public override {
