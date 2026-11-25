@@ -2,6 +2,7 @@
 pragma solidity ^0.8.35;
 
 import { ILituusRep } from "./ILituusRep.sol";
+import { IQueryTokenizer } from "./IQueryTokenizer.sol";
 import { IZoltar } from "./IZoltar.sol";
 
 /// @notice The subset of the Multiverse the QueryTokenizer (and deploy script) depend on.
@@ -42,5 +43,5 @@ interface IMultiverse {
     function ZOLTAR() external view returns (IZoltar);
 
     /// @notice The QueryTokenizer of this Multiverse (the only caller the token deployer makes query tokens for).
-    function QUERY_TOKENIZER() external view returns (address);
+    function QUERY_TOKENIZER() external view returns (IQueryTokenizer);
 }

@@ -25,9 +25,11 @@ import { PermitSupport } from "./PermitSupport.sol";
  *
  *      The pooled-average design has one key property: redeeming pays `pooledRep / wholeTokensTotalSupply`,
  *      and removing exactly the average leaves the average unchanged — so only mints (at new fees) move
- *      the price. The redemption fee is recorded whole, uncapped: the pool average can exceed half the
- *      fork threshold (the average never decays while the threshold can decline), and the oracle handles
- *      that separately.
+ *      the price, and a fork's donation: when a universe forks with more tips than its children may carry,
+ *      the Multiverse donates the excess to the universe's pool (see donateRep), raising the average for the
+ *      tokens about to migrate. The redemption fee is recorded whole, uncapped: the pool average can exceed
+ *      half the fork threshold (the average never decays while the threshold can decline), and the oracle
+ *      handles that separately.
  *
  *      Query tokens are universe-specific and are NEVER forwarded to the heir: once a universe forks,
  *      minting and redeeming freeze there (the oracle rejects non-current universes) and migration is the
@@ -68,6 +70,7 @@ contract QueryTokenizer is ReentrancyGuard, PermitSupport, IQueryTokenizer {
     error QueryTokenNotExisting();
     error NoWholeTokens();
     error ZeroAddress();
+    error NotMultiverse();
 
     /* ================================================= EVENTS ================================================== */
     event QueryTokenDeployed(uint248 indexed universeId, address token);
@@ -80,6 +83,8 @@ contract QueryTokenizer is ReentrancyGuard, PermitSupport, IQueryTokenizer {
         uint256 amount,
         uint256 migratedRep
     );
+    // Lituus REP the Multiverse added to a universe's pool without minting tokens: a fork's excess tips.
+    event PoolDonated(uint248 indexed universeId, uint256 amount);
 
     /* =============================================== CONSTRUCTOR =============================================== */
     /// @param permit2_ Uniswap's Permit2 (see PermitSupport).
@@ -133,10 +138,7 @@ contract QueryTokenizer is ReentrancyGuard, PermitSupport, IQueryTokenizer {
 
     /// @inheritdoc IQueryTokenizer
     function redeem(uint248 universeId, string calldata question, uint8 numberOfOutcomes) external nonReentrant {
-        IQueryToken queryToken = token[universeId];
-        if (address(queryToken) == address(0)) revert QueryTokenNotExisting();
-        uint256 wholeTokensTotalSupply = queryToken.totalSupply() / ONE_QUERY;
-        if (wholeTokensTotalSupply == 0) revert NoWholeTokens();
+        (IQueryToken queryToken, uint256 wholeTokensTotalSupply) = _outstandingWholeTokens(universeId);
 
         // Price of this exact token = the pool average per query.
         uint256 pooledRepTokens = pooledRep[universeId];
@@ -163,10 +165,7 @@ contract QueryTokenizer is ReentrancyGuard, PermitSupport, IQueryTokenizer {
     /// @inheritdoc IQueryTokenizer
     function migrate(uint248 parentUniverseId, uint256 childOutcome, uint256 amount) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
-        IQueryToken parentToken = token[parentUniverseId];
-        if (address(parentToken) == address(0)) revert QueryTokenNotExisting();
-        uint256 wholeTokensTotalSupply = parentToken.totalSupply() / ONE_QUERY;
-        if (wholeTokensTotalSupply == 0) revert NoWholeTokens();
+        (IQueryToken parentToken, uint256 wholeTokensTotalSupply) = _outstandingWholeTokens(parentUniverseId);
 
         // The tokens take their share of the pool, rounded down: the holders who stay never lose, and the
         // last tokens out take the whole pool with them (nothing sweeps a forked universe's pool later).
@@ -188,7 +187,46 @@ contract QueryTokenizer is ReentrancyGuard, PermitSupport, IQueryTokenizer {
         emit QueryTokensMigrated(msg.sender, parentUniverseId, childUniverseId, amount, migratedRep);
     }
 
+    /// @inheritdoc IQueryTokenizer
+    function donateRep(uint248 universeId, uint256 amount) external returns (bool accepted) {
+        // The credit below runs ahead of the REP, so only the caller trusted to send it may ask for one.
+        if (msg.sender != address(MULTIVERSE)) revert NotMultiverse();
+
+        // Refused without a whole token outstanding: nothing could ever carry the REP out of the pool. Nothing
+        // is booked, and the Multiverse keeps the REP.
+        (, uint256 wholeTokens) = _wholeTokens(universeId);
+        if (wholeTokens == 0) return false;
+
+        // Accepted. The pool is credited before the REP arrives: the Multiverse transfers `amount` as soon as
+        // this returns, in the same transaction (see ForkLib._capCarriedTips). The two cannot come apart:
+        // - nothing runs between the credit and the transfer but the vault's own transfer, which calls no one,
+        //   so nobody can act on a pool that is ahead of the balance;
+        // - if the transfer failed, the whole transaction would revert, and this credit with it.
+        pooledRep[universeId] += amount;
+        emit PoolDonated(universeId, amount);
+        return true;
+    }
+
     /* ================================================ INTERNALS ================================================ */
+    /// @dev The universe's query token and how many whole tokens of it are outstanding. Both are zero for a
+    ///      universe whose token was never deployed.
+    function _wholeTokens(uint248 universeId) internal view returns (IQueryToken queryToken, uint256 wholeTokens) {
+        queryToken = token[universeId];
+        if (address(queryToken) != address(0)) wholeTokens = queryToken.totalSupply() / ONE_QUERY;
+    }
+
+    /// @dev _wholeTokens for the paths that spend a token: reverts if the token was never deployed or no whole
+    ///      token is outstanding.
+    function _outstandingWholeTokens(uint248 universeId)
+        internal
+        view
+        returns (IQueryToken queryToken, uint256 wholeTokens)
+    {
+        (queryToken, wholeTokens) = _wholeTokens(universeId);
+        if (address(queryToken) == address(0)) revert QueryTokenNotExisting();
+        if (wholeTokens == 0) revert NoWholeTokens();
+    }
+
     function _getOrDeployToken(uint248 universeId) internal returns (IQueryToken queryToken) {
         queryToken = token[universeId];
         if (address(queryToken) == address(0)) {

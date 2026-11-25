@@ -504,10 +504,7 @@ contract MultiversePermitTest is MultiverseFixtures, PermitSigning {
     function test_Wrap_ThroughPermit2_ExactSharesAtARateAboveOne() public {
         // A burn moves the rate, so the exact-shares path has to pull the rounded-up underlying the vault
         // itself computes, and nothing more.
-        vm.prank(user);
-        genesisRep.transfer(address(multiverse), 50 ether);
-        vm.prank(address(multiverse));
-        genesisRep.burnShares(50 ether);
+        _burnShares(genesisRep, user, 50 ether);
         uint256 sharesWanted = 10 ether;
         uint256 assetsNeeded = genesisRep.convertToAssetsUp(sharesWanted);
         assertGt(assetsNeeded, sharesWanted);

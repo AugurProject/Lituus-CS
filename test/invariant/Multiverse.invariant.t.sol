@@ -239,8 +239,7 @@ contract MultiverseInvariantTest is MultiverseDeployFixture {
                 unpaidTips += handler.ghostQueryTips(i);
             }
         }
-        (,,,,,,,,,,,,, uint128 totalTips) = multiverse.universes(GENESIS_UID);
-        assertEq(totalTips, unpaidTips);
+        assertEq(_universe(GENESIS_UID).totalTips, unpaidTips);
     }
 
     /// @dev Per-actor conservation: an actor's REP only moves into stakes and tips it placed itself and

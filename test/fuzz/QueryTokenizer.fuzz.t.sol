@@ -152,12 +152,7 @@ contract QueryTokenizerFuzzTest is QueryTokenizerFixtures {
 
         // A burn before the fork moves the parent's rate (the children open at it); zero keeps it at 1.
         uint256 sharesToBurn = bound(burnSeed, 0, 100 ether);
-        if (sharesToBurn > 0) {
-            vm.prank(user);
-            genesisRep.transfer(address(multiverse), sharesToBurn);
-            vm.prank(address(multiverse));
-            genesisRep.burnShares(sharesToBurn);
-        }
+        if (sharesToBurn > 0) _burnShares(genesisRep, user, sharesToBurn);
 
         _forkGenesis();
         multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);

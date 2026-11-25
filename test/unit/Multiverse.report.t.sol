@@ -592,8 +592,7 @@ contract MultiverseReportTest is MultiverseFixtures {
         assertEq(r.totalStaked, 2 * supplyAtCap / 100);
 
         // Two outcomes at the cap means the fork level: the same report forked the universe.
-        (, Multiverse.UniverseState state,,,,,,,,,,,,) = multiverse.universes(GENESIS_UID);
-        assertEq(uint8(state), uint8(Multiverse.UniverseState.Migration));
+        assertEq(uint8(_universeState(GENESIS_UID)), uint8(Multiverse.UniverseState.Migration));
     }
 
     function test_Report_LateOutcomePaysTwiceThePot() public {
@@ -631,8 +630,7 @@ contract MultiverseReportTest is MultiverseFixtures {
         assertEq(multiverse.getOutcomeStakes(GENESIS_UID, queryId, OUTCOME_C).totalOutcomeStaked, cap);
         assertEq(_resolution(queryId).noOfOutcomesAtCap, 2);
         // The universe is forked because two outcomes are at the cap
-        (, Multiverse.UniverseState state,,,,,,,,,,,,) = multiverse.universes(GENESIS_UID);
-        assertEq(uint8(state), uint8(Multiverse.UniverseState.Migration));
+        assertEq(uint8(_universeState(GENESIS_UID)), uint8(Multiverse.UniverseState.Migration));
     }
 
     /*//////////////////////////////////////////////////////////////

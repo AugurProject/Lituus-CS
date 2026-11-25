@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.35;
 
+import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
+
 import { Multiverse } from "src/Multiverse.sol";
 import { LituusRep } from "src/LituusRep.sol";
 import { ILituusRep } from "src/interfaces/ILituusRep.sol";
+import { MultiverseHelpers } from "src/libraries/MultiverseHelpers.sol";
 import { MultiverseFuzzFixtures } from "./Multiverse.fuzz.fixtures.sol";
 
 /// @notice Property-based tests for the forking query's payouts and the settlement of the parent's other
@@ -24,6 +27,8 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
     // leaving the user 200 ether at the high end, enough for the cap on every outcome.
     uint256 internal constant MIN_RATE_BURN = 0.001 ether;
     uint256 internal constant MAX_RATE_BURN = 800 ether;
+    // The same ahead of a fork escalated by two reporters from fresh balances: both still afford the cap.
+    uint256 internal constant MAX_TIP_RATE_BURN = 100 ether;
     // Side queries of the settlement fuzz: with at most three reports on a fee of 0.1 ether or less, a
     // ladder never gets anywhere near the cap.
     uint256 internal constant SIDE_QUERIES = 3;
@@ -115,6 +120,11 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
     ///      against the parent record: parent shares to assets at the parent rate, assets to child shares at
     ///      the child's, which starts at the parent's. Returns the claimed principal in assets, as the
     ///      contract counts it.
+    ///      A known edge: a payout that makes no child share cannot be claimed on its own. That is a single wei
+    ///      at a rate above 1, such as a stake that only filled the last wei to the cap. The child vault's wrap
+    ///      rejects the claim and the stake stays in place (see the unit test
+    ///      test_MigrateStake_AOneWeiTriggerStakeCannotBeClaimedAlone). Its entry in `staked` is cleared, so the
+    ///      caller's totals count only what was claimed.
     function _claimEveryStakeInEveryChild(uint256 queryId, uint256[4][3] memory staked)
         internal
         returns (uint256 principalAssets)
@@ -132,6 +142,14 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
                 uint256 balanceBefore = childRep.balanceOf(reporters[r]);
                 uint256 expected =
                     childRep.convertToShares(genesisRep.convertToAssets(_expectedChildPayout(queryId, amount)));
+                if (expected == 0) {
+                    vm.prank(reporters[r]);
+                    vm.expectRevert(LituusRep.ZeroShares.selector);
+                    multiverse.migrateStake(GENESIS_UID, queryId, outcomes[o], outcomes[o]);
+                    assertEq(multiverse.getUserStake(GENESIS_UID, queryId, reporters[r], outcomes[o]), amount);
+                    staked[r][o] = 0;
+                    continue;
+                }
                 vm.prank(reporters[r]);
                 multiverse.migrateStake(GENESIS_UID, queryId, outcomes[o], outcomes[o]);
                 assertEq(childRep.balanceOf(reporters[r]) - balanceBefore, expected);
@@ -153,7 +171,7 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
         (uint256 queryId, uint256[4][3] memory staked) = _buildRandomForkingLadder(seed);
         (,,, uint96 totalStaked,,,,,,) = multiverse.queryResolutions(GENESIS_UID, queryId);
         uint256 parked = zoltar.getMigrationRepBalance(address(multiverse), GENESIS_UID);
-        (,,,,,,,,,,,, uint128 unmigratedBefore,) = multiverse.universes(GENESIS_UID);
+        uint128 unmigratedBefore = _universe(GENESIS_UID).unmigratedSupply;
         // The pot is carried at face value; what is parked is the pot less Zoltar's burn on the bond.
         assertEq(unmigratedBefore, parked + _forkBurn(forkThreshold));
 
@@ -170,7 +188,8 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
 
         // The stakes left the supply as counted migration at face value; what stays is the forking query's
         // fee. The burn is accounted on the record, not here.
-        (,,,,,,,,,, uint128 totalOut,, uint128 unmigratedAfter,) = multiverse.universes(GENESIS_UID);
+        uint128 totalOut = _universe(GENESIS_UID).totalMigratedOut;
+        uint128 unmigratedAfter = _universe(GENESIS_UID).unmigratedSupply;
         assertEq(totalOut, totalStaked);
         assertEq(unmigratedAfter, unmigratedBefore - totalStaked);
         assertEq(unmigratedAfter, fee);
@@ -178,17 +197,14 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
 
     /// @dev Property: whatever the vault rate, the forking query's two outcomes at the cap hold the fork bond
     /// in shares, the fee on top covers it in REP, the fork fires and leaves no REP behind, and every stake
-    /// is still paid in full in its child from a parked balance that is the pot less Zoltar's burn. The rate
+    /// that makes a child share is still paid in full in its child from a parked balance that is the pot less
+    /// Zoltar's burn (a stake of a single wei makes none and stays unclaimed). The rate
     /// is moved directly (shares burned the way a resolution burns them) rather than through ladders, so any
     /// rate gets covered, not only the ones resolutions happen to produce.
     function testFuzz_Fork_TwoCapsCoverTheBondAtAnyRate(uint256 seed, uint256 fee, uint256 burnSeed) public {
         fee = bound(fee, MIN_LADDER_FEE, MAX_LADDER_FEE);
         feeCtl.setFee(fee);
-        uint256 sharesToBurn = bound(burnSeed, MIN_RATE_BURN, MAX_RATE_BURN);
-        vm.prank(user);
-        genesisRep.transfer(address(multiverse), sharesToBurn);
-        vm.prank(address(multiverse));
-        genesisRep.burnShares(sharesToBurn);
+        _burnShares(genesisRep, user, bound(burnSeed, MIN_RATE_BURN, MAX_RATE_BURN));
         assertGt(genesisRep.rate(), LituusRep(address(genesisRep)).SCALE());
 
         uint256 supply = zoltar.getUniverseTheoreticalSupply(GENESIS_UID);
@@ -206,7 +222,7 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
         assertEq(underlying.balanceOf(address(multiverse)), 0);
         assertEq(genesisRep.balanceOf(address(multiverse)), 0);
         uint256 parked = zoltar.getMigrationRepBalance(address(multiverse), GENESIS_UID);
-        (,,,,,,,,,,,, uint128 unmigratedBefore,) = multiverse.universes(GENESIS_UID);
+        uint128 unmigratedBefore = _universe(GENESIS_UID).unmigratedSupply;
         assertEq(unmigratedBefore, parked + _forkBurn(forkThreshold));
         assertEq(forkBurn, genesisRep.convertToSharesUp(_forkBurn(forkThreshold)));
 
@@ -214,7 +230,8 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
         for (uint256 o = 0; o < outcomes.length; o++) {
             assertLe(zoltar.splitPerChild(address(multiverse), GENESIS_UID, outcomes[o]), parked);
         }
-        (,,,,,,,,,, uint128 totalOut,, uint128 unmigratedAfter,) = multiverse.universes(GENESIS_UID);
+        uint128 totalOut = _universe(GENESIS_UID).totalMigratedOut;
+        uint128 unmigratedAfter = _universe(GENESIS_UID).unmigratedSupply;
         assertEq(totalOut, principalAssets);
         assertEq(unmigratedAfter, unmigratedBefore - principalAssets);
     }
@@ -346,7 +363,7 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
 
         (uint256 forkQueryId, uint256[4][3] memory forkStaked) = _buildRandomForkingLadder(seed);
         uint256 parked = zoltar.getMigrationRepBalance(address(multiverse), GENESIS_UID);
-        (,,,,,,,,,,,, uint128 unmigratedBefore,) = multiverse.universes(GENESIS_UID);
+        uint128 unmigratedBefore = _universe(GENESIS_UID).unmigratedSupply;
         assertEq(unmigratedBefore, parked + _forkBurn(forkThreshold));
 
         uint256 totalVotes = _claimEveryStakeInEveryChild(forkQueryId, forkStaked);
@@ -358,12 +375,12 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
             for (uint256 r = 0; r < reporters.length; r++) {
                 forkVotes += genesisRep.convertToAssets(forkStaked[r][o]);
             }
-            (,,,,,,, uint128 totalIn,,,,,,) = multiverse.universes(_childId(GENESIS_UID, outcomes[o]));
-            assertEq(totalIn, forkVotes + sideVotes[o]);
+            assertEq(_universe(_childId(GENESIS_UID, outcomes[o])).totalMigratedIn, forkVotes + sideVotes[o]);
             totalVotes += sideVotes[o];
             assertLe(zoltar.splitPerChild(address(multiverse), GENESIS_UID, outcomes[o]), parked);
         }
-        (,,,,,,,,,, uint128 totalOut,, uint128 unmigratedAfter,) = multiverse.universes(GENESIS_UID);
+        uint128 totalOut = _universe(GENESIS_UID).totalMigratedOut;
+        uint128 unmigratedAfter = _universe(GENESIS_UID).unmigratedSupply;
         assertEq(totalOut, totalVotes);
         assertEq(unmigratedAfter, unmigratedBefore - totalVotes);
 
@@ -380,5 +397,193 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
         }
         assertGe(unmigratedAfter, openFees);
         assertLe(unmigratedAfter, openFees + settlements);
+    }
+
+    /// @dev Property: over two nested forks, each capped or not, at any two rates, the rounding of the tip pools
+    /// and of the cuts stays within a few wei and always on the pool's side.
+    /// - A fork carries its pool, capped, rounded down to what a child's vault mints for it, and a child's pool
+    ///   is exactly that. The pool the fork held stays on its record.
+    /// - A query reads what it was owed one level up, cut by carried / pool and rounded down.
+    /// - The tips owed never exceed the pool. The pool exceeds them by at most 2 wei per level (a wei per query,
+    ///   less one).
+    /// - Every query is paid in full out of the grandchild's pool, and what stays in it is that dust.
+    /// Three genesis queries are tipped, the first one again in the child, so records sit at both levels.
+    function testFuzz_TipCap_RoundingStaysWithinBoundsOverTwoForks(
+        uint256[3] memory tipSeeds,
+        uint256 childTipSeed,
+        uint256 burnSeed,
+        uint256 childBurnSeed,
+        bool smallTips
+    ) public {
+        _burnShares(genesisRep, user, bound(burnSeed, MIN_RATE_BURN, MAX_TIP_RATE_BURN));
+        uint256 cap1 = genesisRep.totalSupply() / MultiverseHelpers.FORK_TIP_CAP_DIVISOR;
+        // Large tips mostly cap both forks, small ones mostly neither.
+        uint256 maxTip = smallTips ? cap1 / 8 : cap1;
+        uint256[3] memory ids;
+        uint256[3] memory tips;
+        uint256 pool1;
+        for (uint256 i = 0; i < 3; i++) {
+            ids[i] = _createQuery();
+            tips[i] = bound(tipSeeds[i], 1, maxTip);
+            vm.prank(reporter);
+            multiverse.tip(GENESIS_UID, ids[i], tips[i]);
+            pool1 += tips[i];
+        }
+        _escalateToFork(GENESIS_UID, _createQuery(), user, reporter);
+        // The genesis carries its pool up to the cap, rounded down through its rate.
+        uint256 carried1 = genesisRep.convertToShares(genesisRep.convertToAssets(pool1 > cap1 ? cap1 : pool1));
+        assertEq(_universe(GENESIS_UID).carriedTips, carried1);
+        assertEq(_universe(GENESIS_UID).totalTips, pool1);
+
+        // One level down: the child holds what the genesis carried, and each query is cut by carried1 / pool1.
+        multiverse.spawnChildUniverse(GENESIS_UID, 1);
+        uint248 child = _childId(GENESIS_UID, 1);
+        uint256 ledger1 = _universe(child).totalTips;
+        assertEq(ledger1, carried1);
+        uint256[3] memory owed1;
+        uint256 sum1;
+        for (uint256 i = 0; i < 3; i++) {
+            owed1[i] = multiverse.getTips(child, ids[i]);
+            assertEq(owed1[i], tips[i] * carried1 / pool1);
+            sum1 += owed1[i];
+        }
+        assertLe(sum1, ledger1);
+        assertLe(ledger1 - sum1, 2);
+
+        // The child: funded, the first query tipped again, the rate moved, then forked on a query of its own.
+        ILituusRep childRep = multiverse.repTokenOf(child);
+        _wrapFromZoltar(child, user, USER_REP_BALANCE);
+        _wrapFromZoltar(child, reporter, 100 ether);
+        uint256 childTip = bound(childTipSeed, 1, maxTip);
+        vm.prank(reporter);
+        multiverse.tip(child, ids[0], childTip);
+        owed1[0] += childTip;
+        _burnShares(childRep, user, bound(childBurnSeed, MIN_RATE_BURN, MAX_TIP_RATE_BURN));
+        uint256 cap2 = childRep.totalSupply() / MultiverseHelpers.FORK_TIP_CAP_DIVISOR;
+        uint256 pool2 = ledger1 + childTip;
+        uint256 childForkQueryId = multiverse.queryCount();
+        vm.prank(user);
+        multiverse.createQuery(child, "q", 3);
+        _escalateToFork(child, childForkQueryId, user, user);
+        uint256 carried2 = childRep.convertToShares(childRep.convertToAssets(pool2 > cap2 ? cap2 : pool2));
+        assertEq(_universe(child).carriedTips, carried2);
+        assertEq(_universe(child).totalTips, pool2);
+
+        // Two levels down: the grandchild holds what the child carried, and what the child owed each query is
+        // cut by carried2 / pool2.
+        multiverse.spawnChildUniverse(child, 1);
+        uint248 grandchild = _childId(child, 1);
+        uint256 ledger2 = _universe(grandchild).totalTips;
+        assertEq(ledger2, carried2);
+        uint256[3] memory owed2;
+        uint256 sum2;
+        for (uint256 i = 0; i < 3; i++) {
+            owed2[i] = multiverse.getTips(grandchild, ids[i]);
+            assertEq(owed2[i], owed1[i] * carried2 / pool2);
+            sum2 += owed2[i];
+        }
+        assertLe(sum2, ledger2);
+        assertLe(ledger2 - sum2, 4);
+
+        // Every query expires unreported in the grandchild and pays its resolver the fee plus its tips, in full.
+        // Two reporting periods on, the resolver's fee share has ramped up to the whole fee.
+        ILituusRep grandchildRep = multiverse.repTokenOf(grandchild);
+        vm.warp(vm.getBlockTimestamp() + 2 * REPORTING_PERIOD);
+        for (uint256 i = 0; i < 3; i++) {
+            uint256 resolverBefore = grandchildRep.balanceOf(resolver);
+            vm.prank(resolver);
+            multiverse.resolve(grandchild, ids[i]);
+            assertEq(grandchildRep.balanceOf(resolver) - resolverBefore, DEFAULT_FEE + owed2[i]);
+        }
+        uint256 leftover = _universe(grandchild).totalTips;
+        assertEq(leftover, ledger2 - sum2);
+        // The whole-REP fees were paid out exactly, so the dust is all the Multiverse holds there.
+        assertEq(grandchildRep.balanceOf(address(multiverse)), leftover);
+    }
+
+    /// @dev Property: one cap covers the forking query's tips with an open query's, at any rate, any tip sizes
+    /// (capped or not) and any report delay.
+    /// - Both queries are cut by carried / held, rounded down, and the two cuts leave at most a wei of the pool.
+    /// - In a child whose outcome was reported, the reporter gets the forking query's cut tips to the wei and the
+    ///   fee share at most a wei above its own conversion, never above the share earned.
+    /// - Every child keeps the rest of the carried pool, nobody reported or not, and holds exactly its pools.
+    /// - The spawn draws the fee pool, the tips rounded up and the fee share rounded down: nothing more.
+    /// - The open query is paid in full in every child.
+    function testFuzz_TipCap_ForkingQuerySharesTheCap(
+        uint256 forkTipSeed,
+        uint256 openTipSeed,
+        uint256 burnSeed,
+        uint256 delaySeed
+    ) public {
+        _burnShares(genesisRep, user, bound(burnSeed, MIN_RATE_BURN, MAX_TIP_RATE_BURN));
+        uint256 cap = genesisRep.totalSupply() / MultiverseHelpers.FORK_TIP_CAP_DIVISOR;
+        // Up to three caps each: capped forks and uncapped ones.
+        uint256 forkTip = bound(forkTipSeed, 1, 3 * cap);
+        uint256 openTip = bound(openTipSeed, 0, 3 * cap);
+        uint256 openId;
+        if (openTip != 0) {
+            openId = _createQuery();
+            vm.prank(reporter);
+            multiverse.tip(GENESIS_UID, openId, openTip);
+        }
+        uint256 forkQueryId = _createQuery();
+        vm.prank(reporter);
+        multiverse.tip(GENESIS_UID, forkQueryId, forkTip);
+        // The whole ladder lands in one block, `delay` after the query's creation.
+        uint256 delay = bound(delaySeed, 0, multiverse.REPORTING_PERIOD());
+        vm.warp(vm.getBlockTimestamp() + delay);
+        _escalateToFork(GENESIS_UID, forkQueryId, user, reporter);
+
+        uint256 held = _universe(GENESIS_UID).totalTips;
+        uint256 carried = _universe(GENESIS_UID).carriedTips;
+        assertEq(held, forkTip + openTip);
+        assertEq(carried, genesisRep.convertToShares(genesisRep.convertToAssets(held > cap ? cap : held)));
+        uint256 forkCut = Math.mulDiv(forkTip, carried, held);
+        uint256 openCut = Math.mulDiv(openTip, carried, held);
+        assertLe(carried - forkCut - openCut, 1);
+        uint256 childPool = carried - forkCut;
+        (,, uint256 fee,,) = multiverse.queries(forkQueryId);
+        uint256 feeShare = fee * delay / multiverse.REPORTING_PERIOD();
+        uint256 feePool = _universe(GENESIS_UID).totalQueryFees;
+
+        uint256[3] memory childOutcomes = [OUTCOME_A, OUTCOME_B, INVALID_OUTCOME];
+        address[3] memory firstReporters = [user, reporter, address(0)];
+        for (uint256 i = 0; i < childOutcomes.length; i++) {
+            multiverse.spawnChildUniverse(GENESIS_UID, childOutcomes[i]);
+            uint248 child = _childId(GENESIS_UID, childOutcomes[i]);
+            ILituusRep childRep = multiverse.repTokenOf(child);
+            assertEq(_universe(child).totalTips, childPool);
+            if (openTip != 0) assertEq(multiverse.getTips(child, openId), openCut);
+            assertEq(childRep.balanceOf(address(multiverse)), uint256(_universe(child).totalQueryFees) + childPool);
+
+            uint256 drawn = feePool > 1 ? genesisRep.convertToAssets(feePool) : 0;
+            if (firstReporters[i] == address(0)) {
+                if (childPool != 0) drawn += genesisRep.convertToAssetsUp(childPool);
+            } else {
+                if (carried != 0) drawn += genesisRep.convertToAssetsUp(carried);
+                if (feeShare > 1) drawn += genesisRep.convertToAssets(feeShare);
+                // A brand-new vault: the reporter's whole balance is the spawn payment.
+                uint256 feeShares = childRep.balanceOf(firstReporters[i]) - forkCut;
+                assertLe(feeShares, feeShare);
+                if (feeShare > 1) {
+                    assertGe(feeShares, childRep.convertToShares(genesisRep.convertToAssets(feeShare)));
+                }
+            }
+            assertEq(zoltar.splitPerChild(address(multiverse), GENESIS_UID, childOutcomes[i]), drawn);
+        }
+
+        // The open query expires unreported in every child and pays its resolver the fee plus its cut tips.
+        if (openTip == 0) return;
+        vm.warp(vm.getBlockTimestamp() + 2 * multiverse.REPORTING_PERIOD());
+        (,, uint256 openFee,,) = multiverse.queries(openId);
+        for (uint256 i = 0; i < childOutcomes.length; i++) {
+            uint248 child = _childId(GENESIS_UID, childOutcomes[i]);
+            ILituusRep childRep = multiverse.repTokenOf(child);
+            uint256 before = childRep.balanceOf(resolver);
+            vm.prank(resolver);
+            multiverse.resolve(child, openId);
+            assertEq(childRep.balanceOf(resolver) - before, openFee + openCut);
+            assertEq(_universe(child).totalTips, childPool - openCut);
+        }
     }
 }

@@ -7,8 +7,10 @@ import { IMultiverse } from "src/interfaces/IMultiverse.sol";
 import { IQueryFeeController } from "src/interfaces/IQueryFeeController.sol";
 import { IQueryToken } from "src/interfaces/IQueryToken.sol";
 import { ITokenDeployer } from "src/interfaces/ITokenDeployer.sol";
+import { MultiverseHelpers } from "src/libraries/MultiverseHelpers.sol";
 import { MultiverseDeployFixture } from "../unit/Multiverse.fixtures.sol";
 import { MultiverseForkHandler } from "./handlers/MultiverseForkHandler.sol";
+import { UniverseView } from "../utils/UniverseReader.sol";
 
 /// @notice Stateful fuzzing of a forked genesis: random sequences of spawn, migrate, stake settlements, query
 ///         token migrations and redemptions, time moves and the fork's resolution must keep the migration
@@ -19,17 +21,21 @@ import { MultiverseForkHandler } from "./handlers/MultiverseForkHandler.sol";
 ///      the fork, so the parent's rate is above 1 throughout. The pot at the fork is pinned here, at face
 ///      value and as parked (net of Zoltar's burn on the fork bond), and the invariants hold the counters
 ///      against them. The real QueryTokenizer is wired in and every actor holds genesis query tokens minted
-///      before the fork; their pool is the tokenizer's, outside the pot.
+///      before the fork; their pool is the tokenizer's, outside the pot. The carried query is tipped above the
+///      fork's tip cap, so the fork cuts its tips to the cap and donates the excess to that pool.
 contract MultiverseForkInvariantTest is MultiverseDeployFixture {
     uint256 internal constant ACTOR_REP_BALANCE = 1000 ether;
     uint256 internal constant ACTOR_COUNT = 3;
     uint256 internal constant TOKENS_PER_ACTOR = 2;
-    // Tips on the forking query (paid by every child to the first reporter of its outcome) and on a query left
-    // unreported at the fork (carried into every child as its tip pool).
+    // Tips on the forking query and on a query left unreported at the fork. The fork caps what its children carry
+    // of both together at 0.1% of the wREP supply, just under 3 REP here, so each is cut to half the carried pool
+    // and the excess is donated to the genesis query-token pool. Every child pays the forking query's cut tips to
+    // the first reporter of its outcome at spawn and keeps the rest.
     uint256 internal constant FORK_TIP = 5 ether;
-    uint256 internal constant TIPPED_TIP = 3 ether;
-    // The spawn-time copies of the fee and tip pools round down twice through the parent's rate above 1, so a
-    // child's pools may trail what it pays out by a few wei (the known fee-accounting dust TODO).
+    uint256 internal constant TIPPED_TIP = 5 ether;
+    // The spawn-time copy of the fee pool rounds down twice through the parent's rate above 1, so a child's fee
+    // pool may trail what it pays out by a few wei (the known fee-accounting dust TODO). The tip pool does not:
+    // a child starts with exactly the pool the fork carried.
     uint256 internal constant POOL_DUST = 4;
 
     MultiverseForkHandler internal handler;
@@ -44,6 +50,13 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
     uint256 internal tokensAtFork;
     uint256 internal poolAtFork;
     uint256 internal averageAtFork;
+    // The tip cap the fork applied, and the tip pool it carried: the cap rounded down to what a child's vault
+    // mints for it. Both tipped queries are cut by carried / held: the forking query's part is paid at spawn, the
+    // tipped query's is owed in the child.
+    uint256 internal tipCapAtFork;
+    uint256 internal carriedTipsAtFork;
+    uint256 internal forkShareAtFork;
+    uint256 internal tippedShareAtFork;
 
     /// @dev 3200 ether (the actors' balances plus a 200 ether pool remainder) so the per-outcome cap is
     ///      32 ether and the default fee sits on the cap grid, like the functional suites.
@@ -71,7 +84,7 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
             zoltar,
             GENESIS_UID,
             feeController,
-            address(tokenizer),
+            tokenizer,
             tokenDeployer,
             permit2,
             MIGRATION_DURATION,
@@ -93,8 +106,7 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
         }
         assertEq(_capWrep(), 32 * DEFAULT_FEE);
         tokensAtFork = ACTOR_COUNT * TOKENS_PER_ACTOR;
-        poolAtFork = tokenizer.pooledRep(GENESIS_UID);
-        averageAtFork = poolAtFork / tokensAtFork;
+        uint256 poolBeforeFork = tokenizer.pooledRep(GENESIS_UID);
 
         // Two queries actor0 (A) and actor1 (B) ladder to 1 + 2. The first is resolved before the fork, B
         // winning, so actor1 is owed 2 plus 80% of actor0's 1 and actor0 nothing; the second stays open.
@@ -116,17 +128,27 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
         multiverse.createQuery(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
         vm.prank(actors[2]);
         multiverse.tip(GENESIS_UID, forkQueryId, FORK_TIP);
+        // The fork measures its tip cap against the wREP supply as it stands before the pot leaves. Reports only
+        // move wREP around, so it is read here.
+        tipCapAtFork = genesisRep.totalSupply() / MultiverseHelpers.FORK_TIP_CAP_DIVISOR;
+        assertLt(tipCapAtFork, TIPPED_TIP, "fixture: the carried tips must be above the cap");
+        carriedTipsAtFork = genesisRep.convertToShares(genesisRep.convertToAssets(tipCapAtFork));
+        forkShareAtFork = FORK_TIP * carriedTipsAtFork / (TIPPED_TIP + FORK_TIP);
+        tippedShareAtFork = TIPPED_TIP * carriedTipsAtFork / (TIPPED_TIP + FORK_TIP);
         address[6] memory reporters = [actors[0], actors[1], actors[2], actors[0], actors[1], actors[0]];
         uint256[6] memory outcomes = [OUTCOME_A, OUTCOME_B, OUTCOME_C, OUTCOME_A, OUTCOME_B, OUTCOME_A];
         for (uint256 i = 0; i < reporters.length; i++) {
             vm.prank(reporters[i]);
             multiverse.report(GENESIS_UID, forkQueryId, outcomes[i]);
         }
-        (, Multiverse.UniverseState state,,,,,,,,,,,,) = multiverse.universes(GENESIS_UID);
-        assertEq(uint8(state), uint8(Multiverse.UniverseState.Migration));
+        assertEq(uint8(_universeState(GENESIS_UID)), uint8(Multiverse.UniverseState.Migration));
+        // The fork tx donated the tips above the cap to the genesis pool: from here on it only drains.
+        poolAtFork = tokenizer.pooledRep(GENESIS_UID);
+        // Both queries' tips are under the cap, the forking query's included.
+        assertEq(poolAtFork, poolBeforeFork + TIPPED_TIP + FORK_TIP - tipCapAtFork);
+        averageAtFork = poolAtFork / tokensAtFork;
         parkedAtFork = zoltar.getMigrationRepBalance(address(multiverse), GENESIS_UID);
-        (,,,,,,,,,,,, uint128 unmigratedAtFork,) = multiverse.universes(GENESIS_UID);
-        potAtFork = unmigratedAtFork;
+        potAtFork = _universe(GENESIS_UID).unmigratedSupply;
         assertEq(potAtFork, parkedAtFork + forkThreshold / zoltar.FORK_BURN_DIVISOR());
 
         handler = new MultiverseForkHandler(
@@ -139,6 +161,7 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
             resolvedQueryId,
             openQueryId,
             tippedQueryId,
+            tippedShareAtFork,
             actors
         );
         targetContract(address(handler));
@@ -171,36 +194,40 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
     /// @dev The parent's outflow is exactly what the counted lanes moved: wallet migrations in full, the
     ///      forking query's stakes at their principal, the other queries' stakes at what they paid out.
     function invariant_OutflowMatchesTheCountedLanes() public view {
-        (,,,,,,,,,, uint128 totalOut,,,) = multiverse.universes(GENESIS_UID);
-        assertEq(totalOut, handler.ghostWalletMigrated() + handler.ghostPrincipalClaimed() + handler.ghostStakeVotes());
+        assertEq(
+            _universe(GENESIS_UID).totalMigratedOut,
+            handler.ghostWalletMigrated() + handler.ghostPrincipalClaimed() + handler.ghostStakeVotes()
+        );
     }
 
     /// @dev Counted plus unmigrated supply only grows by what wallets bring in after the fork: stake
     ///      settlements move value from unmigrated to counted, never create or destroy it.
     function invariant_CountedPlusUnmigratedIsConserved() public view {
-        (,,,,,,,,,, uint128 totalOut,, uint128 unmigrated,) = multiverse.universes(GENESIS_UID);
-        assertEq(uint256(totalOut) + unmigrated, potAtFork + handler.ghostWalletMigrated());
+        UniverseView memory genesis = _universe(GENESIS_UID);
+        assertEq(
+            uint256(genesis.totalMigratedOut) + genesis.unmigratedSupply, potAtFork + handler.ghostWalletMigrated()
+        );
     }
 
     /// @dev Every child's inflow matches what was moved into it, the inflows add up to the outflow, and the
     ///      running max points at a child holding it.
     function invariant_ChildInflowsMatchTheOutflow() public view {
-        (,,,,, uint248 favoriteChild,,, uint128 maxOut,, uint128 totalOut,,,) = multiverse.universes(GENESIS_UID);
+        UniverseView memory genesis = _universe(GENESIS_UID);
         uint256 inflows;
         uint256 largest;
         uint256 favoriteInflow;
         for (uint256 i = 0; i < handler.outcomesLength(); ++i) {
             uint256 outcome = handler.outcomeAt(i);
             uint248 childId = handler.childOf(outcome);
-            (,,,,,,, uint128 totalIn,,,,,,) = multiverse.universes(childId);
+            uint128 totalIn = _universe(childId).totalMigratedIn;
             assertEq(totalIn, handler.ghostMigratedInto(outcome));
             inflows += totalIn;
             if (totalIn > largest) largest = totalIn;
-            if (childId == favoriteChild) favoriteInflow = totalIn;
+            if (childId == genesis.favoriteChild) favoriteInflow = totalIn;
         }
-        assertEq(inflows, totalOut);
-        assertEq(maxOut, largest);
-        if (favoriteChild != 0) assertEq(favoriteInflow, maxOut);
+        assertEq(inflows, genesis.totalMigratedOut);
+        assertEq(genesis.maxMigratedOut, largest);
+        if (genesis.favoriteChild != 0) assertEq(favoriteInflow, genesis.maxMigratedOut);
     }
 
     /// @dev No child ever draws more than the whole parked balance from the Zoltar credit, whatever it was
@@ -215,9 +242,9 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
     /// @dev Once the fork resolved, the winner never moves: no counted lane is open after resolution.
     function invariant_WinnerIsFinalOnceResolved() public view {
         if (!handler.ghostResolved()) return;
-        (, Multiverse.UniverseState state,,,, uint248 favoriteChild,,,,,,,,) = multiverse.universes(GENESIS_UID);
-        assertEq(uint8(state), uint8(Multiverse.UniverseState.PostFork));
-        assertEq(favoriteChild, handler.ghostWinner());
+        UniverseView memory genesis = _universe(GENESIS_UID);
+        assertEq(uint8(genesis.universeState), uint8(Multiverse.UniverseState.PostFork));
+        assertEq(genesis.favoriteChild, handler.ghostWinner());
     }
 
     /// @dev Every forking-query stake is either still on the parent record or was claimed, never both and
@@ -274,8 +301,9 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
         assertEq(parentSupply + childSupplies, (tokensAtFork - handler.ghostTokensRedeemed()) * oneQuery);
     }
 
-    /// @dev Nothing enters the parent pool after the fork and every migration takes its share rounded down, so
-    ///      the pool is what it was less what left, the average the stayers see never drops below the one at the
+    /// @dev Nothing enters the parent pool after the fork (its last inflow is the fork's own donation of the
+    ///      excess tips) and every migration takes its share rounded down, so the pool is what it was less what
+    ///      left, the average the stayers see never drops below the one at the
     ///      fork and rises by at most a wei per migration, and the last tokens out leave nothing behind.
     function invariant_ParentPoolOnlyDrainsAtTheShare() public view {
         uint256 pool = tokenizer.pooledRep(GENESIS_UID);
@@ -306,38 +334,46 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
         }
     }
 
-    /// @dev The parent's tips are frozen at the fork: its pool holds only the carried query's tips (the forking
-    ///      query's left it in the fork tx), the forking query's record keeps its tips for every spawn to read,
-    ///      and a forked universe pays no tips itself.
+    /// @dev The parent's tips are frozen at the fork: its aggregate holds both queries' tips, whole, next to what
+    ///      its children carry of them: cut to the cap and rounded down to what a child's vault mints. Both
+    ///      records keep their tips whole too (the forking query's for every spawn to cut, the carried query's for
+    ///      every child to cut on reading), and a forked universe pays no tips itself.
     function invariant_ParentTipsFrozenAtTheFork() public view {
-        (,,,,,,,,,,,,, uint128 parentTips) = multiverse.universes(GENESIS_UID);
-        assertEq(parentTips, TIPPED_TIP);
+        UniverseView memory genesis = _universe(GENESIS_UID);
+        assertEq(genesis.carriedTips, carriedTipsAtFork);
+        assertLe(carriedTipsAtFork, tipCapAtFork);
+        assertEq(genesis.totalTips, TIPPED_TIP + FORK_TIP);
         assertEq(_resolutionIn(GENESIS_UID, forkQueryId).tips, FORK_TIP);
         assertEq(_resolutionIn(GENESIS_UID, tippedQueryId).tips, TIPPED_TIP);
         assertEq(multiverse.getTips(GENESIS_UID, forkQueryId), 0);
         assertEq(multiverse.getTips(GENESIS_UID, tippedQueryId), 0);
     }
 
-    /// @dev Each spawned child's tip pool is the parent's pool copied at spawn (a few wei short at most) plus
-    ///      the tips placed there, and the carried query pays the parent's tips plus those, until it is resolved
-    ///      there; then nothing is owed, the record is cleared and the pool saturates to zero. The forking query
-    ///      is resolved in every child, so it owes nothing there.
+    /// @dev Each spawned child's tip pool is the pool the parent carried less the forking query's cut tips, paid
+    ///      to its reporter at spawn, plus the tips placed there. The carried query is owed the parent's cut tips
+    ///      plus those, which is the pool but at most a wei of rounding dust, until it is resolved there; then
+    ///      nothing is owed, the record is cleared and only the dust stays in the pool. The forking query is
+    ///      resolved in every child, so it owes nothing there.
     function invariant_ChildTipsMatchGhosts() public view {
         for (uint256 i = 0; i < handler.outcomesLength(); ++i) {
             uint256 outcome = handler.outcomeAt(i);
             uint248 childId = handler.childOf(outcome);
             if (!handler.ghostSpawned(outcome)) continue;
-            (,,,,,,,,,,,,, uint128 childTips) = multiverse.universes(childId);
-            assertLe(handler.ghostTipsCopied(outcome), TIPPED_TIP);
-            assertGe(handler.ghostTipsCopied(outcome) + POOL_DUST, TIPPED_TIP);
+            uint128 childTips = _universe(childId).totalTips;
+            // The child keeps what the fork carried less the forking query's part, paid out at spawn. The cuts
+            // round down, so a wei of the carried pool can be owed to nobody.
+            assertEq(handler.ghostTipsCopied(outcome), carriedTipsAtFork - forkShareAtFork);
+            uint256 dust = carriedTipsAtFork - forkShareAtFork - tippedShareAtFork;
+            assertLe(dust, 1);
             assertEq(multiverse.getTips(childId, forkQueryId), 0);
             if (handler.ghostTippedResolved(outcome)) {
-                assertEq(childTips, 0);
+                assertEq(childTips, dust);
                 assertEq(_resolutionIn(childId, tippedQueryId).tips, 0);
                 assertEq(multiverse.getTips(childId, tippedQueryId), 0);
             } else {
                 assertEq(childTips, handler.ghostTipsCopied(outcome) + handler.ghostChildTips(outcome));
-                assertEq(multiverse.getTips(childId, tippedQueryId), TIPPED_TIP + handler.ghostChildTips(outcome));
+                // Owed the cut tips plus the child's: the whole pool but the dust.
+                assertEq(multiverse.getTips(childId, tippedQueryId), childTips - dust);
             }
         }
     }
@@ -351,11 +387,11 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
             uint256 outcome = handler.outcomeAt(i);
             if (!handler.ghostSpawned(outcome)) continue;
             uint248 childId = handler.childOf(outcome);
-            (,,,,,,,,,,, uint128 childFees,, uint128 childTips) = multiverse.universes(childId);
+            UniverseView memory child = _universe(childId);
             uint256 openStake = handler.ghostTippedResolved(outcome) ? 0 : handler.ghostChildStake(outcome);
             assertApproxEqAbs(
-                multiverse.repTokenOf(childId).balanceOf(address(multiverse)),
-                uint256(childFees) + childTips + openStake,
+                child.repToken.balanceOf(address(multiverse)),
+                uint256(child.totalQueryFees) + child.totalTips + openStake,
                 POOL_DUST
             );
         }

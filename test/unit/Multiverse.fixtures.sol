@@ -7,10 +7,12 @@ import { Multiverse } from "src/Multiverse.sol";
 import { TokenDeployer } from "src/TokenDeployer.sol";
 import { IPermit2 } from "src/interfaces/IPermit2.sol";
 import { Permit2Deployer } from "../utils/Permit2Deployer.sol";
+import { UniverseReader, UniverseView } from "../utils/UniverseReader.sol";
 import { ILituusRep } from "src/interfaces/ILituusRep.sol";
 import { IReputationToken } from "src/interfaces/IReputationToken.sol";
 import { IZoltarQuestionData } from "src/interfaces/IZoltar.sol";
 import { IQueryFeeController } from "src/interfaces/IQueryFeeController.sol";
+import { IQueryTokenizer } from "src/interfaces/IQueryTokenizer.sol";
 import { MockERC20 } from "src/mock/MockERC20.sol";
 import { MockZoltar } from "src/mock/MockZoltar.sol";
 import { MockZoltarQuestionData } from "src/mock/MockZoltarQuestionData.sol";
@@ -76,8 +78,9 @@ abstract contract MultiverseDeployFixture is Test {
     address internal bystander = makeAddr("bystander");
     address internal challenger = makeAddr("challenger");
     // Stub address for the query tokenizer: the Multiverse requires it nonzero, but these suites do
-    // not test the tokenizer (they use it only to satisfy the constructor).
-    address internal queryTokenizerStub = makeAddr("queryTokenizer");
+    // not test the tokenizer. The only call it ever gets is donateRep, in a fork that caps its tips
+    // (answered in setUp).
+    IQueryTokenizer internal queryTokenizerStub = IQueryTokenizer(makeAddr("queryTokenizer"));
 
     /// @dev The genesis universe's fork threshold in wREP shares, derived independently of the
     ///      Multiverse's own conversion (straight through Zoltar + the vault).
@@ -160,8 +163,15 @@ abstract contract MultiverseDeployFixture is Test {
         multiverse = _deployMultiverse(feeController);
         assertEq(address(multiverse), predictedMultiverse, "fixture deploy order changed");
 
-        (ILituusRep repToken,,,,,,,,,,,,,) = multiverse.universes(GENESIS_UID);
-        genesisRep = repToken;
+        genesisRep = _universe(GENESIS_UID).repToken;
+
+        // A fork that caps the tips its children carry offers the excess to the tokenizer's pool. The stub stands
+        // for a tokenizer with no query tokens: it has code and refuses, so the excess stays parked. Suites that
+        // wire the real tokenizer never reach the stub.
+        vm.etch(address(queryTokenizerStub), hex"00");
+        vm.mockCall(
+            address(queryTokenizerStub), abi.encodeWithSelector(IQueryTokenizer.donateRep.selector), abi.encode(false)
+        );
     }
 
     /// @dev Contracts a suite creates between Permit2 and the token deployer in its `_deployMultiverse` (the
@@ -283,8 +293,22 @@ abstract contract MultiverseDeployFixture is Test {
 
     /* ============================================ FORK HELPERS ============================================ */
 
-    function _universeState(uint248 universeId) internal view returns (Multiverse.UniverseState state) {
-        (, state,,,,,,,,,,,,) = multiverse.universes(universeId);
+    /// @dev A universe's record with its fields by name (see UniverseView).
+    function _universe(uint248 universeId) internal view returns (UniverseView memory) {
+        return UniverseReader.read(multiverse, universeId);
+    }
+
+    function _universeState(uint248 universeId) internal view returns (Multiverse.UniverseState) {
+        return _universe(universeId).universeState;
+    }
+
+    /// @dev Moves a vault's rate up the way a resolution does: `from` hands the shares to the Multiverse, which
+    ///      burns them.
+    function _burnShares(ILituusRep repToken, address from, uint256 shares) internal {
+        vm.prank(from);
+        repToken.transfer(address(multiverse), shares);
+        vm.prank(address(multiverse));
+        repToken.burnShares(shares);
     }
 
     function _childId(uint248 parentId, uint256 outcome) internal view returns (uint248) {

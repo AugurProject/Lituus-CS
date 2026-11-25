@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.35;
 
+import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { IERC20Errors } from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 
 import { LituusRep } from "src/LituusRep.sol";
@@ -230,10 +231,7 @@ contract QueryTokenizerMigrateTest is QueryTokenizerFixtures {
         // A burn in the genesis vault before the fork moves its rate; the child vault opens at that rate, so
         // the pool share converts through assets and the child pool holds what the parent pool gave up.
         uint256 mintCost = _mintTokens(user, MINTED);
-        vm.prank(user);
-        genesisRep.transfer(address(multiverse), 50 ether);
-        vm.prank(address(multiverse));
-        genesisRep.burnShares(50 ether);
+        _burnShares(genesisRep, user, 50 ether);
         _forkGenesis();
         multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
         childA = _childId(GENESIS_UID, OUTCOME_A);
@@ -355,10 +353,7 @@ contract QueryTokenizerMigrateTest is QueryTokenizerFixtures {
         _mintTokens(user, 1);
         assertEq(tokenizer.pooledRep(GENESIS_UID), 1);
         feeCtl.setFee(DEFAULT_FEE);
-        vm.prank(user);
-        genesisRep.transfer(address(multiverse), 50 ether);
-        vm.prank(address(multiverse));
-        genesisRep.burnShares(50 ether);
+        _burnShares(genesisRep, user, 50 ether);
         _forkGenesis();
         multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
 
@@ -433,5 +428,224 @@ contract QueryTokenizerMigrateTest is QueryTokenizerFixtures {
         vm.prank(user);
         vm.expectRevert(Multiverse.MigrationWindowClosed.selector);
         tokenizer.migrate(GENESIS_UID, OUTCOME_A, 1);
+    }
+
+    /* ============================================= FORK DONATION ============================================== */
+
+    /// @dev `user` holds three genesis tokens, an open query is tipped 5 wREP and the forking query's ladder
+    ///      stands one report short of the fork. 3,000 wREP are wrapped, so the fork will cap the tips its
+    ///      children carry at 3 wREP and have 2 wREP of excess.
+    function _mintTipAndLadderToCap() internal returns (uint256 mintCost, uint256 forkQueryId) {
+        mintCost = _mintTokens(user, MINTED);
+        uint256 openQueryId = _createDefaultQuery();
+        vm.prank(bystander);
+        multiverse.tip(GENESIS_UID, openQueryId, 5 ether);
+        (forkQueryId,) = _createLadderToCap();
+        assertEq(genesisRep.totalSupply(), 3000 ether, "fixture: 3,000 wREP wrapped in the genesis");
+    }
+
+    /// @dev A fork with more tips than its children may carry donates the excess to the universe's query-token
+    ///      pool in the fork tx, before the pot is parked. The tokenizer is asked once: it credits its pool and
+    ///      the REP follows in the same tx, so the pool matches the tokenizer's balance when the tx ends. The
+    ///      donation is not in the parked pot, and it leaves the forked universe only with the tokens: a holder's
+    ///      migration carries it into one child, counted as a vote like the rest of the pool.
+    function test_Fork_DonatesTheExcessTipsToThePool() public {
+        (uint256 mintCost, uint256 forkQueryId) = _mintTipAndLadderToCap();
+        uint256 excess = 2 ether;
+        uint256 forkThreshold = zoltar.getForkThreshold(GENESIS_UID);
+        uint256 heldBeforeTrigger = genesisRep.balanceOf(address(multiverse));
+        uint256 triggerStake = multiverse.getNextRequiredStake(GENESIS_UID, forkQueryId, OUTCOME_A);
+
+        // In this order: the pool is credited, the REP arrives, the fork reports the donation.
+        vm.expectEmit(true, true, true, true, address(tokenizer));
+        emit QueryTokenizer.PoolDonated(GENESIS_UID, excess);
+        vm.expectEmit(true, true, true, true, address(genesisRep));
+        emit IERC20.Transfer(address(multiverse), address(tokenizer), excess);
+        vm.expectEmit(true, true, true, true, address(multiverse));
+        emit Multiverse.TipsCapped(GENESIS_UID, 5 ether, 3 ether, excess);
+        vm.prank(user);
+        multiverse.report(GENESIS_UID, forkQueryId, OUTCOME_A);
+
+        // The children carry the capped tips; the genesis record keeps what it held.
+        assertEq(_universe(GENESIS_UID).carriedTips, 3 ether);
+        assertEq(_universe(GENESIS_UID).totalTips, 5 ether);
+        assertEq(tokenizer.pooledRep(GENESIS_UID), mintCost + excess);
+        assertEq(genesisRep.balanceOf(address(tokenizer)), mintCost + excess);
+        // The pot is everything the Multiverse held at the fork less the donation; Zoltar kept its burn on the
+        // fork bond, the rest is parked. At rate 1 shares are REP.
+        assertEq(
+            zoltar.getMigrationRepBalance(address(multiverse), GENESIS_UID),
+            heldBeforeTrigger + triggerStake - excess - forkThreshold / zoltar.FORK_BURN_DIVISOR()
+        );
+
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_B);
+        childA = _childId(GENESIS_UID, OUTCOME_A);
+        childB = _childId(GENESIS_UID, OUTCOME_B);
+        // Both children carry the capped tips; neither carries the donation.
+        assertEq(_universe(childA).totalTips, 3 ether);
+        assertEq(_universe(childB).totalTips, 3 ether);
+
+        // The tokens take the whole pool, donation included, into the one child their holder picks.
+        (uint256 migratedRep, uint256 childShares) = _migrateTokens(user, OUTCOME_A, MINTED);
+        assertEq(migratedRep, mintCost + excess);
+        assertEq(childShares, mintCost + excess);
+        assertEq(tokenizer.pooledRep(GENESIS_UID), 0);
+        assertEq(tokenizer.pooledRep(childA), mintCost + excess);
+        assertEq(tokenizer.pooledRep(childB), 0);
+        assertEq(_totalMigratedOut(GENESIS_UID), mintCost + excess);
+        assertEq(_totalMigratedIn(childA), mintCost + excess);
+    }
+
+    /// @dev The pool is credited before the REP arrives, both in the fork tx. If the REP could not be sent, the
+    ///      whole fork tx reverts and the credit with it: the pool never stays ahead of the tokenizer's balance.
+    ///      Here the vault is made to refuse that one transfer.
+    function test_Fork_AFailedPushRevertsTheForkAndTheCredit() public {
+        (uint256 mintCost, uint256 forkQueryId) = _mintTipAndLadderToCap();
+        uint256 excess = 2 ether;
+        vm.mockCallRevert(
+            address(genesisRep), abi.encodeCall(IERC20.transfer, (address(tokenizer), excess)), "push refused"
+        );
+
+        vm.prank(user);
+        vm.expectRevert();
+        multiverse.report(GENESIS_UID, forkQueryId, OUTCOME_A);
+        assertEq(tokenizer.pooledRep(GENESIS_UID), mintCost);
+        assertEq(genesisRep.balanceOf(address(tokenizer)), mintCost);
+        assertEq(uint8(_universeState(GENESIS_UID)), uint8(Multiverse.UniverseState.Active));
+
+        // With the vault back to normal the same report forks and donates.
+        vm.clearMockedCalls();
+        vm.prank(user);
+        multiverse.report(GENESIS_UID, forkQueryId, OUTCOME_A);
+        assertEq(uint8(_universeState(GENESIS_UID)), uint8(Multiverse.UniverseState.Migration));
+        assertEq(tokenizer.pooledRep(GENESIS_UID), mintCost + excess);
+        assertEq(genesisRep.balanceOf(address(tokenizer)), mintCost + excess);
+    }
+
+    /// @dev A universe nobody ever minted a query token in has no QueryToken: nothing could carry a donation out
+    ///      of its pool. The tokenizer refuses, the fork donates nothing and the excess stays parked with the pot.
+    function test_Fork_DonatesNothingWhenNoTokenWasEverMinted() public {
+        assertEq(address(tokenizer.token(GENESIS_UID)), address(0));
+        uint256 openQueryId = _createDefaultQuery();
+        vm.prank(bystander);
+        multiverse.tip(GENESIS_UID, openQueryId, 5 ether);
+        (uint256 forkQueryId,) = _createLadderToCap();
+
+        vm.expectEmit(true, true, true, true, address(multiverse));
+        emit Multiverse.TipsCapped(GENESIS_UID, 5 ether, 3 ether, 0);
+        vm.prank(user);
+        multiverse.report(GENESIS_UID, forkQueryId, OUTCOME_A);
+
+        assertEq(_universe(GENESIS_UID).carriedTips, 3 ether);
+        assertEq(tokenizer.pooledRep(GENESIS_UID), 0);
+        assertEq(genesisRep.balanceOf(address(tokenizer)), 0);
+    }
+
+    /// @dev A universe whose query tokens were all redeemed still has its QueryToken, but nothing could carry a
+    ///      donation out of its pool. The fork donates nothing and the excess stays parked with the pot.
+    function test_Fork_DonatesNothingWhenEveryTokenWasRedeemed() public {
+        _mintTokens(user, 1);
+        _redeemToken(user);
+        assertTrue(address(tokenizer.token(GENESIS_UID)) != address(0));
+        assertEq(tokenizer.token(GENESIS_UID).totalSupply(), 0);
+
+        uint256 openQueryId = _createDefaultQuery();
+        vm.prank(bystander);
+        multiverse.tip(GENESIS_UID, openQueryId, 5 ether);
+        (uint256 forkQueryId,) = _createLadderToCap();
+
+        vm.expectEmit(true, true, true, true, address(multiverse));
+        emit Multiverse.TipsCapped(GENESIS_UID, 5 ether, 3 ether, 0);
+        vm.prank(user);
+        multiverse.report(GENESIS_UID, forkQueryId, OUTCOME_A);
+
+        assertEq(_universe(GENESIS_UID).carriedTips, 3 ether);
+        assertEq(_universe(GENESIS_UID).totalTips, 5 ether);
+        assertEq(tokenizer.pooledRep(GENESIS_UID), 0);
+        assertEq(genesisRep.balanceOf(address(tokenizer)), 0);
+    }
+
+    /// @dev Pins a known lever: the donation goes to whoever holds query tokens at the fork. With none
+    ///      outstanding, a single token minted just before the fork-triggering report takes the whole excess,
+    ///      and its holder carries it into the child of their choice as counted votes.
+    function test_Fork_ATokenMintedJustBeforeTheForkTakesTheWholeExcess() public {
+        uint256 openQueryId = _createDefaultQuery();
+        vm.prank(bystander);
+        multiverse.tip(GENESIS_UID, openQueryId, 5 ether);
+        (uint256 forkQueryId,) = _createLadderToCap();
+        assertEq(address(tokenizer.token(GENESIS_UID)), address(0));
+
+        uint256 mintCost = _mintTokens(challenger, 1);
+        uint256 excess = 2 ether;
+        vm.expectEmit(true, true, true, true, address(multiverse));
+        emit Multiverse.TipsCapped(GENESIS_UID, 5 ether, 3 ether, excess);
+        vm.prank(user);
+        multiverse.report(GENESIS_UID, forkQueryId, OUTCOME_A);
+        assertEq(tokenizer.pooledRep(GENESIS_UID), mintCost + excess);
+
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_B);
+        childB = _childId(GENESIS_UID, OUTCOME_B);
+        (uint256 migratedRep,) = _migrateTokens(challenger, OUTCOME_B, 1);
+        assertEq(migratedRep, mintCost + excess);
+        assertEq(tokenizer.pooledRep(childB), mintCost + excess);
+        assertEq(_totalMigratedIn(childB), mintCost + excess);
+    }
+
+    /// @dev A donation the way the fork tx makes it: the Multiverse offers the REP in one call, and transfers it
+    ///      only if the pool took it. `user` stands in for the Multiverse's own REP in that transfer.
+    function _donateAsTheMultiverse(uint256 amount) internal returns (bool accepted) {
+        vm.prank(address(multiverse));
+        accepted = tokenizer.donateRep(GENESIS_UID, amount);
+        if (accepted) {
+            vm.prank(user);
+            genesisRep.transfer(address(tokenizer), amount);
+        }
+    }
+
+    /// @dev donateRep takes the REP only while a whole token is outstanding, and says so: on a yes the pool is
+    ///      credited, on a no nothing is booked and nothing is emitted.
+    function test_DonateRep_TakesTheDonationOnlyWithWholeTokensOutstanding() public {
+        // No QueryToken yet: refused.
+        vm.recordLogs();
+        assertFalse(_donateAsTheMultiverse(1 ether));
+        assertEq(vm.getRecordedLogs().length, 0);
+        assertEq(tokenizer.pooledRep(GENESIS_UID), 0);
+
+        // Two tokens outstanding: taken, on top of what the mints pooled.
+        uint256 mintCost = _mintTokens(user, 2);
+        vm.expectEmit(true, true, true, true, address(tokenizer));
+        emit QueryTokenizer.PoolDonated(GENESIS_UID, 1 ether);
+        assertTrue(_donateAsTheMultiverse(1 ether));
+        assertEq(tokenizer.pooledRep(GENESIS_UID), mintCost + 1 ether);
+        assertEq(genesisRep.balanceOf(address(tokenizer)), mintCost + 1 ether);
+
+        // One token left: still taken. The pool is half of the above plus the new donation.
+        _redeemToken(user);
+        assertTrue(_donateAsTheMultiverse(1 ether));
+        assertEq(tokenizer.pooledRep(GENESIS_UID), (mintCost + 1 ether) / 2 + 1 ether);
+        assertEq(genesisRep.balanceOf(address(tokenizer)), tokenizer.pooledRep(GENESIS_UID));
+
+        // The last token redeemed takes the whole pool. The QueryToken stays, with nothing outstanding: refused.
+        _redeemToken(user);
+        assertEq(tokenizer.pooledRep(GENESIS_UID), 0);
+        vm.recordLogs();
+        assertFalse(_donateAsTheMultiverse(1 ether));
+        assertEq(vm.getRecordedLogs().length, 0);
+        assertEq(tokenizer.pooledRep(GENESIS_UID), 0);
+        assertEq(genesisRep.balanceOf(address(tokenizer)), 0);
+    }
+
+    /// @dev Only the Multiverse may ask for the credit that runs ahead of the REP, tokens outstanding or not.
+    function test_RevertWhen_DonateRep_CallerIsNotTheMultiverse() public {
+        vm.prank(user);
+        vm.expectRevert(QueryTokenizer.NotMultiverse.selector);
+        tokenizer.donateRep(GENESIS_UID, 1 ether);
+
+        _mintTokens(user, 1);
+        vm.prank(user);
+        vm.expectRevert(QueryTokenizer.NotMultiverse.selector);
+        tokenizer.donateRep(GENESIS_UID, 1 ether);
+        assertEq(tokenizer.pooledRep(GENESIS_UID), tokenizer.mintPrice(GENESIS_UID));
     }
 }

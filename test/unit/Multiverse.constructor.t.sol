@@ -8,7 +8,9 @@ import { ILituusRep } from "src/interfaces/ILituusRep.sol";
 import { ITokenDeployer } from "src/interfaces/ITokenDeployer.sol";
 import { IZoltar } from "src/interfaces/IZoltar.sol";
 import { IQueryFeeController } from "src/interfaces/IQueryFeeController.sol";
+import { IQueryTokenizer } from "src/interfaces/IQueryTokenizer.sol";
 import { MultiverseFixtures } from "./Multiverse.fixtures.sol";
+import { UniverseReader, UniverseView } from "../utils/UniverseReader.sol";
 
 contract MultiverseConstructorTest is MultiverseFixtures {
     function test_RevertWhen_ZoltarIsZero() public {
@@ -47,7 +49,7 @@ contract MultiverseConstructorTest is MultiverseFixtures {
             zoltar,
             GENESIS_UID,
             feeCtl,
-            address(0),
+            IQueryTokenizer(address(0)),
             tokenDeployer,
             permit2,
             MIGRATION_DURATION,
@@ -120,40 +122,27 @@ contract MultiverseConstructorTest is MultiverseFixtures {
             APPEAL_PERIOD
         );
 
-        (
-            ILituusRep repToken,
-            Multiverse.UniverseState universeState,
-            uint48 forkTime,
-            bool isCanonical,
-            uint248 parent,
-            uint248 favoriteChild,
-            bool isLituusFork,
-            uint128 totalMigratedIn,
-            uint128 maxMigratedOut,
-            uint256 forkQuery,
-            uint256 totalMigratedOut,
-            uint256 totalQueryFees,
-            uint256 unmigratedSupply,
-            uint256 totalTips
-        ) = newMultiverse.universes(GENESIS_UID);
+        UniverseView memory genesis = UniverseReader.read(newMultiverse, GENESIS_UID);
 
-        assertTrue(address(repToken) != address(0));
-        assertEq(uint8(universeState), uint8(Multiverse.UniverseState.Active));
+        assertTrue(address(genesis.repToken) != address(0));
+        assertEq(uint8(genesis.universeState), uint8(Multiverse.UniverseState.Active));
         // forkTime = the moment the universe's own fork split it; 0 until the genesis forks.
-        assertEq(forkTime, 0);
-        assertTrue(isCanonical);
-        assertEq(parent, 0);
-        assertEq(favoriteChild, 0);
-        assertFalse(isLituusFork);
-        assertEq(totalMigratedIn, 0);
-        assertEq(maxMigratedOut, 0);
-        assertEq(forkQuery, 0);
+        assertEq(genesis.forkTime, 0);
+        assertTrue(genesis.isCanonical);
+        assertEq(genesis.parent, 0);
+        assertEq(genesis.favoriteChild, 0);
+        assertFalse(genesis.isLituusFork);
+        assertEq(genesis.totalMigratedIn, 0);
+        assertEq(genesis.maxMigratedOut, 0);
+        assertEq(genesis.forkQuery, 0);
         // totalMigratedOut stays 0 until the universe forks and migration begins.
-        assertEq(totalMigratedOut, 0);
+        assertEq(genesis.totalMigratedOut, 0);
         // No queries yet, no parked pot.
-        assertEq(totalQueryFees, 0);
-        assertEq(unmigratedSupply, 0);
-        assertEq(totalTips, 0);
+        assertEq(genesis.totalQueryFees, 0);
+        assertEq(genesis.unmigratedSupply, 0);
+        assertEq(genesis.totalTips, 0);
+        // Set when the universe forks.
+        assertEq(genesis.carriedTips, 0);
         // The canonical timeline starts at the genesis.
         assertEq(newMultiverse.canonicalHeir(), GENESIS_UID);
     }
@@ -191,7 +180,7 @@ contract MultiverseConstructorTest is MultiverseFixtures {
         );
 
         assertEq(address(newMultiverse), predictedMultiverse);
-        (ILituusRep repToken,,,,,,,,,,,,,) = newMultiverse.universes(GENESIS_UID);
+        ILituusRep repToken = UniverseReader.read(newMultiverse, GENESIS_UID).repToken;
         assertEq(address(repToken), predictedVault);
         assertEq(LituusRep(predictedVault).owner(), address(newMultiverse));
     }
@@ -232,7 +221,7 @@ contract MultiverseConstructorTest is MultiverseFixtures {
         );
 
         assertEq(address(newMultiverse), predictedMultiverse);
-        (ILituusRep repToken,,,,,,,,,,,,,) = newMultiverse.universes(GENESIS_UID);
+        ILituusRep repToken = UniverseReader.read(newMultiverse, GENESIS_UID).repToken;
         assertEq(LituusRep(address(repToken)).owner(), predictedMultiverse);
     }
 

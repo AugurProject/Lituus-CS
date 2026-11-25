@@ -47,7 +47,7 @@ contract TokenDeployer is ITokenDeployer {
     /// @inheritdoc ITokenDeployer
     function deployQueryToken(address zoltarRepToken) external returns (IQueryToken) {
         // The tokenizer is read off the Multiverse (an immutable there), so the two can never disagree on it.
-        if (msg.sender != IMultiverse(MULTIVERSE).QUERY_TOKENIZER()) revert NotQueryTokenizer();
+        if (msg.sender != address(IMultiverse(MULTIVERSE).QUERY_TOKENIZER())) revert NotQueryTokenizer();
         (string memory name, string memory symbol) = _nameAndSymbol(zoltarRepToken, "Lituus Query Token", "QT");
         return new QueryToken(msg.sender, name, symbol);
     }

@@ -55,7 +55,7 @@ abstract contract QueryTokenizerFixtures is MultiverseFixtures {
             zoltar,
             GENESIS_UID,
             feeController,
-            address(tokenizer),
+            tokenizer,
             tokenDeployer,
             permit2,
             MIGRATION_DURATION,
@@ -216,16 +216,16 @@ abstract contract QueryTokenizerFixtures is MultiverseFixtures {
         assertEq(_totalMigratedOut(parentId), migratedOutBefore + assets);
     }
 
-    function _totalMigratedIn(uint248 universeId) internal view returns (uint128 migratedIn) {
-        (,,,,,,, migratedIn,,,,,,) = multiverse.universes(universeId);
+    function _totalMigratedIn(uint248 universeId) internal view returns (uint128) {
+        return _universe(universeId).totalMigratedIn;
     }
 
-    function _totalMigratedOut(uint248 universeId) internal view returns (uint128 migratedOut) {
-        (,,,,,,,,,, migratedOut,,,) = multiverse.universes(universeId);
+    function _totalMigratedOut(uint248 universeId) internal view returns (uint128) {
+        return _universe(universeId).totalMigratedOut;
     }
 
-    function _favoriteChild(uint248 universeId) internal view returns (uint248 favoriteChild) {
-        (,,,,, favoriteChild,,,,,,,,) = multiverse.universes(universeId);
+    function _favoriteChild(uint248 universeId) internal view returns (uint248) {
+        return _universe(universeId).favoriteChild;
     }
 
     /// @dev The average per whole token the universe's pool pays out, floored like redeem prices it.

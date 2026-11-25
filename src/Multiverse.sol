@@ -11,6 +11,7 @@ import { ILituusRep } from "./interfaces/ILituusRep.sol";
 import { ITokenDeployer } from "./interfaces/ITokenDeployer.sol";
 import { IReputationToken } from "./interfaces/IReputationToken.sol";
 import { IQueryFeeController } from "./interfaces/IQueryFeeController.sol";
+import { IQueryTokenizer } from "./interfaces/IQueryTokenizer.sol";
 import { IMultiverse } from "./interfaces/IMultiverse.sol";
 import { IPermit2 } from "./interfaces/IPermit2.sol";
 import { PermitSupport } from "./PermitSupport.sol";
@@ -45,9 +46,9 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
     // The ZoltarQuestionData contract is immutable in Zoltar so it can be cached here.
     IZoltarQuestionData public immutable ZOLTAR_QUESTION_DATA;
     IQueryFeeController public immutable QUERY_FEE_CONTROLLER;
-    // The QueryTokenizer allowed to create queries at a tokenizer-supplied price.
-    // One immutable contract serves every universe.
-    address public immutable QUERY_TOKENIZER;
+    // The QueryTokenizer: the only caller allowed to create queries at a tokenizer-supplied price, and the holder
+    // of the query-token pools a fork donates its excess tips to. One immutable contract serves every universe.
+    IQueryTokenizer public immutable QUERY_TOKENIZER;
     // Deploy factory for Lituus wREP tokens and for query tokens.
     ITokenDeployer public immutable TOKEN_DEPLOYER;
 
@@ -128,9 +129,10 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
         // The outcome of the latest stake. Wins the query if the appeal window lapses unchallenged.
         uint256 lastReportedOutcome;
         // Tips this universe pays out for the query, in wREP: the tips it inherited, copied in at the first touch
-        // of the local record, plus the tips placed here. Paid in full to the first correct reporter, or to the
-        // resolver of an unreported query, and cleared once paid. A forking query's record keeps them: every child
-        // pays them out of the parked balance at its spawn.
+        // of the local record already cut by every fork they crossed (see _carriedTips), plus the tips placed
+        // here. Paid in full to the first correct reporter, or to the resolver of an unreported query, and
+        // cleared once paid. A forking query's record keeps them as tipped: every child pays them at its spawn,
+        // cut by that fork like every other query's tips (see ForkLib._drawTipsAndPayForkReporter).
         uint128 tips;
         // Stake totals and first reporter per outcome.
         mapping(uint256 outcome => OutcomeStakes) outcomes;
@@ -182,10 +184,18 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
         // burned part stays in here; fee splits move neither (per-world duplicated copies). Kept locally:
         // Zoltar's balance would include foreign flows.
         uint128 unmigratedSupply;
-        // Unpaid tips held for this universe's queries, in nominal wREP shares: += at tip, -= when a resolution
-        // pays them out. At a fork the aggregate (minus the forking query's own tips) is copied into EVERY child
-        // at its spawn, like totalQueryFees.
+        // Packed together into one slot; both are REP amounts within uint128.
+        // Unpaid tips this universe holds for its queries, in nominal wREP shares: += at tip, -= when a resolution
+        // pays them out. It always covers the tips its unresolved queries are owed. Rounding at a fork can leave it
+        // a few wei above them: dust that is paid to nobody. Frozen at the universe's fork: all the tips it held
+        // then, the forking query's included.
         uint128 totalTips;
+        // What this universe's fork carries of totalTips into EVERY child: totalTips capped and rounded down to what
+        // a child's vault mints (see ForkLib._capCarriedTips). Zero until the universe forks holding tips.
+        // carriedTips / totalTips is the cut every query's tips took at this fork, the forking query's too. A child
+        // pays the forking query's cut tips to its reporter at spawn and keeps the rest as its own totalTips. Kept
+        // as the amount rather than as a precomputed scale, so the cut rounds only once (see _carriedTips).
+        uint128 carriedTips;
     }
 
     /* ================================================ VARIABLES ================================================ */
@@ -224,7 +234,8 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
     event ChildUniverseSpawned(uint248 indexed parentUniverseId, uint248 indexed childUniverseId, uint256 outcome);
     event StakeClaimed(address indexed reporter, uint248 indexed universeId, uint256 indexed queryId, uint256 payout);
     // The first correct reporter's share of the query fee (`amount`) and the query's tips (`tips`), paid when the
-    // escalation game resolves.
+    // escalation game resolves. For a forking query each child pays it at its spawn, with the tips cut by the
+    // fork like every other query's.
     event ReporterRewardPaid(
         address indexed reporter, uint248 indexed universeId, uint256 indexed queryId, uint256 amount, uint256 tips
     );
@@ -245,6 +256,11 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
     );
     // A tip placed on an unreported query, paid to its first correct reporter (or its resolver if none reports).
     event QueryTipped(address indexed tipper, uint248 indexed universeId, uint256 indexed queryId, uint256 amount);
+    // A fork cut the tips its children carry from `tips` down to `carried`: by the cap, by the rounding to whole
+    // child shares, or both. `tips` is every unpaid tip the universe held, the forking query's included.
+    // `donated` is the amount of the excess above the cap given to the universe's query-token pool: all of it, or
+    // zero if the universe has no query tokens (the excess then stays parked and no child draws it).
+    event TipsCapped(uint248 indexed universeId, uint256 tips, uint256 carried, uint256 donated);
 
     /* ================================================= ERRORS ================================================== */
     error ZeroAddress();
@@ -292,7 +308,7 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
         IZoltar _zoltar,
         uint248 _initialZoltarUniverseId,
         IQueryFeeController _queryFeeController,
-        address _queryTokenizer,
+        IQueryTokenizer _queryTokenizer,
         ITokenDeployer _tokenDeployer,
         IPermit2 _permit2,
         uint256 _migrationDuration,
@@ -303,7 +319,7 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
         REPORTING_PERIOD = _reportingPeriod;
         APPEAL_PERIOD = _appealPeriod;
         QUERY_TOKENIZER = _queryTokenizer;
-        if (QUERY_TOKENIZER == address(0)) revert ZeroAddress();
+        if (address(QUERY_TOKENIZER) == address(0)) revert ZeroAddress();
         TOKEN_DEPLOYER = _tokenDeployer;
         if (address(TOKEN_DEPLOYER) == address(0)) revert ZeroAddress();
         ZOLTAR = _zoltar;
@@ -579,7 +595,7 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
         uint256 fee,
         address creator
     ) external nonReentrant {
-        if (msg.sender != QUERY_TOKENIZER) revert OnlyQueryTokenizer();
+        if (msg.sender != address(QUERY_TOKENIZER)) revert OnlyQueryTokenizer();
         _checkUniverseState(universeId);
 
         if (numberOfOutcomes < MIN_OUTCOMES) revert InvalidNumberOfOutcomes();
@@ -692,7 +708,14 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
             // The second outcome at the cap means two sides each hold 1% of the supply: the query forks.
             if (outcomesAtCap == 2) {
                 ForkLib.forkLituusUniverse(
-                    universes, queries, queryResolutions, ZOLTAR, ZOLTAR_QUESTION_DATA, universeId, queryId
+                    universes,
+                    queries,
+                    queryResolutions,
+                    ZOLTAR,
+                    ZOLTAR_QUESTION_DATA,
+                    QUERY_TOKENIZER,
+                    universeId,
+                    queryId
                 );
             }
         }
@@ -777,7 +800,9 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
         // natively in the meantime, mirror that fork now, in this same tx, right after the resolution.
         if (ZOLTAR.getForkTime(universeId) != 0) {
             // queryCount++ passes the current count as the new query's id, then advances it before the library runs.
-            ForkLib.mirrorZoltarFork(universes, queries, queryResolutions, ZOLTAR, universeId, queryCount++);
+            ForkLib.mirrorZoltarFork(
+                universes, queries, queryResolutions, ZOLTAR, QUERY_TOKENIZER, universeId, queryCount++
+            );
         }
     }
 
@@ -789,6 +814,11 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
      *      resolver if the query expires unreported and resolves INVALID. An inherited query carries the
      *      tips placed in its ancestors (copied into the local record at its first touch) and can be tipped
      *      again here while it has no report in this universe; those tips stay local to this universe.
+     *      A fork carries the tips of its queries into every child only up to 0.1% of the universe's wREP supply
+     *      in total, the tips of the query it forks on included: above that each is cut by the same ratio and
+     *      the excess goes to the universe's query-token pool (see ForkLib._capCarriedTips). Under the cap a
+     *      carried tip can still lose a wei at a fork, to rounding. Each child pays the forking query's cut tips
+     *      to the first reporter of its outcome at its spawn.
      * @param universeId The universe to tip in.
      * @param queryId The query being tipped.
      * @param amount The tip, in the universe's wREP.
@@ -1024,8 +1054,8 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
     }
 
     /**
-     * @notice Returns the tips a query pays out in a given universe: the tips inherited from its lineage plus
-     *         the tips placed there.
+     * @notice Returns the tips a query pays out in a given universe: the tips inherited from its lineage, after
+     *         the cuts of the forks they crossed, plus the tips placed there.
      * @dev Only an Active universe pays tips: a forked one pays them in its children, so it reads zero. Zero
      *      too once the query is resolved along the universe's lineage. Reverts if the universe does not exist,
      *      the query does not exist, or the (Active) universe did not inherit the query.
@@ -1402,7 +1432,9 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
      */
     function mirrorZoltarFork(uint248 universeId) external nonReentrant {
         // queryCount++ passes the current count as the new query's id, then advances it before the library runs.
-        ForkLib.mirrorZoltarFork(universes, queries, queryResolutions, ZOLTAR, universeId, queryCount++);
+        ForkLib.mirrorZoltarFork(
+            universes, queries, queryResolutions, ZOLTAR, QUERY_TOKENIZER, universeId, queryCount++
+        );
     }
 
     /* =========================================== INTERNAL HELPERS ============================================== */
@@ -1427,7 +1459,9 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
      *        above it needs checking: an ancestor resolves a query only before it forks, so any record below it
      *        was created later — rejected by this same check, or created resolved (a forking query's spawn).
      *      - The record is open: the query was inherited, and its tips are complete — every record copies its
-     *        inherited tips at its first touch, and an ancestor is frozen once it forks.
+     *        inherited tips at its first touch, and an ancestor is frozen once it forks. They reach this universe
+     *        cut by every fork between the record and here that carried less than its whole tip aggregate (see
+     *        _carriedTips).
      *      - No record up to the genesis: the query was not inherited (QueryNotInherited).
      *      The reportable time is the parent's forkTime: the moment of the fork that carried the query in. Every
      *      unresolved query restarts here with a full window at the fork, whatever state its ancestor record was
@@ -1435,8 +1469,8 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
      * @param universeId The (Active) universe the query is being acted on in.
      * @param queryId The query in question.
      * @return queryCreateTime The timestamp the query became reportable in this universe.
-     * @return inheritedTips The tips inherited from the lineage; zero when the local record already exists (it
-     *         holds its own, which the caller reads from the record).
+     * @return inheritedTips The tips inherited from the lineage, after the forks' cuts; zero when the local record
+     *         already exists (it holds its own, which the caller reads from the record).
      */
     function _inheritedQueryProperties(uint248 universeId, uint256 queryId)
         internal
@@ -1453,11 +1487,48 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
             QueryResolution storage ancestorResolution = queryResolutions[currentId][queryId];
             if (ancestorResolution.queryCreateTime != 0) {
                 if (ancestorResolution.outcome != UNRESOLVED) revert QueryAlreadyResolved();
-                return (universes[parentId].forkTime, ancestorResolution.tips);
+                uint256 tips = ancestorResolution.tips;
+                // What reaches this universe of the record's tips: at most the record's tips, within uint128.
+                // forge-lint: disable-next-line(unsafe-typecast)
+                if (tips != 0) inheritedTips = uint128(_carriedTips(parentId, currentId, tips));
+                return (universes[parentId].forkTime, inheritedTips);
             }
             // Every parent chain terminates at the genesis.
             if (currentId == GENESIS_UNIVERSE_ID) revert QueryNotInherited();
             currentId = universes[currentId].parent;
         }
+    }
+
+    /**
+     * @notice Returns what the children of a forked universe carry of tips recorded in it or in one of its
+     *         ancestors.
+     * @dev The tips crossed the fork of every universe from the record holder down to `universeId`. Each fork
+     *      carried carriedTips of the totalTips it held: the cap can take a part, and rounding the aggregate down
+     *      to what a child's vault mints for it can take a wei (see ForkLib._capCarriedTips). Each open query's
+     *      tips are cut by that same ratio, carriedTips / totalTips, rounded down (MultiverseHelpers._cutTips),
+     *      as the forking query's were at spawn. So a query never gets more than
+     *      its exact share of the aggregate its child starts with, and loses less than a wei to the rounding of
+     *      a cut. The tips owed in a child therefore never add up to more than its aggregate: what the rounding
+     *      takes off the queries stays there as dust, and no payout runs short. A fork that carried its whole
+     *      aggregate cuts nothing (carriedTips == totalTips, zero included). The cuts apply in the order the forks
+     *      happened. Rounding makes the order matter by a wei, and this order gives a descendant the same amount
+     *      whether or not a universe in between touched the query (its record then holds the tips cut so far).
+     *      The cut is the ratio of the two stored amounts, applied in one mulDiv, rather than a fixed-point scale
+     *      stored at the fork (carriedTips * 1e18 / totalTips). Such a scale is rounded down when it is stored and the
+     *      product is rounded again when it is applied, and the first rounding is multiplied by the tips: a
+     *      query would lose up to a wei per whole REP of its tips at every cut. The ratio rounds once, so the
+     *      loss stays under a wei per cut whatever the size. It also needs no scale constant, and a fork with
+     *      no tips stores nothing, where a scale would be written at every fork. The price is about a hundred
+     *      gas more per cut than multiplying by a stored scale, paid once at a query's first touch in a universe.
+     * @param universeId The forked universe whose children carry the tips.
+     * @param recordHolderId The universe holding the record: `universeId` or one of its ancestors.
+     * @param tips The record's tips.
+     * @return The tips carried into the children of `universeId`.
+     */
+    function _carriedTips(uint248 universeId, uint248 recordHolderId, uint256 tips) internal view returns (uint256) {
+        Universe storage universe = universes[universeId];
+        // The earlier forks first: climb to the record holder, then cut on the way back down.
+        if (universeId != recordHolderId) tips = _carriedTips(universe.parent, recordHolderId, tips);
+        return MultiverseHelpers._cutTips(tips, universe.carriedTips, universe.totalTips);
     }
 }

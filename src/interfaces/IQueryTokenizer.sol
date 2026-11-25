@@ -67,6 +67,24 @@ interface IQueryTokenizer {
     /// @param amount Number of whole query rights to migrate.
     function migrate(uint248 parentUniverseId, uint256 childOutcome, uint256 amount) external;
 
+    /// @notice Offers `amount` of a universe's Lituus REP to its pool without minting tokens, raising the pool's
+    ///         per-token average. Called by the Multiverse in a fork tx with the excess of the tips the
+    ///         universe's children may not carry (see Multiverse.TipsCapped).
+    /// @dev The pool takes the donation only if the universe's QueryToken exists with at least one whole token
+    ///      outstanding: REP donated to a pool without tokens could never leave it. The donation leaves the
+    ///      forked universe with the tokens, through migrate: a counted migration into one child per token.
+    ///      One call both answers and books, so the fork asks only once:
+    ///      - true: the pool is already credited with `amount`. The Multiverse must transfer exactly `amount`
+    ///        of the universe's Lituus REP to this contract right after, in the same transaction, so the pool
+    ///        matches the balance again before anything else can read either.
+    ///      - false: nothing was booked and nothing is expected. The Multiverse keeps the REP.
+    ///      Reverts with NotMultiverse for any other caller: only the Multiverse is trusted to follow a credit
+    ///      with the transfer.
+    /// @param universeId The universe whose pool is offered the REP.
+    /// @param amount The Lituus REP offered.
+    /// @return accepted Whether the pool took the donation and now expects the transfer.
+    function donateRep(uint248 universeId, uint256 amount) external returns (bool accepted);
+
     /* =============================================== VIEW FUNCTIONS ============================================ */
 
     /// @notice The universe's QueryToken ERC20.
@@ -74,8 +92,9 @@ interface IQueryTokenizer {
     function token(uint248 universeId) external view returns (IQueryToken);
 
     /// @notice The Lituus REP pooled in the universe, backing its outstanding query tokens.
-    /// @dev Grows by the full mint cost on each mint and by what a migration brings in from the parent;
-    ///      shrinks by the per-token average on each redemption and by the migrated tokens' share on each
-    ///      migration out, so only mints (at new fees) and arrivals from a parent move the average.
+    /// @dev Grows by the full mint cost on each mint, by what a migration brings in from the parent and by a
+    ///      fork's donation; shrinks by the per-token average on each redemption and by the migrated tokens'
+    ///      share on each migration out, so only mints (at new fees), arrivals from a parent and a donation
+    ///      move the average.
     function pooledRep(uint248 universeId) external view returns (uint256);
 }

@@ -100,7 +100,7 @@ contract Deploy is Script {
             zoltar,
             genesisUniverseId,
             queryFeeController,
-            address(queryTokenizer),
+            queryTokenizer,
             tokenDeployer,
             permit2,
             MIGRATION_DURATION,

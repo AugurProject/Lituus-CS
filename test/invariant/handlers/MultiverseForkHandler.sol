@@ -10,6 +10,7 @@ import { QueryTokenizer } from "src/QueryTokenizer.sol";
 import { ILituusRep } from "src/interfaces/ILituusRep.sol";
 import { IQueryToken } from "src/interfaces/IQueryToken.sol";
 import { MockZoltar } from "src/mock/MockZoltar.sol";
+import { UniverseReader, UniverseView } from "../../utils/UniverseReader.sol";
 
 /// @notice Handler for stateful fuzzing of a forked universe: spawning children, migrating wallet wREP and
 ///         query tokens, settling the forking query's stakes and the other queries' stakes into the children,
@@ -42,6 +43,9 @@ contract MultiverseForkHandler is CommonBase, StdCheats, StdUtils {
     uint256 public immutable OPEN_QUERY_ID;
     // Left unreported and tipped at the fork: its tips carry into every child as the child's tip pool.
     uint256 public immutable TIPPED_QUERY_ID;
+    // What every child carries of that query's tips: the fork cut them, with the forking query's, by the ratio of
+    // what it carried to what it held.
+    uint256 public immutable CARRIED_TIP;
     uint256 public constant INVALID_OUTCOME = type(uint256).max;
 
     address[] internal actors;
@@ -89,6 +93,7 @@ contract MultiverseForkHandler is CommonBase, StdCheats, StdUtils {
         uint256 resolvedQueryId_,
         uint256 openQueryId_,
         uint256 tippedQueryId_,
+        uint256 carriedTip_,
         address[] memory actors_
     ) {
         MULTIVERSE = multiverse_;
@@ -100,6 +105,7 @@ contract MultiverseForkHandler is CommonBase, StdCheats, StdUtils {
         RESOLVED_QUERY_ID = resolvedQueryId_;
         OPEN_QUERY_ID = openQueryId_;
         TIPPED_QUERY_ID = tippedQueryId_;
+        CARRIED_TIP = carriedTip_;
         actors = actors_;
         outcomes = [1, 2, 3, INVALID_OUTCOME];
         ghostNow = block.timestamp;
@@ -125,8 +131,8 @@ contract MultiverseForkHandler is CommonBase, StdCheats, StdUtils {
         return ZOLTAR.getChildUniverseId(GENESIS_UID, outcome);
     }
 
-    function _forkTime() internal view returns (uint48 forkTime) {
-        (,, forkTime,,,,,,,,,,,) = MULTIVERSE.universes(GENESIS_UID);
+    function _forkTime() internal view returns (uint48) {
+        return UniverseReader.read(MULTIVERSE, GENESIS_UID).forkTime;
     }
 
     /// @dev The genesis has no parent, so its migration window is exactly MIGRATION_DURATION from the fork.
@@ -146,12 +152,14 @@ contract MultiverseForkHandler is CommonBase, StdCheats, StdUtils {
     }
 
     /// @dev The tips a query holds in a universe's record, in that universe's shares.
-    function _recordTips(uint248 universeId, uint256 queryId) internal view returns (uint128 tips) {
-        (,,,,,,,,, tips) = MULTIVERSE.queryResolutions(universeId, queryId);
+    /// @dev The forking query's tips cut by the genesis fork: what every child pays its reporter.
+    function _forkTipsCarried() internal view returns (uint256) {
+        UniverseView memory genesis = UniverseReader.read(MULTIVERSE, GENESIS_UID);
+        return uint256(_recordTips(GENESIS_UID, FORK_QUERY_ID)) * genesis.carriedTips / genesis.totalTips;
     }
 
-    function _totalTips(uint248 universeId) internal view returns (uint128 totalTips) {
-        (,,,,,,,,,,,,, totalTips) = MULTIVERSE.universes(universeId);
+    function _recordTips(uint248 universeId, uint256 queryId) internal view returns (uint128 tips) {
+        (,,,,,,,,, tips) = MULTIVERSE.queryResolutions(universeId, queryId);
     }
 
     /// @dev The fee share the forking query's first reporter of `outcome` earned: the ramp over the reporting
@@ -167,9 +175,9 @@ contract MultiverseForkHandler is CommonBase, StdCheats, StdUtils {
 
     /// @notice Spawn the child of a random outcome. No-ops once spawned, after the window, or after
     ///         the fork resolved.
-    /// @dev    The spawn pays the forking query's first reporter of the outcome its fee share and the full tips,
-    ///         drawn fresh from the parked balance (nobody, for an outcome nobody staked on), and copies the
-    ///         parent's tip pool, which holds only the carried query's tips, into the child.
+    /// @dev    The spawn draws the tips the parent carries, pays the forking query's first reporter of the
+    ///         outcome its fee share and its cut tips (nobody, for an outcome nobody staked on), and keeps the
+    ///         rest as the child's tip pool.
     function spawn(uint256 outcomeSeed) external {
         uint256 outcome = outcomes[bound(outcomeSeed, 0, outcomes.length - 1)];
         if (ghostSpawned[outcome] || ghostResolved || !_windowOpen()) return;
@@ -182,13 +190,17 @@ contract MultiverseForkHandler is CommonBase, StdCheats, StdUtils {
         address reporter = MULTIVERSE.getOutcomeStakes(GENESIS_UID, FORK_QUERY_ID, outcome).firstReporter;
         if (reporter != address(0)) {
             // A brand-new vault: the reporter's whole balance is the spawn payout.
-            uint256 expected =
-                _childSharesFor(childRep, _forkReporterFeeShare(outcome) + _recordTips(GENESIS_UID, FORK_QUERY_ID));
-            require(childRep.balanceOf(reporter) == expected, "spawn: fork reporter paid other than fee share + tips");
+            // The tips exact, the fee share rounded down: one draw for both can mint a wei more of the fee share.
+            uint256 expected = _childSharesFor(childRep, _forkReporterFeeShare(outcome)) + _forkTipsCarried();
+            uint256 paid = childRep.balanceOf(reporter);
+            require(paid >= expected && paid <= expected + 1, "spawn: fork reporter paid other than fee share + tips");
         }
 
-        uint256 copied = _totalTips(childId);
-        require(copied <= _totalTips(GENESIS_UID), "spawn: child tip pool above the parent's");
+        uint256 copied = UniverseReader.read(MULTIVERSE, childId).totalTips;
+        require(
+            copied == UniverseReader.read(MULTIVERSE, GENESIS_UID).carriedTips - _forkTipsCarried(),
+            "spawn: child tip pool differs from what the parent carries less the forking query's tips"
+        );
         ghostTipsCopied[outcome] = copied;
     }
 
@@ -218,7 +230,8 @@ contract MultiverseForkHandler is CommonBase, StdCheats, StdUtils {
     /// @notice Place the carried query's first report in a random spawned child, as a random actor holding that
     ///         child's wREP, on a random outcome. No-ops once reported or resolved there, after its window there
     ///         closed, or when the actor cannot afford the stake. The report must keep the record's tips: the
-    ///         carried ones plus those placed there, whether a tip anchored the record first or this report does.
+    ///         carried ones (the parent's, cut at the fork) plus those placed there, whether a tip anchored the
+    ///         record first or this report does.
     function reportTippedInChild(uint256 actorSeed, uint256 outcomeSeed, uint256 choiceSeed) external {
         uint256 outcome = outcomes[bound(outcomeSeed, 0, outcomes.length - 1)];
         if (!ghostSpawned[outcome] || ghostTippedResolved[outcome]) return;
@@ -237,8 +250,7 @@ contract MultiverseForkHandler is CommonBase, StdCheats, StdUtils {
         vm.stopPrank();
 
         require(
-            _recordTips(childId, TIPPED_QUERY_ID)
-                == _recordTips(GENESIS_UID, TIPPED_QUERY_ID) + ghostChildTips[outcome],
+            _recordTips(childId, TIPPED_QUERY_ID) == CARRIED_TIP + ghostChildTips[outcome],
             "reportTippedInChild: record lost tips"
         );
         ghostChildReporter[outcome] = actor;
@@ -250,7 +262,8 @@ contract MultiverseForkHandler is CommonBase, StdCheats, StdUtils {
     ///         window passed, the sole reporter gets the stake back, the fee share ramped from the query's clock
     ///         to the report, and every tip the child pays (the carried ones and those placed there); the
     ///         resolver gets nothing. Unreported: once the window expired, it resolves INVALID and the resolver
-    ///         gets the fee share ramped from the deadline plus every tip.
+    ///         gets the fee share ramped from the deadline plus every tip. The tips are paid in full out of the
+    ///         child's tip pool, which holds exactly them.
     function resolveTippedInChild(uint256 actorSeed, uint256 outcomeSeed) external {
         uint256 outcome = outcomes[bound(outcomeSeed, 0, outcomes.length - 1)];
         if (!ghostSpawned[outcome] || ghostTippedResolved[outcome]) return;
@@ -269,7 +282,7 @@ contract MultiverseForkHandler is CommonBase, StdCheats, StdUtils {
         (,, uint256 fee,,) = MULTIVERSE.queries(TIPPED_QUERY_ID);
         uint256 elapsed = reporter == address(0) ? ghostNow - (clock + period) : ghostChildReportTime[outcome] - clock;
         uint256 feeShare = elapsed >= period ? fee : fee * elapsed / period;
-        uint256 tips = _recordTips(GENESIS_UID, TIPPED_QUERY_ID) + ghostChildTips[outcome];
+        uint256 tips = CARRIED_TIP + ghostChildTips[outcome];
         address recipient = reporter == address(0) ? actor : reporter;
         uint256 expected = feeShare + tips + (reporter == address(0) ? 0 : ghostChildStake[outcome]);
 
@@ -282,6 +295,11 @@ contract MultiverseForkHandler is CommonBase, StdCheats, StdUtils {
         if (actor != recipient) {
             require(childRep.balanceOf(actor) == actorBefore, "resolveTippedInChild: resolver paid");
         }
+        // Only the rounding dust of the fork's cuts stays.
+        require(
+            UniverseReader.read(MULTIVERSE, childId).totalTips == ghostTipsCopied[outcome] - CARRIED_TIP,
+            "resolveTippedInChild: tip pool not emptied"
+        );
         ghostTippedResolved[outcome] = true;
     }
 
@@ -492,6 +510,6 @@ contract MultiverseForkHandler is CommonBase, StdCheats, StdUtils {
         MULTIVERSE.advanceForkState(GENESIS_UID);
 
         ghostResolved = true;
-        (,,,,, ghostWinner,,,,,,,,) = MULTIVERSE.universes(GENESIS_UID);
+        ghostWinner = UniverseReader.read(MULTIVERSE, GENESIS_UID).favoriteChild;
     }
 }

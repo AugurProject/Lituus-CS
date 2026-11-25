@@ -5,6 +5,7 @@ import { Multiverse } from "src/Multiverse.sol";
 import { ILituusRep } from "src/interfaces/ILituusRep.sol";
 import { MockERC20 } from "src/mock/MockERC20.sol";
 import { MultiverseFixtures } from "./Multiverse.fixtures.sol";
+import { UniverseView } from "../utils/UniverseReader.sol";
 
 /// @notice Mirroring native Zoltar forks (mirror-by-id): the entry points (auto-mirror in resolve(), the
 ///         explicit mirrorZoltarFork), lazy spawn keyed by Zoltar answer, migration and settlement, and the
@@ -13,35 +14,8 @@ import { MultiverseFixtures } from "./Multiverse.fixtures.sol";
 contract MultiverseZoltarForkTest is MultiverseFixtures {
     uint256 internal constant ZOLTAR_INVALID = 0;
 
-    struct UniverseView {
-        Multiverse.UniverseState state;
-        uint48 forkTime;
-        bool isCanonical;
-        uint248 parent;
-        uint248 favoriteChild;
-        bool isLituusFork;
-        uint128 forkQuery;
-        uint128 totalQueryFees;
-        uint128 unmigratedSupply;
-    }
-
-    function _universe(uint248 universeId) internal view returns (UniverseView memory u) {
-        (
-            ,
-            u.state,
-            u.forkTime,
-            u.isCanonical,
-            u.parent,
-            u.favoriteChild,
-            u.isLituusFork,,,
-            u.forkQuery,,
-            u.totalQueryFees,
-            u.unmigratedSupply,
-        ) = multiverse.universes(universeId);
-    }
-
-    function _repOf(uint248 universeId) internal view returns (ILituusRep repToken) {
-        (repToken,,,,,,,,,,,,,) = multiverse.universes(universeId);
+    function _repOf(uint248 universeId) internal view returns (ILituusRep) {
+        return _universe(universeId).repToken;
     }
 
     function _childId(uint256 outcome) internal view returns (uint248) {
@@ -65,7 +39,7 @@ contract MultiverseZoltarForkTest is MultiverseFixtures {
     ///      mirror itself (`feesExpected` is what the caller expects it to read).
     function _assertMirrored(uint256 zoltarQuestionId, uint256 potExpected, uint128 feesExpected) internal view {
         UniverseView memory u = _universe(GENESIS_UID);
-        assertEq(uint8(u.state), uint8(Multiverse.UniverseState.Migration));
+        assertEq(uint8(u.universeState), uint8(Multiverse.UniverseState.Migration));
         assertEq(u.forkTime, uint48(vm.getBlockTimestamp()));
         assertFalse(u.isLituusFork);
         assertEq(u.forkQuery, multiverse.queryCount() - 1);
@@ -93,7 +67,7 @@ contract MultiverseZoltarForkTest is MultiverseFixtures {
         uint256 zq = _createZoltarCategoricalQuestion(3);
         _forkZoltarNatively(zq);
         // Zoltar forked, nothing touched the Lituus universe yet: still Active.
-        assertEq(uint8(_universe(GENESIS_UID).state), uint8(Multiverse.UniverseState.Active));
+        assertEq(uint8(_universe(GENESIS_UID).universeState), uint8(Multiverse.UniverseState.Active));
 
         // Resolve the unreported query past the full resolver ramp: the resolver takes the whole fee out of
         // the vault, nothing is burned, and the rest of the pot is parked by the mirror in the same tx.
@@ -216,7 +190,7 @@ contract MultiverseZoltarForkTest is MultiverseFixtures {
         assertEq(multiverse.getOutcome(_childId(3), forkQuery), 3);
 
         UniverseView memory child = _universe(_childId(3));
-        assertEq(uint8(child.state), uint8(Multiverse.UniverseState.Active));
+        assertEq(uint8(child.universeState), uint8(Multiverse.UniverseState.Active));
         assertEq(child.parent, GENESIS_UID);
         assertFalse(child.isLituusFork);
         // The fee copy funds the child (rate is 1: assets == shares).
@@ -260,7 +234,7 @@ contract MultiverseZoltarForkTest is MultiverseFixtures {
         vm.warp(vm.getBlockTimestamp() + multiverse.MIGRATION_DURATION());
         multiverse.advanceForkState(GENESIS_UID);
 
-        assertEq(uint8(_universe(GENESIS_UID).state), uint8(Multiverse.UniverseState.PostFork));
+        assertEq(uint8(_universe(GENESIS_UID).universeState), uint8(Multiverse.UniverseState.PostFork));
         assertTrue(_universe(_childId(answerB)).isCanonical);
         assertEq(multiverse.canonicalHeir(), _childId(answerB));
         // Settled: the genesis now reads the winner's answer.
@@ -301,7 +275,7 @@ contract MultiverseZoltarForkTest is MultiverseFixtures {
         vm.prank(bystander);
         multiverse.mirrorZoltarFork(child2);
         uint256 forkQuery2 = _universe(child2).forkQuery;
-        assertEq(uint8(_universe(child2).state), uint8(Multiverse.UniverseState.Migration));
+        assertEq(uint8(_universe(child2).universeState), uint8(Multiverse.UniverseState.Migration));
         vm.prank(bystander);
         multiverse.spawnChildUniverse(child2, 1);
         uint248 grandchild = zoltar.getChildUniverseId(child2, 1);
@@ -361,8 +335,8 @@ contract MultiverseZoltarForkTest is MultiverseFixtures {
 
     /* =========================================== RETURN OF STAKES ========================================== */
 
-    function _totalMigratedOut(uint248 universeId) internal view returns (uint128 totalOut) {
-        (,,,,,,,,,, totalOut,,,) = multiverse.universes(universeId);
+    function _totalMigratedOut(uint248 universeId) internal view returns (uint128) {
+        return _universe(universeId).totalMigratedOut;
     }
 
     /// @dev Asserts `staker` got its `parentShares` payout as child wREP: assets at the parent's frozen rate,
@@ -487,7 +461,7 @@ contract MultiverseZoltarForkTest is MultiverseFixtures {
 
         // The grandchild sits on the real Zoltar lineage and answers both fork questions.
         UniverseView memory g = _universe(grandchild);
-        assertEq(uint8(g.state), uint8(Multiverse.UniverseState.Active));
+        assertEq(uint8(g.universeState), uint8(Multiverse.UniverseState.Active));
         assertEq(g.parent, child1);
         assertEq(_universe(child1).parent, GENESIS_UID);
         assertEq(multiverse.getOutcome(grandchild, forkQuery1), 1);

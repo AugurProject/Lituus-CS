@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity ^0.8.35;
 
+import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
+
 import { Multiverse } from "../Multiverse.sol";
 
 /**
@@ -22,6 +24,11 @@ library MultiverseHelpers {
     // This is the divider for the burn depending on losingStakes on a query.
     // If burn ratio is 20% (1/5), then BURN_DIVIDER is 5.
     uint256 internal constant BURN_DIVIDER = 5;
+    // The tips a fork's children carry are capped at this fraction of the forking universe's wREP supply, in
+    // shares: a divisor of 1000 is 0.1%. The cap covers every unpaid tip the universe holds, the forking query's
+    // included. Above it every tip is cut by the same ratio and the excess is donated to the universe's
+    // query-token pool (see ForkLib._capCarriedTips).
+    uint256 internal constant FORK_TIP_CAP_DIVISOR = 1000;
 
     /**
      * @notice Checks that a universe can be operated on directly — it must exist and be Active — and
@@ -41,18 +48,34 @@ library MultiverseHelpers {
         }
     }
 
-    /// @dev Marks a query's fee and tips consumed in this universe's fee and tip aggregates. Saturating: the
-    ///      spawn-time splits round down, so a child's carried aggregates can run short of the nominal sums by
-    ///      dust. An untipped query leaves the tip aggregate's slot untouched.
+    /// @dev Marks a query's fee consumed in this universe's fee aggregate. Saturating: the spawn-time fee split
+    ///      rounds down twice, so a child's carried aggregate can run short of the nominal fee sum by dust.
     // TODO: rewrite the fee accounting so that it correctly handles dust and rounding issues.
-    function _consumeQueryFeeAndTips(Multiverse.Universe storage universe, uint256 fee, uint256 tips) internal {
+    function _consumeQueryFee(Multiverse.Universe storage universe, uint256 fee) internal {
         uint128 totalQueryFees = universe.totalQueryFees;
         // forge-lint: disable-next-line(unsafe-typecast)
         universe.totalQueryFees = fee >= totalQueryFees ? 0 : totalQueryFees - uint128(fee);
+    }
+
+    /// @dev Marks a query's fee and tips consumed in this universe's fee and tip aggregates. A fork rounds the
+    ///      carried tips down together with the aggregate they are paid from (see ForkLib._capCarriedTips), so
+    ///      the tips a universe owes never exceed it, and the subtraction is checked: it reverts if that ever
+    ///      breaks. An untipped query leaves the tip aggregate's slot untouched.
+    function _consumeQueryFeeAndTips(Multiverse.Universe storage universe, uint256 fee, uint256 tips) internal {
+        _consumeQueryFee(universe, fee);
         if (tips == 0) return;
-        uint128 totalTips = universe.totalTips;
+        // Tips are REP amounts within uint128.
         // forge-lint: disable-next-line(unsafe-typecast)
-        universe.totalTips = tips >= totalTips ? 0 : totalTips - uint128(tips);
+        universe.totalTips -= uint128(tips);
+    }
+
+    /// @dev What a fork that carried `carried` of the `held` tips carries of `tips`: the same ratio, rounded down.
+    ///      Every query's tips are cut by it, the forking query's at spawn (see
+    ///      ForkLib._drawTipsAndPayForkReporter) and an open query's where a child reads them (see
+    ///      Multiverse._carriedTips). A fork that carried all it held cuts nothing, zero included.
+    function _cutTips(uint256 tips, uint256 carried, uint256 held) internal pure returns (uint256) {
+        // A fork that carried less than it held did hold tips, so the divisor is nonzero there.
+        return carried == held ? tips : Math.mulDiv(tips, carried, held);
     }
 
     /// @dev A winning stake's payout: the stake itself plus its pro-rata share of the losing stakes after the burn cut.
