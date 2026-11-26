@@ -54,10 +54,15 @@ contract MultiverseNestedForkInvariantTest is MultiverseDeployFixture {
         uint256[3] memory tips = [
             uint256(1.123_456_789_012_345_678 ether), 2.345_678_901_234_567_891 ether, 0.987_654_321_098_765_432 ether
         ];
+        // Their fees are uneven too, so the fee pool's copy rounds at both fork levels.
+        uint256[3] memory fees = [
+            uint256(1.111_111_111_111_111_111 ether), 0.333_333_333_333_333_337 ether, 2.222_222_222_222_222_229 ether
+        ];
         uint256[] memory queryIds = new uint256[](4);
         uint256[] memory clocksInChild1 = new uint256[](4);
         for (uint256 i = 0; i < 3; ++i) {
             queryIds[i] = multiverse.queryCount();
+            feeCtl.setFee(fees[i]);
             vm.prank(actors[0]);
             multiverse.createQuery(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
             vm.prank(actors[1]);
@@ -66,6 +71,7 @@ contract MultiverseNestedForkInvariantTest is MultiverseDeployFixture {
         }
 
         // The genesis forks on a fresh query, in this block: the inherited queries restart here in child1.
+        feeCtl.setFee(DEFAULT_FEE);
         uint256 forkQueryId = multiverse.queryCount();
         vm.prank(actors[0]);
         multiverse.createQuery(GENESIS_UID, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
@@ -84,10 +90,16 @@ contract MultiverseNestedForkInvariantTest is MultiverseDeployFixture {
         assertGt(child1Cap, carriedAtGenesisFork, "fixture: child1's cap must be above the tips it inherited");
         assertLt(child1Cap - carriedAtGenesisFork, 0.01 ether, "fixture: child1's cap must be just above them");
 
-        // One query of child1's own, tracked with the inherited ones.
+        // child1 inherits the three fees less what its copy of the pool lost to rounding: a wei here.
+        assertEq(_universe(child1).totalQueryFees, fees[0] + fees[1] + fees[2] - 1, "fixture: the copy must lose a wei");
+
+        // One query of child1's own, tracked with the inherited ones, and an uneven fee for the query child1
+        // forks on (created by the handler).
         queryIds[3] = multiverse.queryCount();
+        feeCtl.setFee(0.777_777_777_777_777_781 ether);
         vm.prank(actors[0]);
         multiverse.createQuery(child1, DEFAULT_QUESTION, DEFAULT_NUMBER_OF_OUTCOMES);
+        feeCtl.setFee(0.555_555_555_555_555_557 ether);
         for (uint256 i = 0; i < 4; ++i) {
             clocksInChild1[i] = vm.getBlockTimestamp();
         }
@@ -104,8 +116,8 @@ contract MultiverseNestedForkInvariantTest is MultiverseDeployFixture {
     }
 
     /// @dev An Active universe's aggregate covers the tips its queries are owed, exceeds them by no more than
-    ///      `dust`, and is held by the Multiverse next to the fee aggregate and nothing else: the fees here are
-    ///      whole REP, which every copy carries exactly, and nobody stakes on the tracked queries.
+    ///      `dust`, and is held by the Multiverse next to the fee aggregate and nothing else: nobody stakes on the
+    ///      tracked queries, and a resolution never consumes more fee than the aggregate holds.
     function _assertAggregateCoversTheTipsOwed(uint248 universeId, uint256 dust) internal view {
         UniverseView memory universe = _universe(universeId);
         uint256 owed = _tipsOwedIn(universeId);
@@ -116,9 +128,38 @@ contract MultiverseNestedForkInvariantTest is MultiverseDeployFixture {
         );
     }
 
+    /// @dev An Active universe's fee pool is at most the fees of its open tracked queries and short of them by at
+    ///      most `depth` wei: a wei per fork above it, the rounding of the copy. Every open query here is tracked:
+    ///      the forking queries were resolved at the spawns. A resolution consumes at most what the pool holds
+    ///      (MultiverseHelpers._consumeQueryFee), so a pool short by more than rounding would underpay silently:
+    ///      this bound is what turns such a ledger bug into a failure.
+    function _assertFeePoolWithinDepth(uint248 universeId, uint256 depth) internal view {
+        uint256 openFees;
+        for (uint256 i = 0; i < handler.queriesLength(); ++i) {
+            uint256 queryId = handler.queryAt(i);
+            if (multiverse.getOutcome(universeId, queryId) != 0) continue;
+            (,, uint256 fee,,) = multiverse.queries(queryId);
+            openFees += fee;
+        }
+        uint256 pool = _universe(universeId).totalQueryFees;
+        assertLe(pool, openFees);
+        assertLe(openFees - pool, depth);
+    }
+
     /*//////////////////////////////////////////////////////////////
                               INVARIANTS
     //////////////////////////////////////////////////////////////*/
+
+    /// @dev The fee pools stay within a wei per fork level of what their open queries carry: one level down in
+    ///      child1 while it is Active, two in every grandchild.
+    function invariant_FeePoolsShortByAtMostTheForkDepth() public view {
+        if (!handler.ghostChild1Forked()) _assertFeePoolWithinDepth(child1, 1);
+        for (uint256 i = 0; i < handler.outcomesLength(); ++i) {
+            uint256 outcome = handler.outcomeAt(i);
+            if (!handler.ghostSpawned(outcome)) continue;
+            _assertFeePoolWithinDepth(handler.grandchildOf(outcome), 2);
+        }
+    }
 
     /// @dev While child1 is Active, the tips its queries are owed never exceed its aggregate.
     function invariant_Child1AggregateCoversTheTipsOwed() public view {

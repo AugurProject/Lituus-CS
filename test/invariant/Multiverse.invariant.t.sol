@@ -161,6 +161,18 @@ contract MultiverseInvariantTest is MultiverseDeployFixture {
         }
     }
 
+    /// @dev The genesis fee pool is exactly the fees of the queries not resolved yet. A resolution consumes at
+    ///      most what the pool holds (MultiverseHelpers._consumeQueryFee), and only a pool copied through a fork
+    ///      can be short of its fees. In the genesis that clamp must never bind: any gap here is a ledger bug it
+    ///      would hide.
+    function invariant_FeePoolIsTheOpenFees() public view {
+        uint256 openFees;
+        for (uint256 i = 0; i < handler.ghostQueriesCreated(); ++i) {
+            if (!handler.ghostResolved(i)) openFees += handler.ghostQueryFee(i);
+        }
+        assertEq(_universe(GENESIS_UID).totalQueryFees, openFees);
+    }
+
     /// @dev A query is resolved on-chain exactly when the handler resolved it, to the outcome the
     ///      escalation determined (the last reported outcome, or INVALID for an expired unreported
     ///      query), and its creation time never moves after createQuery set it.

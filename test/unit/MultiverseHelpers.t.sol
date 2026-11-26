@@ -16,8 +16,8 @@ contract ConsumeHarness {
         universe.totalTips = totalTips;
     }
 
-    function consume(uint256 fee, uint256 tips) external {
-        MultiverseHelpers._consumeQueryFeeAndTips(universe, fee, tips);
+    function consume(uint256 fee, uint256 tips) external returns (uint256 consumedFee) {
+        return MultiverseHelpers._consumeQueryFeeAndTips(universe, fee, tips);
     }
 
     function aggregates() external view returns (uint128 totalQueryFees, uint128 totalTips) {
@@ -35,16 +35,17 @@ contract MultiverseHelpersTest is Test {
 
     function test_Consume_TakesTheFeeAndTheTipsOffTheAggregates() public {
         harness.setAggregates(5 ether, 3 ether);
-        harness.consume(2 ether, 1 ether);
+        assertEq(harness.consume(2 ether, 1 ether), 2 ether);
         (uint128 totalQueryFees, uint128 totalTips) = harness.aggregates();
         assertEq(totalQueryFees, 3 ether);
         assertEq(totalTips, 2 ether);
     }
 
-    /// @dev A child's fee aggregate can trail the nominal fees by dust, so the fee side stops at zero.
+    /// @dev A child's fee aggregate can be short of the nominal fees by a wei per fork level, so the fee side
+    ///      stops at zero, and the fee consumed, the amount the resolution pays and burns, is what was left.
     function test_Consume_TheFeeSaturatesAtZero() public {
         harness.setAggregates(1 ether, 3 ether);
-        harness.consume(1 ether + 1, 0);
+        assertEq(harness.consume(1 ether + 1, 0), 1 ether);
         (uint128 totalQueryFees, uint128 totalTips) = harness.aggregates();
         assertEq(totalQueryFees, 0);
         assertEq(totalTips, 3 ether);

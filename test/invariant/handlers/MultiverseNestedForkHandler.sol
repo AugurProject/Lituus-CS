@@ -264,14 +264,17 @@ contract MultiverseNestedForkHandler is CommonBase, StdCheats, StdUtils {
         );
     }
 
-    /// @dev Resolves the expired, unreported `queryId` in `universeId` as a random actor: the resolver gets the
-    ///      fee share ramped from the deadline plus every tip the query was owed, in full, out of the aggregate.
+    /// @dev Resolves the expired, unreported `queryId` in `universeId` as a random actor: the query consumes its
+    ///      fee or what the fee pool still holds, whichever is less; the resolver gets the share of that ramped
+    ///      from the deadline plus every tip the query was owed, in full, out of the aggregate.
     function _resolveExpired(uint248 universeId, uint256 actorSeed, uint256 queryId, uint256 deadline) internal {
         ILituusRep repToken = MULTIVERSE.repTokenOf(universeId);
         address actor = actors[bound(actorSeed, 0, actors.length - 1)];
         uint256 tips = MULTIVERSE.getTips(universeId, queryId);
-        uint256 aggregateBefore = UniverseReader.read(MULTIVERSE, universeId).totalTips;
+        UniverseView memory before = UniverseReader.read(MULTIVERSE, universeId);
+        uint256 aggregateBefore = before.totalTips;
         (,, uint256 fee,,) = MULTIVERSE.queries(queryId);
+        if (fee > before.totalQueryFees) fee = before.totalQueryFees;
         uint256 period = MULTIVERSE.REPORTING_PERIOD();
         uint256 elapsed = ghostNow - deadline;
         uint256 feeShare = elapsed >= period ? fee : fee * elapsed / period;
@@ -289,5 +292,9 @@ contract MultiverseNestedForkHandler is CommonBase, StdCheats, StdUtils {
             "resolve: the aggregate did not drop by the tips paid"
         );
         require(MULTIVERSE.getTips(universeId, queryId) == 0, "resolve: tips still owed");
+        require(
+            UniverseReader.read(MULTIVERSE, universeId).totalQueryFees == before.totalQueryFees - fee,
+            "resolve: the fee pool did not drop by the fee consumed"
+        );
     }
 }

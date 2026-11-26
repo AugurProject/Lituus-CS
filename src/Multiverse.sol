@@ -171,9 +171,13 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
         uint128 totalMigratedOut;
         // Packed together into one slot; both are REP amounts within uint128.
         // Unconsumed query fees held for this universe, in nominal wREP shares: += at createQuery,
-        // -= when a resolution consumes the fee (reporter/resolver share + burn). At a fork the
-        // aggregate (minus the forking query's own fee) is split into EVERY child at its spawn,
-        // funding inherited queries' resolutions there; the counter carries recursively.
+        // -= when a resolution consumes the fee (reporter/resolver share + burn). Frozen at the universe's fork,
+        // the forking query's fee included. EVERY child copies it at its spawn less that fee, funding inherited
+        // queries' resolutions there; the counter carries recursively. The child resolves the forking query at
+        // spawn and pays its reporter the ramped share of that fee; the rest is never drawn and stays parked
+        // (see ForkLib._spawnChildUniverse). Each copy can lose a wei to rounding, so a pool can be short by a
+        // wei per fork above it, and a resolution consumes at most what is left
+        // (see MultiverseHelpers._consumeQueryFee).
         uint128 totalQueryFees;
         // The supply for migration at fork, in underlying assets: the contract's entire wREP balance (fees,
         // forking-query stakes, other stakes/winnings) as it stood before the fork, moved into the Zoltar
@@ -758,17 +762,18 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
             // query that was not reported on within the window restarted at the fork.
             resolution.outcome = INVALID;
 
-            // The resolver setting this query to INVALID earns a share of the fee
-            // that ramps from 0 at the reporting deadline to the full fee three days later, then stays
-            // whole with no deadline.
-            uint256 queryFee = queries[queryId].fee;
-            uint256 resolverPay = _timeBasedFeeShare(queryFee, block.timestamp - (queryCreateTime + REPORTING_PERIOD));
-            uint256 profit = queryFee - resolverPay;
             // The tips are the resolver's in full, with no ramp: nobody reported, so nobody else earned them. They
             // are the stored tips, or on a first touch the inherited ones (one of the two is always zero).
             uint128 storedTips = resolution.tips;
             uint128 tips = storedTips + inheritedTips;
-            MultiverseHelpers._consumeQueryFeeAndTips(universe, queryFee, tips);
+            // The fee this universe still holds for the query: the whole fee unless its pool ran short, by at most
+            // a wei per fork above it (see MultiverseHelpers._consumeQueryFee).
+            uint256 queryFee = MultiverseHelpers._consumeQueryFeeAndTips(universe, queries[queryId].fee, tips);
+            // The resolver setting this query to INVALID earns a share of the fee
+            // that ramps from 0 at the reporting deadline to the full fee three days later, then stays
+            // whole with no deadline.
+            uint256 resolverPay = _timeBasedFeeShare(queryFee, block.timestamp - (queryCreateTime + REPORTING_PERIOD));
+            uint256 profit = queryFee - resolverPay;
             // Paid out: clearing the record earns the storage refund (nothing reads a resolved query's tips).
             if (storedTips != 0) resolution.tips = 0;
             emit ResolverRewardPaid(msg.sender, universeId, queryId, resolverPay, tips);
@@ -970,7 +975,11 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
         address reporter = winnerStakes.firstReporter;
         uint48 reportingTimestamp = winnerStakes.firstReportTime;
 
-        uint256 queryFee = queries[queryId].fee;
+        // The tips go to the first correct reporter in full, with no ramp. They are not profit: never burned.
+        uint256 tips = resolution.tips;
+        // The fee this universe still holds for the query: the whole fee unless its pool ran short, by at most a
+        // wei per fork above it (see MultiverseHelpers._consumeQueryFee).
+        uint256 queryFee = MultiverseHelpers._consumeQueryFeeAndTips(universes[universeId], queries[queryId].fee, tips);
         // Per-universe queryCreateTime: createQuery sets it for the origin universe, and the query's first touch
         // in an heir universe (report(), tip() or resolve()) sets it to the parent's forkTime.
         uint48 queryCreateTime = resolution.queryCreateTime;
@@ -982,9 +991,6 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
         uint256 loserBurn = totalLoserStakes / BURN_DIVIDER;
         uint256 profit = loserBurn + (queryFee - reporterPay);
 
-        // The tips go to the first correct reporter in full, with no ramp. They are not profit: never burned.
-        uint256 tips = resolution.tips;
-        MultiverseHelpers._consumeQueryFeeAndTips(universes[universeId], queryFee, tips);
         // Paid out: clearing the record earns the storage refund (nothing reads a resolved query's tips).
         if (tips != 0) resolution.tips = 0;
 

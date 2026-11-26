@@ -77,13 +77,11 @@ library ForkLib {
         uint256 zoltarQueryId = zoltarQuestionData.createQuestion(questionData, outcomes);
         if (zoltarQueryId == 0) revert Multiverse.ZoltarQueryCreationFailed();
 
-        // The forking query's fee leaves the fee aggregate so the children don't inherit it as a pool. Each child
-        // pays the share earned to the first reporter of its own outcome when it spawns (see
-        // _drawTipsAndPayForkReporter).
-        MultiverseHelpers._consumeQueryFee(universe, query.fee);
-        // The forking query's tips stay in the tip aggregate: the cap covers them with the open queries' tips,
-        // and each child pays them to its reporter out of the tips it carries. This runs before the pot is
-        // unwrapped, so the cap is measured against the whole wREP supply and the excess can still be donated in
+        // The forking query's fee and tips stay in the aggregates. Each child takes the fee out of the fee pool it
+        // copies at its spawn and pays the share earned to the first reporter of its own outcome (see
+        // _spawnChildUniverse). The tips cap covers the forking query's tips with the open queries' tips, and
+        // each child pays them to its reporter out of the tips it carries. The cap runs before the pot is
+        // unwrapped, so it is measured against the whole wREP supply and the excess can still be donated in
         // wREP.
         _capCarriedTips(queryTokenizer, universeId, universe);
 
@@ -426,19 +424,29 @@ library ForkLib {
         childUniverse.forkTime = 0;
         childUniverse.parent = universeId;
 
-        // Fund the child with the parent's whole fee aggregate: split from the parked migration
-        // balance (a full copy per child — Zoltar's per-child escrow makes the duplication legal)
-        // and wrap into the child vault. This backs the resolutions of EVERY query the child
-        // inherits; the carried counter re-parks if the child itself forks later. Deliberately NOT
-        // counted in totalMigratedIn/totalMigratedOut/max: fees duplicate per child and are not
-        // single-spend voting capital — totalQueryFees is their ledger. An aggregate of a single wei stays parked
-        // (see _moveParkedSharesAtSpawn).
-        uint256 feeShares = _moveParkedSharesAtSpawn(
-            zoltar, universeId, parentUniverse.repToken, childUniverseRepToken, outcome, parentUniverse.totalQueryFees
-        );
-        // Share amounts are REP amounts within uint128.
-        // forge-lint: disable-next-line(unsafe-typecast)
-        if (feeShares != 0) childUniverse.totalQueryFees = uint128(feeShares);
+        // Fund the child with the parent's fee aggregate: split from the parked migration balance (a full copy
+        // per child — Zoltar's per-child escrow makes the duplication legal) and wrap into the child vault. This
+        // backs the resolutions of EVERY query the child inherits; the carried counter re-parks if the child
+        // itself forks later. Deliberately NOT counted in totalMigratedIn/totalMigratedOut/max: fees duplicate
+        // per child and are not single-spend voting capital — totalQueryFees is their ledger.
+        // The forking query is resolved in the child here, so its fee is consumed here, like any resolution
+        // consumes a fee: at most what the aggregate holds (see MultiverseHelpers._consumeQueryFee). The rest is
+        // the child's aggregate. The copy rounds down through the rate, so it can come out a wei short; an
+        // aggregate of a single wei stays parked (see _moveParkedSharesAtSpawn).
+        uint256 forkQueryFee;
+        {
+            uint256 parentFees = parentUniverse.totalQueryFees;
+            if (parentUniverse.isLituusFork) {
+                forkQueryFee = queries[queryId].fee;
+                if (forkQueryFee > parentFees) forkQueryFee = parentFees;
+            }
+            uint256 feeShares = _moveParkedSharesAtSpawn(
+                zoltar, universeId, parentUniverse.repToken, childUniverseRepToken, outcome, parentFees - forkQueryFee
+            );
+            // Share amounts are REP amounts within uint128.
+            // forge-lint: disable-next-line(unsafe-typecast)
+            if (feeShares != 0) childUniverse.totalQueryFees = uint128(feeShares);
+        }
 
         // Every child resolves the forking query to its own outcome; descendants inherit it via the
         // ancestor walk
@@ -455,7 +463,6 @@ library ForkLib {
         // tips and pays nobody. The stakes are claimed through migrateStake.
         _drawTipsAndPayForkReporter(
             universes,
-            queries,
             queryResolutions,
             zoltar,
             reportingPeriod,
@@ -463,7 +470,8 @@ library ForkLib {
             childUniverseId,
             childUniverseRepToken,
             queryId,
-            outcome
+            outcome,
+            forkQueryFee
         );
     }
 
@@ -511,21 +519,28 @@ library ForkLib {
     ///      out of that amount, the way any resolution pays tips out of totalTips. They are cut by the fork's
     ///      ratio like every other query's (see MultiverseHelpers._cutTips) and go to the parent's first reporter
     ///      of `outcome`. What is left is the child's own totalTips, the ledger of its open queries' tips.
-    ///      Fee: that reporter also earned the forking query's fee ramp in the child. The unpaid part of the fee
-    ///      is never drawn, so it is effectively burned in the child.
+    ///      Fee: that reporter also earned the forking query's fee ramp in the child, measured on `forkQueryFee`,
+    ///      the fee the spawn took out of the parent's fee aggregate: the whole fee unless the aggregate ran
+    ///      short, by at most a wei per fork above the parent. The unpaid part of the fee is never drawn: it stays
+    ///      parked.
     ///      If nobody staked on `outcome`, nothing is owed: the forking query's tips and fee are not drawn and
     ///      stay parked. A mirrored fork has no forking query with stakes: its child keeps all the carried tips.
     function _drawTipsAndPayForkReporter(
         mapping(uint248 universeId => Multiverse.Universe) storage universes,
-        mapping(uint256 queryId => Multiverse.Query) storage queries,
-        mapping(uint248 universeId => mapping(uint256 queryId => Multiverse.QueryResolution)) storage queryResolutions,
+        mapping(
+            uint248 universeId
+                => mapping(
+                uint256 queryId => Multiverse.QueryResolution
+            )
+        ) storage queryResolutions,
         IZoltar zoltar,
         uint256 reportingPeriod,
         uint248 universeId,
         uint248 childUniverseId,
         ILituusRep childRepToken,
         uint256 queryId,
-        uint256 outcome
+        uint256 outcome,
+        uint256 forkQueryFee
     ) private {
         Multiverse.Universe storage parentUniverse = universes[universeId];
 
@@ -546,7 +561,7 @@ library ForkLib {
             if (reporter != address(0)) {
                 // Ramps to the full fee over the reporting window, like the non-fork resolution.
                 feeShare = MultiverseHelpers._timeBasedFeeShare(
-                    queries[queryId].fee, winnerStakes.firstReportTime - resolution.queryCreateTime, reportingPeriod
+                    forkQueryFee, winnerStakes.firstReportTime - resolution.queryCreateTime, reportingPeriod
                 );
             }
         }

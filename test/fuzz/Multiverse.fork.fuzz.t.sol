@@ -180,7 +180,7 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
         uint256 principalClaimed = _claimEveryStakeInEveryChild(queryId, staked);
         assertEq(principalClaimed, totalStaked);
 
-        // Every child drew its own winners' payouts (no fee copy: the forking query's fee is excluded),
+        // Every child drew its own winners' payouts (no fee copy: the forking query's fee is left out of it),
         // which never add up to the parked balance.
         for (uint256 o = 0; o < outcomes.length; o++) {
             assertLe(zoltar.splitPerChild(address(multiverse), GENESIS_UID, outcomes[o]), parked);
@@ -256,7 +256,7 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
             multiverse.spawnChildUniverse(GENESIS_UID, outcomes[o]);
             ILituusRep childRep = multiverse.repTokenOf(_childId(GENESIS_UID, outcomes[o]));
             if (side.firstReporter == address(0)) {
-                // Nothing drawn for this child: no fee copy (the forking query's fee is excluded) and
+                // Nothing drawn for this child: no fee copy (the forking query's fee is left out of it) and
                 // no reporter.
                 assertEq(childRep.totalAssets(), 0);
                 continue;
@@ -544,7 +544,8 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
         uint256 childPool = carried - forkCut;
         (,, uint256 fee,,) = multiverse.queries(forkQueryId);
         uint256 feeShare = fee * delay / multiverse.REPORTING_PERIOD();
-        uint256 feePool = _universe(GENESIS_UID).totalQueryFees;
+        // The child copies the fee aggregate less the forking query's fee, which goes to its reporter.
+        uint256 feePool = _universe(GENESIS_UID).totalQueryFees - fee;
 
         uint256[3] memory childOutcomes = [OUTCOME_A, OUTCOME_B, INVALID_OUTCOME];
         address[3] memory firstReporters = [user, reporter, address(0)];
@@ -585,5 +586,144 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
             assertEq(childRep.balanceOf(resolver) - before, openFee + openCut);
             assertEq(_universe(child).totalTips, childPool - openCut);
         }
+    }
+
+    /// @dev The fees `universeId` still owes: those of the `count` queries in `queryIds` it has not resolved.
+    function _openFees(uint248 universeId, uint256[3] memory queryIds, uint256 count)
+        internal
+        view
+        returns (uint256 owed)
+    {
+        for (uint256 i = 0; i < count; i++) {
+            if (multiverse.getOutcome(universeId, queryIds[i]) != 0) continue;
+            (,, uint256 fee,,) = multiverse.queries(queryIds[i]);
+            owed += fee;
+        }
+    }
+
+    /// @dev The fee pool of `universeId` is at most the fees its open queries carry and short of them by at most
+    ///      `depth` wei: a wei per fork above it, the rounding of the copy. A pool short by more is a ledger bug
+    ///      the clamp would hide.
+    function _assertFeePoolWithinDepth(uint248 universeId, uint256[3] memory queryIds, uint256 count, uint256 depth)
+        internal
+        view
+    {
+        uint256 owed = _openFees(universeId, queryIds, count);
+        uint256 pool = _universe(universeId).totalQueryFees;
+        assertLe(pool, owed);
+        assertLe(owed - pool, depth);
+    }
+
+    /// @dev Property: fee pools copied through two forks at any two rates run short by at most a wei per fork, and
+    /// every query still resolves, consuming the fee or what is left of the pool.
+    /// - Up to three queries with uneven fees; the genesis forks on a fresh query, the child on one of them or on a
+    ///   fresh one of its own, at a random delay, so its reporter earns part of the fee or all of it.
+    /// - In the child and the grandchild: pool <= open fees <= pool + fork depth.
+    /// - The child's forking reporter is paid the ramp on the fee the spawn takes out of the child's pool: the fee,
+    ///   or the pool if that is less. Both stake claims into the grandchildren succeed without drawing past the
+    ///   parked balance.
+    /// - In the grandchild every query resolves, some reported and some not, in a random order; each consumes the
+    ///   fee or the rest of the pool, whichever is less. The pool ends empty and the Multiverse holds nothing
+    ///   there.
+    function testFuzz_FeePool_ShortChildsPayWhatTheyHold(
+        uint256[3] memory feeSeeds,
+        uint256 countSeed,
+        uint256 burnSeed,
+        uint256 childBurnSeed,
+        bool forkOnOpenQuery,
+        uint256 delaySeed,
+        uint256 orderSeed,
+        uint8 reportMask
+    ) public {
+        _burnShares(genesisRep, user, bound(burnSeed, MIN_RATE_BURN, MAX_TIP_RATE_BURN));
+        uint256 count = bound(countSeed, 1, 3);
+        uint256[3] memory queryIds;
+        for (uint256 i = 0; i < count; i++) {
+            feeCtl.setFee(bound(feeSeeds[i], 2, 2 ether));
+            queryIds[i] = _createQuery();
+        }
+        feeCtl.setFee(DEFAULT_FEE);
+        _escalateToFork(GENESIS_UID, _createQuery(), user, reporter);
+        uint256 genesisForkTime = vm.getBlockTimestamp();
+
+        // One fork level down.
+        multiverse.spawnChildUniverse(GENESIS_UID, 1);
+        uint248 child = _childId(GENESIS_UID, 1);
+        _assertFeePoolWithinDepth(child, queryIds, count, 1);
+
+        // The child: funded, its rate moved, then forked by `user` alone, at a random point of the window its
+        // inherited queries restarted at the genesis fork.
+        ILituusRep childRep = multiverse.repTokenOf(child);
+        _wrapFromZoltar(child, user, USER_REP_BALANCE);
+        _burnShares(childRep, user, bound(childBurnSeed, MIN_RATE_BURN, MAX_TIP_RATE_BURN));
+        uint256 forkQueryId;
+        if (forkOnOpenQuery) {
+            forkQueryId = queryIds[0];
+        } else {
+            feeCtl.setFee(bound(feeSeeds[0] >> 128, 2, 2 ether));
+            forkQueryId = multiverse.queryCount();
+            vm.prank(user);
+            multiverse.createQuery(child, "q", 3);
+            feeCtl.setFee(DEFAULT_FEE);
+        }
+        uint256 delay = bound(delaySeed, 0, multiverse.REPORTING_PERIOD());
+        vm.warp(genesisForkTime + delay);
+        _escalateToFork(child, forkQueryId, user, user);
+        uint256 parked = zoltar.getMigrationRepBalance(address(multiverse), child);
+        // The forking query's fee stays in the child's frozen pool. Each spawn takes out the fee, or what the
+        // pool holds if that is less, and its reporter earns the ramp on that, from the start of the window (the
+        // genesis fork) to the first reports.
+        uint256 feeShare;
+        {
+            (,, uint256 forkFee,,) = multiverse.queries(forkQueryId);
+            uint256 childPool = _universe(child).totalQueryFees;
+            feeShare = MultiverseHelpers._timeBasedFeeShare(
+                forkFee < childPool ? forkFee : childPool, delay, multiverse.REPORTING_PERIOD()
+            );
+        }
+
+        // Two fork levels down. The forking query's reporter is paid that ramp, and the stake claims into both
+        // grandchildren find their REP parked.
+        uint248[2] memory grandchildren;
+        for (uint256 o = 0; o < 2; o++) {
+            multiverse.spawnChildUniverse(child, o + 1);
+            grandchildren[o] = _childId(child, o + 1);
+            ILituusRep spawnedRep = multiverse.repTokenOf(grandchildren[o]);
+            // A fee share of a single wei makes no child share and stays parked.
+            assertEq(
+                spawnedRep.balanceOf(user),
+                feeShare > 1 ? spawnedRep.convertToShares(childRep.convertToAssets(feeShare)) : 0
+            );
+            vm.prank(user);
+            multiverse.migrateStake(child, forkQueryId, o + 1, o + 1);
+            assertLe(zoltar.splitPerChild(address(multiverse), child, o + 1), parked);
+        }
+        uint248 grandchild = grandchildren[0];
+        ILituusRep grandchildRep = multiverse.repTokenOf(grandchild);
+        _assertFeePoolWithinDepth(grandchild, queryIds, count, 2);
+
+        // Half way through the restarted window, some of the open queries are reported, the rest left to expire.
+        _wrapFromZoltar(grandchild, reporter, 100 ether);
+        vm.warp(vm.getBlockTimestamp() + multiverse.REPORTING_PERIOD() / 2);
+        for (uint256 i = 0; i < count; i++) {
+            if (multiverse.getOutcome(grandchild, queryIds[i]) != 0 || (reportMask >> i) & 1 == 0) continue;
+            vm.prank(reporter);
+            multiverse.report(grandchild, queryIds[i], 1);
+        }
+        vm.warp(vm.getBlockTimestamp() + 2 * multiverse.REPORTING_PERIOD());
+
+        // Each resolution consumes the fee or the rest of the pool, whichever is less.
+        uint256 start = bound(orderSeed, 0, count - 1);
+        for (uint256 k = 0; k < count; k++) {
+            uint256 queryId = queryIds[(start + k) % count];
+            if (multiverse.getOutcome(grandchild, queryId) != 0) continue;
+            (,, uint256 fee,,) = multiverse.queries(queryId);
+            uint256 poolBefore = _universe(grandchild).totalQueryFees;
+            vm.prank(resolver);
+            multiverse.resolve(grandchild, queryId);
+            assertEq(_universe(grandchild).totalQueryFees, poolBefore - (fee < poolBefore ? fee : poolBefore));
+        }
+        assertEq(_universe(grandchild).totalQueryFees, 0);
+        assertEq(grandchildRep.balanceOf(address(multiverse)), 0);
     }
 }

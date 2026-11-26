@@ -33,10 +33,6 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
     // the first reporter of its outcome at spawn and keeps the rest.
     uint256 internal constant FORK_TIP = 5 ether;
     uint256 internal constant TIPPED_TIP = 5 ether;
-    // The spawn-time copy of the fee pool rounds down twice through the parent's rate above 1, so a child's fee
-    // pool may trail what it pays out by a few wei (the known fee-accounting dust TODO). The tip pool does not:
-    // a child starts with exactly the pool the fork carried.
-    uint256 internal constant POOL_DUST = 4;
 
     MultiverseForkHandler internal handler;
     QueryTokenizer internal tokenizer;
@@ -378,10 +374,10 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
         }
     }
 
-    /// @dev What the Multiverse holds of each child's wREP is its fee and tip pools plus the carried query's
-    ///      unsettled stake there: the forking query's reward and tips and every stake settlement are drawn fresh
-    ///      from the parked balance and leave at once, never out of the pools. Only the spawn-time rounding of the
-    ///      pool copies separates the two.
+    /// @dev What the Multiverse holds of each child's wREP is exactly its fee and tip pools plus the carried
+    ///      query's unsettled stake there: the forking query's reward and tips and every stake settlement are drawn
+    ///      fresh from the parked balance and leave at once, never out of the pools, and a resolution never
+    ///      consumes more than its pool holds.
     function invariant_ChildHoldingsAreItsPools() public view {
         for (uint256 i = 0; i < handler.outcomesLength(); ++i) {
             uint256 outcome = handler.outcomeAt(i);
@@ -389,10 +385,9 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
             uint248 childId = handler.childOf(outcome);
             UniverseView memory child = _universe(childId);
             uint256 openStake = handler.ghostTippedResolved(outcome) ? 0 : handler.ghostChildStake(outcome);
-            assertApproxEqAbs(
+            assertEq(
                 child.repToken.balanceOf(address(multiverse)),
-                uint256(child.totalQueryFees) + child.totalTips + openStake,
-                POOL_DUST
+                uint256(child.totalQueryFees) + child.totalTips + openStake
             );
         }
     }

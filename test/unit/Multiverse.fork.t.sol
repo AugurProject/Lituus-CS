@@ -120,9 +120,9 @@ contract MultiverseForkTest is MultiverseFixtures {
         assertEq(zoltar.getMigrationRepBalance(address(multiverse), GENESIS_UID), genesis.unmigratedSupply - FORK_BURN);
         assertEq(r.forkBurn, FORK_BURN);
         assertEq(underlying.totalSupply(), supplyBefore - (r.totalStaked + DEFAULT_FEE));
-        // The forking query's own fee is excluded from the fee aggregate (no payoff path ever
-        // consumes it in a child — its resolution is pre-written at spawn); it stays parked.
-        assertEq(genesis.totalQueryFees, 0);
+        // The forking query's own fee stays in the frozen fee aggregate: each child takes it out of its copy at
+        // spawn and pays its reporter the share earned.
+        assertEq(genesis.totalQueryFees, DEFAULT_FEE);
     }
 
     function test_Fork_TwoCapsCoverTheBondWhenTheRateIsNotOne() public {
@@ -228,8 +228,8 @@ contract MultiverseForkTest is MultiverseFixtures {
         UniverseView memory child = _universe(child1);
         // Children spawn Active: fully functional immediately, no activation step.
         assertEq(uint8(child.universeState), uint8(Multiverse.UniverseState.Active));
-        // The only pre-fork query was the forking one, whose fee is excluded from the aggregate —
-        // so this child receives no fee pot.
+        // The only pre-fork query was the forking one, whose fee is left out of the children's copy of the
+        // aggregate — so this child receives no fee pot.
         assertEq(child.totalQueryFees, 0);
         assertEq(child.parent, GENESIS_UID);
         assertFalse(child.isCanonical);
@@ -329,10 +329,10 @@ contract MultiverseForkTest is MultiverseFixtures {
         assertEq(_universe(child1).totalQueryFees, DEFAULT_FEE + nestedFee);
         _escalateToFork(child1, nestedQueryId, user, user);
 
-        // At child1's own fork the nested forking query's fee is excluded; the genesis-era fee
-        // carries: the grandchild spawns funded with it, so the inherited query is resolvable
+        // child1's frozen aggregate keeps the nested forking query's fee; the grandchild takes it out at spawn.
+        // The genesis-era fee carries: the grandchild spawns funded with it, so the inherited query is resolvable
         // two fork levels below its origin.
-        assertEq(_universe(child1).totalQueryFees, DEFAULT_FEE);
+        assertEq(_universe(child1).totalQueryFees, DEFAULT_FEE + nestedFee);
         vm.prank(bystander);
         multiverse.spawnChildUniverse(child1, OUTCOME_A);
         uint248 grandchild = _childId(child1, OUTCOME_A);
@@ -340,49 +340,217 @@ contract MultiverseForkTest is MultiverseFixtures {
         assertEq(multiverse.getOutcome(grandchild, openQueryId), 0); // still unresolved
     }
 
+    /// @dev Resolves `queryId` in `universeId` once its window there has expired and the resolver's ramp is
+    ///      full: unreported, it resolves INVALID. Returns what the resolver was paid and what was burned.
+    function _resolveExpired(uint248 universeId, uint256 queryId) internal returns (uint256 paid, uint256 burned) {
+        ILituusRep repToken = multiverse.repTokenOf(universeId);
+        uint256 balanceBefore = repToken.balanceOf(bystander);
+        uint256 supplyBefore = repToken.totalSupply();
+        vm.prank(bystander);
+        multiverse.resolve(universeId, queryId);
+        assertEq(multiverse.getOutcome(universeId, queryId), INVALID_OUTCOME);
+        paid = repToken.balanceOf(bystander) - balanceBefore;
+        burned = supplyBefore - repToken.totalSupply();
+    }
+
     function test_PotMigration_LeavesAOneWeiFeePotParked() public {
         // A fee pot of one wei makes no child share at a rate above 1: a vault mints nothing for it and would
         // revert, blocking every child of the fork for good, the pot being frozen in the forked parent. The
-        // spawn leaves the wei parked instead.
+        // spawn leaves the wei parked instead. The frozen pot also holds the forking query's fee, which the
+        // child takes out first.
         _moveGenesisRateAboveOne();
         uint256 openQueryId = _createQueryWithFee(1);
         _forkGenesis();
-        assertEq(_universe(GENESIS_UID).totalQueryFees, 1);
+        assertEq(_universe(GENESIS_UID).totalQueryFees, 1 + DEFAULT_FEE);
 
         multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
         uint248 child1 = _childId(GENESIS_UID, OUTCOME_A);
         assertEq(_universe(child1).totalQueryFees, 0);
+        // Nothing was drawn: the fee pot's wei stays parked, and the forking query's ladder ran in its creation
+        // block, so its reporter earned no fee share.
         assertEq(_drawnIntoChild(GENESIS_UID, OUTCOME_A), 0);
         assertEq(multiverse.getOutcome(child1, openQueryId), 0); // still unresolved
+
+        // The query still resolves in the child: its fee is consumed out of an empty pot, so nothing is paid and
+        // nothing burned.
+        vm.warp(vm.getBlockTimestamp() + 2 * REPORTING_PERIOD);
+        (uint256 paid, uint256 burned) = _resolveExpired(child1, openQueryId);
+        assertEq(paid, 0);
+        assertEq(burned, 0);
     }
 
     function test_PotMigration_CopiesATwoWeiFeePot() public {
         // Two wei are enough at any rate: the child's vault opens at the parent's rate, so they make a share.
         _moveGenesisRateAboveOne();
-        _createQueryWithFee(2);
+        uint256 openQueryId = _createQueryWithFee(2);
         _forkGenesis();
-        assertEq(_universe(GENESIS_UID).totalQueryFees, 2);
+        assertEq(_universe(GENESIS_UID).totalQueryFees, 2 + DEFAULT_FEE);
 
         multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
+        uint248 child1 = _childId(GENESIS_UID, OUTCOME_A);
         // At this rate two wei of wREP are two wei of REP, rounded down, and those make one child share.
         assertEq(_drawnIntoChild(GENESIS_UID, OUTCOME_A), 2);
-        assertEq(_universe(_childId(GENESIS_UID, OUTCOME_A)).totalQueryFees, 1);
+        assertEq(_universe(child1).totalQueryFees, 1);
+
+        // The child holds one wei for a two-wei fee: the resolver gets that wei.
+        vm.warp(vm.getBlockTimestamp() + 2 * REPORTING_PERIOD);
+        (uint256 paid,) = _resolveExpired(child1, openQueryId);
+        assertEq(paid, 1);
+        assertEq(_universe(child1).totalQueryFees, 0);
     }
 
     function test_PotMigration_AOneWeiFeePotStaysParkedAtARateOfOneToo() public {
         // At a rate of exactly 1 a single wei would make a child share. The spawn leaves it parked there too: it
         // skips a single wei at any rate and does not ask the vault. Asking would cost a vault call at every spawn
         // to save one wei at this one rate, and the rate is exactly 1 only until the first burn in the lineage.
-        // The child then owes a one-wei fee it does not hold, as it already does above a rate of 1 (see the TODO
-        // on MultiverseHelpers._consumeQueryFeeAndTips).
+        // The query still resolves in the child, out of the empty pot, paying nothing.
         assertEq(genesisRep.rate(), 1 ether);
-        _createQueryWithFee(1);
+        uint256 openQueryId = _createQueryWithFee(1);
         _forkGenesis();
-        assertEq(_universe(GENESIS_UID).totalQueryFees, 1);
+        assertEq(_universe(GENESIS_UID).totalQueryFees, 1 + DEFAULT_FEE);
 
         multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
-        assertEq(_universe(_childId(GENESIS_UID, OUTCOME_A)).totalQueryFees, 0);
+        uint248 child1 = _childId(GENESIS_UID, OUTCOME_A);
+        assertEq(_universe(child1).totalQueryFees, 0);
         assertEq(_drawnIntoChild(GENESIS_UID, OUTCOME_A), 0);
+
+        vm.warp(vm.getBlockTimestamp() + 2 * REPORTING_PERIOD);
+        (uint256 paid, uint256 burned) = _resolveExpired(child1, openQueryId);
+        assertEq(paid, 0);
+        assertEq(burned, 0);
+    }
+
+    /* ============================================ FEE POOL CLAMP ============================================ */
+
+    /// @dev Moves the genesis rate above 1, creates a query for each of `fees`, forks the genesis and spawns its
+    ///      outcome-A child. At this rate the child's copy of the fee pool comes out a wei short of the fees.
+    function _spawnAShortChild(uint256[] memory fees) internal returns (uint248 child, uint256[] memory queryIds) {
+        _moveGenesisRateAboveOne();
+        queryIds = new uint256[](fees.length);
+        uint256 total;
+        for (uint256 i = 0; i < fees.length; ++i) {
+            queryIds[i] = _createQueryWithFee(fees[i]);
+            total += fees[i];
+        }
+        _forkGenesis();
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
+        child = _childId(GENESIS_UID, OUTCOME_A);
+        assertEq(_universe(child).totalQueryFees, total - 1, "fixture: the copy must lose a wei");
+    }
+
+    /// @dev Three inherited queries in a child whose fee pool is a wei short. The first two resolved are paid
+    ///      their whole fees; the last gets what the pool still holds, a wei less than its fee. The pool ends
+    ///      empty. Without the clamp the last resolution would revert and the query could never resolve there.
+    function test_FeePool_ShortChild_LastQueryGetsWhatIsLeft() public {
+        uint256[] memory fees = new uint256[](3);
+        fees[0] = 1 ether + 1;
+        fees[1] = 0.3 ether + 7;
+        fees[2] = 2 ether + 3;
+        (uint248 child, uint256[] memory queryIds) = _spawnAShortChild(fees);
+
+        vm.warp(vm.getBlockTimestamp() + 2 * REPORTING_PERIOD);
+        (uint256 paid,) = _resolveExpired(child, queryIds[0]);
+        assertEq(paid, fees[0]);
+        (paid,) = _resolveExpired(child, queryIds[1]);
+        assertEq(paid, fees[1]);
+        assertEq(_universe(child).totalQueryFees, fees[2] - 1);
+        (paid,) = _resolveExpired(child, queryIds[2]);
+        assertEq(paid, fees[2] - 1);
+        assertEq(_universe(child).totalQueryFees, 0);
+        assertEq(multiverse.repTokenOf(child).balanceOf(address(multiverse)), 0);
+    }
+
+    /// @dev Half way up the resolver's ramp in a short child: the ramp is measured on the fee the pool could
+    ///      give. The resolver gets half of it, the other half is burned and recorded as profit, and the two add
+    ///      up to the pool.
+    function test_FeePool_ShortChild_UnreportedRampOnTheConsumedFee() public {
+        uint256[] memory fees = new uint256[](1);
+        fees[0] = 1 ether + 1;
+        (uint248 child, uint256[] memory queryIds) = _spawnAShortChild(fees);
+        uint256 consumed = fees[0] - 1;
+
+        // The query's clock in the child is the parent's fork time: the ramp runs from there plus a period.
+        vm.warp(vm.getBlockTimestamp() + REPORTING_PERIOD + REPORTING_PERIOD / 2);
+        (uint256 paid, uint256 burned) = _resolveExpired(child, queryIds[0]);
+        assertEq(paid, consumed / 2);
+        assertEq(burned, consumed - consumed / 2);
+        assertEq(feeCtl.recordedProfit(child), burned);
+        assertEq(_universe(child).totalQueryFees, 0);
+    }
+
+    /// @dev The stakes path in a short child: a sole report half way through the window earns half of the fee
+    ///      the pool could give, the other half is burned, and the reporter gets the stake back with the share.
+    function test_FeePool_ShortChild_ReportedRampOnTheConsumedFee() public {
+        uint256[] memory fees = new uint256[](1);
+        fees[0] = 1 ether + 1;
+        (uint248 child, uint256[] memory queryIds) = _spawnAShortChild(fees);
+        uint256 consumed = fees[0] - 1;
+        ILituusRep childRep = multiverse.repTokenOf(child);
+        _wrapFromZoltar(child, challenger, 100 ether);
+
+        vm.warp(vm.getBlockTimestamp() + REPORTING_PERIOD / 2);
+        uint256 balanceBefore = childRep.balanceOf(challenger);
+        vm.prank(challenger);
+        multiverse.report(child, queryIds[0], OUTCOME_B);
+        vm.warp(vm.getBlockTimestamp() + APPEAL_PERIOD + 1);
+        uint256 supplyBefore = childRep.totalSupply();
+        vm.prank(bystander);
+        multiverse.resolve(child, queryIds[0]);
+
+        assertEq(multiverse.getOutcome(child, queryIds[0]), OUTCOME_B);
+        assertEq(childRep.balanceOf(challenger) - balanceBefore, consumed / 2);
+        assertEq(supplyBefore - childRep.totalSupply(), consumed - consumed / 2);
+        assertEq(_universe(child).totalQueryFees, 0);
+    }
+
+    /// @dev A child whose fee pool is a wei short forks on its only open query, first reported at the end of the
+    ///      window, so the reporter earned the whole fee. The forking query's fee stays in the child's frozen
+    ///      pool and each grandchild takes out what that pool holds, a wei under the fee. Its reporter is paid
+    ///      that, and the stake claims still find their REP parked: none draws past the parked balance. Taking
+    ///      the full fee here would leave the parked balance a wei short at this rate, and a winner's stake claim
+    ///      would revert for good.
+    function test_FeePool_ShortChildForksOnItsOnlyQuery_StakeClaimsSucceed() public {
+        // A rate and fee where the full fee overdrew the parked balance (found by a scan over rates, checked at
+        // the end).
+        _burnShares(genesisRep, user, 4.37 ether + 8);
+        uint256 fee = 1 ether + 4;
+        uint256 queryId = _createQueryWithFee(fee);
+        _forkGenesis();
+        uint256 genesisForkTime = vm.getBlockTimestamp();
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
+        uint248 child = _childId(GENESIS_UID, OUTCOME_A);
+        assertEq(_universe(child).totalQueryFees, fee - 1, "fixture: the copy must lose a wei");
+        _wrapFromZoltar(child, user, 1000 ether);
+        _wrapFromZoltar(child, challenger, 1000 ether);
+        ILituusRep childRep = multiverse.repTokenOf(child);
+
+        // The first reports land at the last second of the window restarted at the genesis fork.
+        vm.warp(genesisForkTime + REPORTING_PERIOD);
+        _escalateToFork(child, queryId, user, challenger);
+        assertEq(_universe(child).totalQueryFees, fee - 1);
+        uint256 parked = zoltar.getMigrationRepBalance(address(multiverse), child);
+
+        uint256[2] memory outcomes = [OUTCOME_A, OUTCOME_B];
+        address[2] memory reporters = [user, challenger];
+        bool fullFeeOverdraws;
+        for (uint256 i = 0; i < 2; ++i) {
+            multiverse.spawnChildUniverse(child, outcomes[i]);
+            uint248 grandchild = _childId(child, outcomes[i]);
+            ILituusRep grandchildRep = multiverse.repTokenOf(grandchild);
+            assertEq(_universe(grandchild).totalQueryFees, 0);
+            assertEq(
+                grandchildRep.balanceOf(reporters[i]), grandchildRep.convertToShares(childRep.convertToAssets(fee - 1))
+            );
+            vm.prank(reporters[i]);
+            multiverse.migrateStake(child, queryId, outcomes[i], outcomes[i]);
+            uint256 drawn = _drawnIntoChild(child, outcomes[i]);
+            assertLe(drawn, parked);
+            // The same draws with the reporter paid the full fee.
+            if (drawn - childRep.convertToAssets(fee - 1) + childRep.convertToAssets(fee) > parked) {
+                fullFeeOverdraws = true;
+            }
+        }
+        assertTrue(fullFeeOverdraws, "fixture: the full fee must overdraw the parked balance at this rate");
     }
 
     function test_Spawn_SeedsTheChildFromTheParentWithTheController() public {
@@ -816,7 +984,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         vm.prank(user);
         multiverse.migrate(child1, OUTCOME_A, 150 ether);
         // The settled query's fee copy carries into the grandchild (the nested forking query's own
-        // fee is excluded at child1's fork).
+        // fee is left out of the copy at the grandchild's spawn).
         assertEq(_universe(grandchild).totalQueryFees, DEFAULT_FEE);
 
         // Reopened two levels down: the old outcome is not resolvable, and the grandchild accepts a
@@ -892,7 +1060,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         vm.stopPrank();
         assertEq(multiverse.getOutcome(child1, unreportedId), INVALID_OUTCOME);
         assertEq(multiverse.getOutcome(child1, voidedId), INVALID_OUTCOME);
-        // Both fee copies funded the child (the forking query's own fee stays excluded).
+        // Both fee copies funded the child (the forking query's own fee is left out of the copy).
         assertEq(multiverse.repTokenOf(child1).balanceOf(bystander), feePot);
         assertEq(_universe(child1).totalQueryFees, 0);
 
@@ -1277,7 +1445,7 @@ contract MultiverseForkTest is MultiverseFixtures {
         multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_B);
         assertEq(multiverse.repTokenOf(child2).balanceOf(challenger), DEFAULT_FEE / 2);
         assertEq(multiverse.repTokenOf(child2).balanceOf(user), 0);
-        // The reward is the fee of the forking query: it was excluded from the fee pot the children inherit.
+        // The reward is the fee of the forking query: it is left out of the fee pot the children copy.
         assertEq(_universe(child1).totalQueryFees, 0);
         assertEq(_universe(child2).totalQueryFees, 0);
     }
@@ -1926,9 +2094,9 @@ contract MultiverseForkTest is MultiverseFixtures {
         (,, uint256 forkFee,,) = multiverse.queries(forkQueryId);
         vm.warp(vm.getBlockTimestamp() + multiverse.REPORTING_PERIOD() / 2);
         _escalateToFork(GENESIS_UID, forkQueryId, user, challenger);
-        // The open query's fee; the forking query's own is excluded.
-        uint256 feePot = _universe(GENESIS_UID).totalQueryFees;
-        assertEq(feePot, DEFAULT_FEE);
+        // The frozen aggregate holds both fees; each child copies it less the forking query's fee.
+        assertEq(_universe(GENESIS_UID).totalQueryFees, DEFAULT_FEE + forkFee);
+        uint256 feePot = DEFAULT_FEE;
 
         // Child A on time, child B only after the fork resolved.
         multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);

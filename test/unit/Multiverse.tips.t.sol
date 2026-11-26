@@ -1016,7 +1016,8 @@ contract MultiverseTipsTest is MultiverseFixtures {
         assertEq(held, 2 ether);
         uint256 forkCut = Math.mulDiv(forkTip, carried, held);
         uint256 feeShare = DEFAULT_FEE / 4;
-        uint256 feePool = _universe(GENESIS_UID).totalQueryFees;
+        // The child copies the fee aggregate less the forking query's fee, which goes to its reporter.
+        uint256 feePool = _universe(GENESIS_UID).totalQueryFees - DEFAULT_FEE;
 
         uint248 childA = _spawn(GENESIS_UID, OUTCOME_A);
         assertEq(

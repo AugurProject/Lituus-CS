@@ -48,25 +48,36 @@ library MultiverseHelpers {
         }
     }
 
-    /// @dev Marks a query's fee consumed in this universe's fee aggregate. Saturating: the spawn-time fee split
-    ///      rounds down twice, so a child's carried aggregate can run short of the nominal fee sum by dust.
-    // TODO: rewrite the fee accounting so that it correctly handles dust and rounding issues.
-    function _consumeQueryFee(Multiverse.Universe storage universe, uint256 fee) internal {
+    /// @dev Marks a query's fee consumed in this universe's fee aggregate and returns what it consumed: the fee,
+    ///      or what the aggregate still holds if that is less. The caller pays and burns exactly that amount.
+    ///      The aggregate can run short: a child's copy of it is drawn through the vault rounded down, so it can
+    ///      lose a wei at every fork level above the universe (see ForkLib._spawnChildUniverse), while every
+    ///      inherited query keeps its full Query.fee. The clamp takes that shortfall off whichever query
+    ///      resolves last, so every query still resolves. It is only ever the rounding: the tests hold every
+    ///      aggregate within the fork depth, in wei, of the fees its open queries carry, so a ledger bug that
+    ///      the clamp would otherwise absorb fails them.
+    function _consumeQueryFee(Multiverse.Universe storage universe, uint256 fee) internal returns (uint256) {
         uint128 totalQueryFees = universe.totalQueryFees;
+        if (fee > totalQueryFees) fee = totalQueryFees;
+        // At most the aggregate, within uint128.
         // forge-lint: disable-next-line(unsafe-typecast)
-        universe.totalQueryFees = fee >= totalQueryFees ? 0 : totalQueryFees - uint128(fee);
+        universe.totalQueryFees = totalQueryFees - uint128(fee);
+        return fee;
     }
 
-    /// @dev Marks a query's fee and tips consumed in this universe's fee and tip aggregates. A fork rounds the
-    ///      carried tips down together with the aggregate they are paid from (see ForkLib._capCarriedTips), so
-    ///      the tips a universe owes never exceed it, and the subtraction is checked: it reverts if that ever
-    ///      breaks. An untipped query leaves the tip aggregate's slot untouched.
-    function _consumeQueryFeeAndTips(Multiverse.Universe storage universe, uint256 fee, uint256 tips) internal {
-        _consumeQueryFee(universe, fee);
-        if (tips == 0) return;
+    /// @dev Marks a query's fee and tips consumed in this universe's fee and tip aggregates and returns the fee
+    ///      consumed (see _consumeQueryFee). A fork rounds the carried tips down together with the aggregate they
+    ///      are paid from (see ForkLib._capCarriedTips), so the tips a universe owes never exceed it, and the
+    ///      subtraction is checked: it reverts if that ever breaks. An untipped query leaves the tip aggregate's
+    ///      slot untouched.
+    function _consumeQueryFeeAndTips(Multiverse.Universe storage universe, uint256 fee, uint256 tips)
+        internal
+        returns (uint256 consumedFee)
+    {
+        consumedFee = _consumeQueryFee(universe, fee);
         // Tips are REP amounts within uint128.
         // forge-lint: disable-next-line(unsafe-typecast)
-        universe.totalTips -= uint128(tips);
+        if (tips != 0) universe.totalTips -= uint128(tips);
     }
 
     /// @dev What a fork that carried `carried` of the `held` tips carries of `tips`: the same ratio, rounded down.
