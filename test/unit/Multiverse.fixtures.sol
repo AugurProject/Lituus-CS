@@ -298,6 +298,13 @@ abstract contract MultiverseDeployFixture is Test {
         return UniverseReader.read(multiverse, universeId);
     }
 
+    /// @dev What `shares` of a forked universe's vault `parentRep` make in a child's vault, which opens at the
+    ///      parent's rate: shares to REP and back, both rounded down, as a spawn draws them
+    ///      (see ForkLib._asChildShares).
+    function _asChildShares(ILituusRep parentRep, uint256 shares) internal view returns (uint256) {
+        return parentRep.convertToShares(parentRep.convertToAssets(shares));
+    }
+
     function _universeState(uint248 universeId) internal view returns (Multiverse.UniverseState) {
         return _universe(universeId).universeState;
     }

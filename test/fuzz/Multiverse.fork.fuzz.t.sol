@@ -431,7 +431,7 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
         }
         _escalateToFork(GENESIS_UID, _createQuery(), user, reporter);
         // The genesis carries its pool up to the cap, rounded down through its rate.
-        uint256 carried1 = genesisRep.convertToShares(genesisRep.convertToAssets(pool1 > cap1 ? cap1 : pool1));
+        uint256 carried1 = _asChildShares(genesisRep, pool1 > cap1 ? cap1 : pool1);
         assertEq(_universe(GENESIS_UID).carriedTips, carried1);
         assertEq(_universe(GENESIS_UID).totalTips, pool1);
 
@@ -465,7 +465,7 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
         vm.prank(user);
         multiverse.createQuery(child, "q", 3);
         _escalateToFork(child, childForkQueryId, user, user);
-        uint256 carried2 = childRep.convertToShares(childRep.convertToAssets(pool2 > cap2 ? cap2 : pool2));
+        uint256 carried2 = _asChildShares(childRep, pool2 > cap2 ? cap2 : pool2);
         assertEq(_universe(child).carriedTips, carried2);
         assertEq(_universe(child).totalTips, pool2);
 
@@ -504,10 +504,12 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
     /// @dev Property: one cap covers the forking query's tips with an open query's, at any rate, any tip sizes
     /// (capped or not) and any report delay.
     /// - Both queries are cut by carried / held, rounded down, and the two cuts leave at most a wei of the pool.
-    /// - In a child whose outcome was reported, the reporter gets the forking query's cut tips to the wei and the
-    ///   fee share at most a wei above its own conversion, never above the share earned.
-    /// - Every child keeps the rest of the carried pool, nobody reported or not, and holds exactly its pools.
-    /// - The spawn draws the fee pool, the tips rounded up and the fee share rounded down: nothing more.
+    /// - In a child whose outcome was reported, the reporter gets the forking query's cut tips and the fee share,
+    ///   each to the wei of what it makes in the child.
+    /// - Every child keeps its copy of the fee pool and the rest of the carried pool, nobody reported or not, and
+    ///   holds exactly its pools.
+    /// - The spawn draws once: what the child's shares cost, rounded up, never more than drawing each part on its
+    ///   own.
     /// - The open query is paid in full in every child.
     function testFuzz_TipCap_ForkingQuerySharesTheCap(
         uint256 forkTipSeed,
@@ -537,15 +539,20 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
         uint256 held = _universe(GENESIS_UID).totalTips;
         uint256 carried = _universe(GENESIS_UID).carriedTips;
         assertEq(held, forkTip + openTip);
-        assertEq(carried, genesisRep.convertToShares(genesisRep.convertToAssets(held > cap ? cap : held)));
+        assertEq(carried, _asChildShares(genesisRep, held > cap ? cap : held));
         uint256 forkCut = Math.mulDiv(forkTip, carried, held);
         uint256 openCut = Math.mulDiv(openTip, carried, held);
         assertLe(carried - forkCut - openCut, 1);
         uint256 childPool = carried - forkCut;
         (,, uint256 fee,,) = multiverse.queries(forkQueryId);
         uint256 feeShare = fee * delay / multiverse.REPORTING_PERIOD();
-        // The child copies the fee aggregate less the forking query's fee, which goes to its reporter.
+        // The child copies the fee aggregate less the forking query's fee, which goes to its reporter. What the
+        // fee amounts make in a child, whose vault opens at the genesis rate:
         uint256 feePool = _universe(GENESIS_UID).totalQueryFees - fee;
+        uint256 childFees = _asChildShares(genesisRep, feePool);
+        uint256 feeShares = _asChildShares(genesisRep, feeShare);
+        // Never above the share earned.
+        assertLe(feeShares, feeShare);
 
         uint256[3] memory childOutcomes = [OUTCOME_A, OUTCOME_B, INVALID_OUTCOME];
         address[3] memory firstReporters = [user, reporter, address(0)];
@@ -553,24 +560,25 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
             multiverse.spawnChildUniverse(GENESIS_UID, childOutcomes[i]);
             uint248 child = _childId(GENESIS_UID, childOutcomes[i]);
             ILituusRep childRep = multiverse.repTokenOf(child);
+            assertEq(_universe(child).totalQueryFees, childFees);
             assertEq(_universe(child).totalTips, childPool);
             if (openTip != 0) assertEq(multiverse.getTips(child, openId), openCut);
-            assertEq(childRep.balanceOf(address(multiverse)), uint256(_universe(child).totalQueryFees) + childPool);
+            assertEq(childRep.balanceOf(address(multiverse)), childFees + childPool);
 
-            uint256 drawn = feePool > 1 ? genesisRep.convertToAssets(feePool) : 0;
+            // The child's shares, and what drawing each part on its own would take.
+            uint256 shares = childFees + childPool;
+            uint256 separately = genesisRep.convertToAssets(feePool);
             if (firstReporters[i] == address(0)) {
-                if (childPool != 0) drawn += genesisRep.convertToAssetsUp(childPool);
+                separately += genesisRep.convertToAssetsUp(childPool);
             } else {
-                if (carried != 0) drawn += genesisRep.convertToAssetsUp(carried);
-                if (feeShare > 1) drawn += genesisRep.convertToAssets(feeShare);
+                shares += forkCut + feeShares;
+                separately += genesisRep.convertToAssetsUp(carried) + genesisRep.convertToAssets(feeShare);
                 // A brand-new vault: the reporter's whole balance is the spawn payment.
-                uint256 feeShares = childRep.balanceOf(firstReporters[i]) - forkCut;
-                assertLe(feeShares, feeShare);
-                if (feeShare > 1) {
-                    assertGe(feeShares, childRep.convertToShares(genesisRep.convertToAssets(feeShare)));
-                }
+                assertEq(childRep.balanceOf(firstReporters[i]), forkCut + feeShares);
             }
-            assertEq(zoltar.splitPerChild(address(multiverse), GENESIS_UID, childOutcomes[i]), drawn);
+            uint256 drawn = zoltar.splitPerChild(address(multiverse), GENESIS_UID, childOutcomes[i]);
+            assertEq(drawn, genesisRep.convertToAssetsUp(shares));
+            assertLe(drawn, separately);
         }
 
         // The open query expires unreported in every child and pays its resolver the fee plus its cut tips.
@@ -689,11 +697,9 @@ contract MultiverseForkFuzzTest is MultiverseFuzzFixtures {
             multiverse.spawnChildUniverse(child, o + 1);
             grandchildren[o] = _childId(child, o + 1);
             ILituusRep spawnedRep = multiverse.repTokenOf(grandchildren[o]);
-            // A fee share of a single wei makes no child share and stays parked.
-            assertEq(
-                spawnedRep.balanceOf(user),
-                feeShare > 1 ? spawnedRep.convertToShares(childRep.convertToAssets(feeShare)) : 0
-            );
+            // A fee share that makes no child share stays parked.
+            assertEq(spawnedRep.balanceOf(user), _asChildShares(childRep, feeShare));
+            assertLe(spawnedRep.balanceOf(user), feeShare);
             vm.prank(user);
             multiverse.migrateStake(child, forkQueryId, o + 1, o + 1);
             assertLe(zoltar.splitPerChild(address(multiverse), child, o + 1), parked);

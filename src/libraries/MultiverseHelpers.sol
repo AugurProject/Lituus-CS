@@ -50,8 +50,8 @@ library MultiverseHelpers {
 
     /// @dev Marks a query's fee consumed in this universe's fee aggregate and returns what it consumed: the fee,
     ///      or what the aggregate still holds if that is less. The caller pays and burns exactly that amount.
-    ///      The aggregate can run short: a child's copy of it is drawn through the vault rounded down, so it can
-    ///      lose a wei at every fork level above the universe (see ForkLib._spawnChildUniverse), while every
+    ///      The aggregate can run short: a child's copy of it goes through the rate rounded down, so it can lose
+    ///      a wei at every fork level above the universe (see ForkLib._fundChildAndPayForkReporter), while every
     ///      inherited query keeps its full Query.fee. The clamp takes that shortfall off whichever query
     ///      resolves last, so every query still resolves. It is only ever the rounding: the tests hold every
     ///      aggregate within the fork depth, in wei, of the fees its open queries carry, so a ledger bug that
@@ -82,7 +82,7 @@ library MultiverseHelpers {
 
     /// @dev What a fork that carried `carried` of the `held` tips carries of `tips`: the same ratio, rounded down.
     ///      Every query's tips are cut by it, the forking query's at spawn (see
-    ///      ForkLib._drawTipsAndPayForkReporter) and an open query's where a child reads them (see
+    ///      ForkLib._fundChildAndPayForkReporter) and an open query's where a child reads them (see
     ///      Multiverse._carriedTips). A fork that carried all it held cuts nothing, zero included.
     function _cutTips(uint256 tips, uint256 carried, uint256 held) internal pure returns (uint256) {
         // A fork that carried less than it held did hold tips, so the divisor is nonzero there.

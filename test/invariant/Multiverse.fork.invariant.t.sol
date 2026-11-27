@@ -128,7 +128,7 @@ contract MultiverseForkInvariantTest is MultiverseDeployFixture {
         // move wREP around, so it is read here.
         tipCapAtFork = genesisRep.totalSupply() / MultiverseHelpers.FORK_TIP_CAP_DIVISOR;
         assertLt(tipCapAtFork, TIPPED_TIP, "fixture: the carried tips must be above the cap");
-        carriedTipsAtFork = genesisRep.convertToShares(genesisRep.convertToAssets(tipCapAtFork));
+        carriedTipsAtFork = _asChildShares(genesisRep, tipCapAtFork);
         forkShareAtFork = FORK_TIP * carriedTipsAtFork / (TIPPED_TIP + FORK_TIP);
         tippedShareAtFork = TIPPED_TIP * carriedTipsAtFork / (TIPPED_TIP + FORK_TIP);
         address[6] memory reporters = [actors[0], actors[1], actors[2], actors[0], actors[1], actors[0]];

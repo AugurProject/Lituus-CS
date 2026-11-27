@@ -356,8 +356,8 @@ contract MultiverseForkTest is MultiverseFixtures {
     function test_PotMigration_LeavesAOneWeiFeePotParked() public {
         // A fee pot of one wei makes no child share at a rate above 1: a vault mints nothing for it and would
         // revert, blocking every child of the fork for good, the pot being frozen in the forked parent. The
-        // spawn leaves the wei parked instead. The frozen pot also holds the forking query's fee, which the
-        // child takes out first.
+        // spawn draws only for whole child shares, so the wei stays parked. The frozen pot also holds the
+        // forking query's fee, which the child takes out first.
         _moveGenesisRateAboveOne();
         uint256 openQueryId = _createQueryWithFee(1);
         _forkGenesis();
@@ -380,7 +380,7 @@ contract MultiverseForkTest is MultiverseFixtures {
     }
 
     function test_PotMigration_CopiesATwoWeiFeePot() public {
-        // Two wei are enough at any rate: the child's vault opens at the parent's rate, so they make a share.
+        // Two wei make a share at any rate (the child's vault opens at the parent's rate), so they are drawn.
         _moveGenesisRateAboveOne();
         uint256 openQueryId = _createQueryWithFee(2);
         _forkGenesis();
@@ -399,11 +399,10 @@ contract MultiverseForkTest is MultiverseFixtures {
         assertEq(_universe(child1).totalQueryFees, 0);
     }
 
-    function test_PotMigration_AOneWeiFeePotStaysParkedAtARateOfOneToo() public {
-        // At a rate of exactly 1 a single wei would make a child share. The spawn leaves it parked there too: it
-        // skips a single wei at any rate and does not ask the vault. Asking would cost a vault call at every spawn
-        // to save one wei at this one rate, and the rate is exactly 1 only until the first burn in the lineage.
-        // The query still resolves in the child, out of the empty pot, paying nothing.
+    function test_PotMigration_CopiesAOneWeiFeePotAtARateOfOne() public {
+        // At a rate of exactly 1 a single wei makes a child share, so the spawn copies it, as it pays a one-wei
+        // forking tip there (see test_Spawn_PaysAOneWeiForkingTipAtARateOfOne): a part is left parked only when
+        // it makes no share. The query resolves in the child and its resolver gets the wei.
         assertEq(genesisRep.rate(), 1 ether);
         uint256 openQueryId = _createQueryWithFee(1);
         _forkGenesis();
@@ -411,13 +410,14 @@ contract MultiverseForkTest is MultiverseFixtures {
 
         multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
         uint248 child1 = _childId(GENESIS_UID, OUTCOME_A);
-        assertEq(_universe(child1).totalQueryFees, 0);
-        assertEq(_drawnIntoChild(GENESIS_UID, OUTCOME_A), 0);
+        assertEq(_universe(child1).totalQueryFees, 1);
+        assertEq(_drawnIntoChild(GENESIS_UID, OUTCOME_A), 1);
 
         vm.warp(vm.getBlockTimestamp() + 2 * REPORTING_PERIOD);
         (uint256 paid, uint256 burned) = _resolveExpired(child1, openQueryId);
-        assertEq(paid, 0);
+        assertEq(paid, 1);
         assertEq(burned, 0);
+        assertEq(_universe(child1).totalQueryFees, 0);
     }
 
     /* ============================================ FEE POOL CLAMP ============================================ */
@@ -538,19 +538,65 @@ contract MultiverseForkTest is MultiverseFixtures {
             uint248 grandchild = _childId(child, outcomes[i]);
             ILituusRep grandchildRep = multiverse.repTokenOf(grandchild);
             assertEq(_universe(grandchild).totalQueryFees, 0);
-            assertEq(
-                grandchildRep.balanceOf(reporters[i]), grandchildRep.convertToShares(childRep.convertToAssets(fee - 1))
-            );
+            uint256 feeShares = _asChildShares(childRep, fee - 1);
+            assertEq(grandchildRep.balanceOf(reporters[i]), feeShares);
+            assertLe(feeShares, fee - 1);
             vm.prank(reporters[i]);
             multiverse.migrateStake(child, queryId, outcomes[i], outcomes[i]);
             uint256 drawn = _drawnIntoChild(child, outcomes[i]);
             assertLe(drawn, parked);
-            // The same draws with the reporter paid the full fee.
-            if (drawn - childRep.convertToAssets(fee - 1) + childRep.convertToAssets(fee) > parked) {
-                fullFeeOverdraws = true;
-            }
+            // The same draws with the reporter paid the full fee: the spawn drew the cost of its fee shares,
+            // rounded up, and nothing else.
+            uint256 spawnDraw = childRep.convertToAssetsUp(feeShares);
+            uint256 fullFeeDraw = childRep.convertToAssetsUp(_asChildShares(childRep, fee));
+            if (drawn - spawnDraw + fullFeeDraw > parked) fullFeeOverdraws = true;
         }
         assertTrue(fullFeeOverdraws, "fixture: the full fee must overdraw the parked balance at this rate");
+    }
+
+    /// @dev A spawn that copies the fee pool and the carried tips and pays the forking query's reporter draws from
+    ///      the parked balance once, at a rate off 1: what the child's shares cost, rounded up. The fee amounts
+    ///      make what a draw of their own would, and the vault mints the draw back exactly, so every part is booked
+    ///      to the wei. The draw is never more than drawing each part on its own.
+    function test_Spawn_DrawsOnce() public {
+        _moveGenesisRateAboveOne();
+        uint256 openFee = 1 ether + 1;
+        uint256 openQueryId = _createQueryWithFee(openFee);
+        vm.prank(bystander);
+        multiverse.tip(GENESIS_UID, openQueryId, 0.3 ether + 7);
+        uint256 forkQueryId = _createDefaultQuery();
+        uint256 forkTip = 0.2 ether + 3;
+        vm.prank(bystander);
+        multiverse.tip(GENESIS_UID, forkQueryId, forkTip);
+        // The first rung lands 18 hours in: the reporter earns a quarter of the fee.
+        _escalateToFork(GENESIS_UID, forkQueryId, user, challenger, 18 hours);
+
+        // What each part makes in the child, whose vault opens at the genesis rate.
+        UniverseView memory genesis = _universe(GENESIS_UID);
+        uint256 carried = genesis.carriedTips;
+        uint256 forkCut = forkTip * carried / genesis.totalTips;
+        uint256 childFees = _asChildShares(genesisRep, openFee);
+        uint256 feeShares = _asChildShares(genesisRep, DEFAULT_FEE / 4);
+        uint256 draw = genesisRep.convertToAssetsUp(childFees + carried + feeShares);
+        // One split from the parked balance, of exactly that, and no other.
+        vm.expectCall(
+            address(zoltar), abi.encodeCall(zoltar.splitMigrationRep, (GENESIS_UID, draw, OUTCOME_A)), uint64(1)
+        );
+        vm.expectCall(address(zoltar), abi.encodeWithSelector(zoltar.splitMigrationRep.selector), uint64(1));
+        multiverse.spawnChildUniverse(GENESIS_UID, OUTCOME_A);
+
+        uint248 child = _childId(GENESIS_UID, OUTCOME_A);
+        ILituusRep childRep = multiverse.repTokenOf(child);
+        assertEq(_universe(child).totalQueryFees, childFees);
+        assertEq(_universe(child).totalTips, carried - forkCut);
+        assertEq(childRep.balanceOf(user), forkCut + feeShares);
+        assertLe(feeShares, DEFAULT_FEE / 4);
+        assertEq(childRep.balanceOf(address(multiverse)), childFees + carried - forkCut);
+        assertLe(
+            draw,
+            genesisRep.convertToAssets(openFee) + genesisRep.convertToAssetsUp(carried)
+                + genesisRep.convertToAssets(DEFAULT_FEE / 4)
+        );
     }
 
     function test_Spawn_SeedsTheChildFromTheParentWithTheController() public {

@@ -17,6 +17,7 @@ import { IPermit2 } from "./interfaces/IPermit2.sol";
 import { PermitSupport } from "./PermitSupport.sol";
 import { ForkLib } from "./libraries/ForkLib.sol";
 import { MultiverseHelpers } from "./libraries/MultiverseHelpers.sol";
+import { LituusRepMath } from "./libraries/LituusRepMath.sol";
 
 contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
     using SafeERC20 for IERC20;
@@ -38,7 +39,8 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
     /// @notice Divisor of the cap that bounds the first stake, so no ladder starts closer than two rounds to it.
     uint256 public constant FIRST_STAKE_CAP_DIVISOR = 4;
 
-    uint256 public constant SCALE = 1 ether;
+    /// @notice Fixed-point scale of a vault's rate (1e18); the genesis vault starts at a rate of 1.
+    uint256 public constant SCALE = LituusRepMath.SCALE;
 
     // The genesis universe's id (mirrors its Zoltar id, which is not necessarily 0).
     uint248 public immutable GENESIS_UNIVERSE_ID;
@@ -132,7 +134,7 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
         // of the local record already cut by every fork they crossed (see _carriedTips), plus the tips placed
         // here. Paid in full to the first correct reporter, or to the resolver of an unreported query, and
         // cleared once paid. A forking query's record keeps them as tipped: every child pays them at its spawn,
-        // cut by that fork like every other query's tips (see ForkLib._drawTipsAndPayForkReporter).
+        // cut by that fork like every other query's tips (see ForkLib._fundChildAndPayForkReporter).
         uint128 tips;
         // Stake totals and first reporter per outcome.
         mapping(uint256 outcome => OutcomeStakes) outcomes;
@@ -175,8 +177,8 @@ contract Multiverse is ReentrancyGuard, PermitSupport, IMultiverse {
         // the forking query's fee included. EVERY child copies it at its spawn less that fee, funding inherited
         // queries' resolutions there; the counter carries recursively. The child resolves the forking query at
         // spawn and pays its reporter the ramped share of that fee; the rest is never drawn and stays parked
-        // (see ForkLib._spawnChildUniverse). Each copy can lose a wei to rounding, so a pool can be short by a
-        // wei per fork above it, and a resolution consumes at most what is left
+        // (see ForkLib._fundChildAndPayForkReporter). Each copy can lose a wei to rounding, so a pool can be
+        // short by a wei per fork above it, and a resolution consumes at most what is left
         // (see MultiverseHelpers._consumeQueryFee).
         uint128 totalQueryFees;
         // The supply for migration at fork, in underlying assets: the contract's entire wREP balance (fees,

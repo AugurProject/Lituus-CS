@@ -10,6 +10,7 @@ import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 import { ILituusRep } from "./interfaces/ILituusRep.sol";
+import { LituusRepMath } from "./libraries/LituusRepMath.sol";
 
 /// @notice Lituus REP (wREP): a share token over an underlying Zoltar REP vault.
 /// @dev See ILituusRep for the accounting model. In short: a stored assets-per-share rate that
@@ -26,7 +27,7 @@ contract LituusRep is ERC20, ERC20Permit, Ownable, ReentrancyGuard, ILituusRep {
     /* =========================================== CONSTANTS/IMMUTABLES ========================================== */
 
     /// @notice Fixed-point scale of the exchange rate (1e18).
-    uint256 public constant SCALE = 1 ether;
+    uint256 public constant SCALE = LituusRepMath.SCALE;
 
     /// @notice The underlying Zoltar REP token this vault wraps.
     IERC20 public immutable UNDERLYING_TOKEN;
@@ -170,21 +171,21 @@ contract LituusRep is ERC20, ERC20Permit, Ownable, ReentrancyGuard, ILituusRep {
 
     /// @inheritdoc ILituusRep
     function convertToShares(uint256 assets) public view returns (uint256 shares) {
-        return assets * SCALE / rate;
+        return LituusRepMath.toShares(assets, rate);
     }
 
     /// @inheritdoc ILituusRep
     function convertToAssets(uint256 shares) public view returns (uint256 assets) {
-        return shares * rate / SCALE;
+        return LituusRepMath.toAssets(shares, rate);
     }
 
     /// @inheritdoc ILituusRep
     function convertToSharesUp(uint256 assets) public view returns (uint256 shares) {
-        return (assets * SCALE + rate - 1) / rate;
+        return LituusRepMath.toSharesUp(assets, rate);
     }
 
     /// @inheritdoc ILituusRep
     function convertToAssetsUp(uint256 shares) public view returns (uint256 assets) {
-        return (shares * rate + SCALE - 1) / SCALE;
+        return LituusRepMath.toAssetsUp(shares, rate);
     }
 }

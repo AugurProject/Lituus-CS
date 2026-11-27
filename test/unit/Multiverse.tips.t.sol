@@ -996,10 +996,11 @@ contract MultiverseTipsTest is MultiverseFixtures {
         assertEq(multiverse.getTips(childA, openQueryId), 3.038 ether);
     }
 
-    /// @dev At a rate off 1, with a ramped fee share, the spawn makes one draw for the carried tips, rounded up,
-    ///      and the fee share, rounded down. The vault mints the tips whole: the child keeps its pool to the wei
-    ///      and the reporter gets the forking query's cut tips to the wei. The fee share can come out a wei above
-    ///      what converting it alone would give, never above the share earned. The two tips add up to 2 REP,
+    /// @dev At a rate off 1, with a ramped fee share, the spawn makes one draw for the fee pool, the carried tips
+    ///      and the fee share. The fee amounts make what a draw of their own would, through the rate rounded down;
+    ///      the tips are whole shares already. The draw is what those shares cost, rounded up, and the vault mints
+    ///      it back exactly: the child keeps its pools to the wei and the reporter gets the cut tips and the fee
+    ///      share to the wei. It is never more than drawing each part on its own. The two tips add up to 2 REP,
     ///      split unevenly.
     function test_ForkingQuery_OneDrawPaysTheCutTipsExactlyAtARateOffOne() public {
         _burnFeeIn(GENESIS_UID);
@@ -1019,16 +1020,23 @@ contract MultiverseTipsTest is MultiverseFixtures {
         // The child copies the fee aggregate less the forking query's fee, which goes to its reporter.
         uint256 feePool = _universe(GENESIS_UID).totalQueryFees - DEFAULT_FEE;
 
+        // What the fee amounts make in the child, whose vault opens at the genesis rate.
+        uint256 childFees = _asChildShares(genesisRep, feePool);
+        uint256 feeShares = _asChildShares(genesisRep, feeShare);
+
         uint248 childA = _spawn(GENESIS_UID, OUTCOME_A);
-        assertEq(
-            zoltar.splitPerChild(address(multiverse), GENESIS_UID, OUTCOME_A),
+        uint256 drawn = zoltar.splitPerChild(address(multiverse), GENESIS_UID, OUTCOME_A);
+        assertEq(drawn, genesisRep.convertToAssetsUp(childFees + carried + feeShares));
+        assertLe(
+            drawn,
             genesisRep.convertToAssets(feePool) + genesisRep.convertToAssetsUp(carried)
                 + genesisRep.convertToAssets(feeShare)
         );
         ILituusRep childRep = multiverse.repTokenOf(childA);
+        assertEq(_universe(childA).totalQueryFees, childFees);
         assertEq(_universe(childA).totalTips, carried - forkCut);
-        uint256 feeShares = childRep.balanceOf(user) - forkCut;
-        assertGe(feeShares, childRep.convertToShares(genesisRep.convertToAssets(feeShare)));
+        assertEq(childRep.balanceOf(user), forkCut + feeShares);
+        // Never above the share earned.
         assertLe(feeShares, feeShare);
         // The Multiverse holds exactly the child's pools: the reporter's payment came out of the draw whole.
         assertEq(
@@ -1247,7 +1255,7 @@ contract MultiverseTipsTest is MultiverseFixtures {
     ///      wei and cuts every tip by that ratio, which takes a wei off each of the two. So the pool loses one
     ///      wei per level and the tips owed lose two: the pool is a wei above the tips owed in the child and two
     ///      in the grandchild. Both queries are paid in full there and the two wei stay in the pool, owed to
-    ///      nobody. A child draws no more REP for its pool than the pot holds for the tips.
+    ///      nobody. A child draws its fee and tip pools in one draw, no more REP than the pot holds for them.
     function test_TipCopy_DustAccumulatesInThePool() public {
         _burnFeeIn(GENESIS_UID);
         uint256 rate = genesisRep.rate();
@@ -1270,12 +1278,13 @@ contract MultiverseTipsTest is MultiverseFixtures {
         assertEq(_universe(child1).totalTips, pool - 1);
         assertEq(multiverse.getTips(child1, ids[0]), tips[0] - 1);
         assertEq(multiverse.getTips(child1, ids[1]), tips[1] - 1);
-        // The child drew its fee pool (the two open queries' fees) and its tip pool from the parked balance. The
-        // REP for the tip pool is rounded up, and still within what the pot holds for the tips.
-        uint256 drawnForTips = zoltar.splitPerChild(address(multiverse), GENESIS_UID, OUTCOME_A)
-            - genesisRep.convertToAssets(2 * DEFAULT_FEE);
-        assertEq(drawnForTips, genesisRep.convertToAssetsUp(pool - 1));
-        assertLe(drawnForTips, genesisRep.convertToAssets(pool));
+        // The child drew its fee pool (the two open queries' fees) and its tip pool in one draw from the parked
+        // balance: what the two cost in child shares, rounded up, and still within what the pot holds for them.
+        uint256 childFees = _asChildShares(genesisRep, 2 * DEFAULT_FEE);
+        assertEq(_universe(child1).totalQueryFees, childFees);
+        uint256 drawn = zoltar.splitPerChild(address(multiverse), GENESIS_UID, OUTCOME_A);
+        assertEq(drawn, genesisRep.convertToAssetsUp(childFees + pool - 1));
+        assertLe(drawn, genesisRep.convertToAssets(2 * DEFAULT_FEE) + genesisRep.convertToAssets(pool));
 
         _fundChild1(child1);
         assertLt(_universe(child1).totalTips, _tipCap(child1));
@@ -1377,7 +1386,7 @@ contract MultiverseTipsTest is MultiverseFixtures {
         assertEq(_universe(GENESIS_UID).totalTips, pool1);
         // The genesis carries the cap, rounded down to what a child's vault mints for it: a wei less here.
         uint256 carried1 = _universe(GENESIS_UID).carriedTips;
-        assertEq(carried1, genesisRep.convertToShares(genesisRep.convertToAssets(cap1)));
+        assertEq(carried1, _asChildShares(genesisRep, cap1));
         assertEq(carried1, cap1 - 1, "fixture: the cap must not convert evenly at the genesis rate");
 
         // One level down: the child holds what the genesis carried, and each query is cut by carried1 / pool1.
@@ -1410,7 +1419,7 @@ contract MultiverseTipsTest is MultiverseFixtures {
         _forkOnFreshQuery(child1);
         assertEq(_universe(child1).totalTips, pool2);
         uint256 carried2 = _universe(child1).carriedTips;
-        assertEq(carried2, child1Rep.convertToShares(child1Rep.convertToAssets(cap2)));
+        assertEq(carried2, _asChildShares(child1Rep, cap2));
 
         // Two levels down: the grandchild holds what child1 carried, and what child1 owed each query is cut by
         // carried2 / pool2. For the untouched queries that is the genesis cut first, then child1's.
